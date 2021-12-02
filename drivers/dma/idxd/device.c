@@ -448,6 +448,8 @@ static void idxd_wq_disable_cleanup(struct idxd_wq *wq)
 	idxd_wq_set_max_batch_size(idxd->data->type, wq, WQ_DEFAULT_MAX_BATCH);
 	if (wq->opcap_bmap)
 		bitmap_copy(wq->opcap_bmap, idxd->opcap_bmap, IDXD_MAX_OPCAP_BITS);
+
+	wq->chan_count = IDXD_DMA_CHANS;
 }
 
 static void idxd_wq_device_reset_cleanup(struct idxd_wq *wq)
