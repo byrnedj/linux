@@ -14,6 +14,7 @@
 #include <linux/iommu.h>
 #include <linux/crypto.h>
 #include <uapi/linux/idxd.h>
+#include <linux/sbitmap.h>
 #include "registers.h"
 
 #define IDXD_DRIVER_VERSION	"1.00"
@@ -55,6 +56,7 @@ enum idxd_type {
 
 #define IDXD_ENQCMDS_RETRIES		32
 #define IDXD_ENQCMDS_MAX_RETRIES	64
+#define IDXD_DMA_CHANS			1
 
 enum idxd_complete_type {
 	IDXD_COMPLETE_NORMAL = 0,
@@ -224,8 +226,12 @@ struct idxd_wq {
 	int compls_size;
 	struct idxd_desc **descs;
 	struct idxd_dma_chan *idxd_chan;
-	atomic_t outstanding;
+	u32 outstanding;
+	struct list_head indirects;
 	struct llist_head free_llist;
+	struct sbitmap_queue sbq;
+	int chan_count;
+	struct idxd_dma_chan *ichans;
 	char name[WQ_NAME_SIZE + 1];
 	u64 max_xfer_bytes;
 	u32 max_batch_size;
@@ -758,6 +764,8 @@ static inline void idxd_desc_complete(struct idxd_desc *desc,
 
 int idxd_register_devices(struct idxd_device *idxd);
 void idxd_unregister_devices(struct idxd_device *idxd);
+int idxd_register_dma_channel(struct idxd_dma_chan *ichan);
+void idxd_unregister_dma_channel(struct idxd_dma_chan *ichan);
 void idxd_wqs_quiesce(struct idxd_device *idxd);
 bool idxd_queue_int_handle_resubmit(struct idxd_desc *desc);
 void multi_u64_to_bmap(unsigned long *bmap, u64 *val, int count);
