@@ -13,6 +13,7 @@
 #include <linux/perf_event.h>
 #include <linux/iommu.h>
 #include <uapi/linux/idxd.h>
+#include <linux/sbitmap.h>
 #include "registers.h"
 
 #define IDXD_DRIVER_VERSION	"1.00"
@@ -55,6 +56,8 @@ enum idxd_type {
 
 #define IDXD_ENQCMDS_RETRIES		32
 #define IDXD_ENQCMDS_MAX_RETRIES	64
+
+#define IDXD_DMA_CHANS			1
 
 struct idxd_device_driver {
 	const char *name;
@@ -221,10 +224,12 @@ struct idxd_wq {
 	dma_addr_t compls_addr;
 	int compls_size;
 	struct idxd_desc **descs;
-	struct idxd_dma_chan *idxd_chan;
 	u32 outstanding;
 	struct list_head indirects;
 	struct llist_head free_llist;
+	struct sbitmap_queue sbq;
+	int chan_count;
+	struct idxd_dma_chan *ichans;
 	char name[WQ_NAME_SIZE + 1];
 	u64 max_xfer_bytes;
 	u32 max_batch_size;
