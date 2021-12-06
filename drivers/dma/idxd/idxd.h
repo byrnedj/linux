@@ -422,7 +422,7 @@ struct idxd_desc {
 	};
 	struct llist_node llnode;
 	struct list_head list;
-	int id;
+	u16 id;
 	int cpu;
 	struct idxd_wq *wq;
 };
