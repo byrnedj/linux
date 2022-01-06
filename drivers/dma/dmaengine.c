@@ -1195,6 +1195,7 @@ int dma_async_device_register(struct dma_device *device)
 }
 
 	CHECK_CAP(dma_memcpy,      DMA_MEMCPY);
+	CHECK_CAP(dma_memcpy_sg,   DMA_MEMCPY_SG);
 	CHECK_CAP(dma_xor,         DMA_XOR);
 	CHECK_CAP(dma_xor_val,     DMA_XOR_VAL);
 	CHECK_CAP(dma_pq,          DMA_PQ);
