@@ -645,6 +645,12 @@ EXPORT_SYMBOL(folio_migrate_flags);
 
 void folio_migrate_copy(struct folio *newfolio, struct folio *folio)
 {
+	if (migrate_use_dma() && !dma_migrate_folio_copy(folio, newfolio))
+		return;
+
+	if (migrate_use_dma())
+		pr_info("DMA copy failed, fallback to CPU\n");
+
 	folio_copy(newfolio, folio);
 	folio_migrate_flags(newfolio, folio);
 }
