@@ -165,7 +165,7 @@ struct idxd_cdev {
 
 #define WQ_DEFAULT_QUEUE_DEPTH		16
 #define WQ_DEFAULT_MAX_XFER		SZ_2M
-#define WQ_DEFAULT_MAX_BATCH		32
+#define WQ_DEFAULT_MAX_BATCH		128
 
 enum idxd_op_type {
 	IDXD_OP_BLOCK = 0,
@@ -373,6 +373,22 @@ static inline unsigned int evl_size(struct idxd_device *idxd)
 {
 	return idxd->evl->size * evl_ent_size(idxd);
 }
+/*
+ * IDXD batch field for SW Batch descriptor
+ * @descs: Descriptor list address
+ * @dma_descs: DMA address for descs
+ * @cr: completion record list address
+ * @dma_cr: DMA address for completion records
+ * @num: Number of descs in batch
+ */
+struct idxd_batch {
+	struct dsa_hw_desc *descs;
+	dma_addr_t dma_descs;
+	struct dsa_completion_record *crs;
+	dma_addr_t dma_crs;
+	u32 num;
+	u32 max;
+};
 
 /* IDXD software descriptor */
 struct idxd_desc {
@@ -393,6 +409,8 @@ struct idxd_desc {
 	u16 gen;
 	int cpu;
 	struct idxd_wq *wq;
+
+	struct idxd_batch *batch;
 };
 
 /*
