@@ -8,67 +8,39 @@
 #include "idxd.h"
 #include "registers.h"
 
-static struct idxd_desc *__get_desc(struct idxd_wq *wq, int idx, int cpu)
+static void __init_desc(struct idxd_device *idxd, struct idxd_desc *desc)
 {
-	struct idxd_desc *desc;
-	struct idxd_device *idxd = wq->idxd;
-
-	desc = wq->descs[idx];
 	memset(desc->hw, 0, sizeof(struct dsa_hw_desc));
 	memset(desc->completion, 0, idxd->data->compl_size);
-	desc->cpu = cpu;
+	desc->batch->num = 0;
 
 	if (device_pasid_enabled(idxd))
 		desc->hw->pasid = idxd->pasid;
-
-	return desc;
 }
 
 struct idxd_desc *idxd_alloc_desc(struct idxd_wq *wq, enum idxd_op_type optype)
 {
-	int cpu, idx;
 	struct idxd_device *idxd = wq->idxd;
-	DEFINE_SBQ_WAIT(wait);
-	struct sbq_wait_state *ws;
-	struct sbitmap_queue *sbq;
+	struct idxd_desc *desc;
+	struct llist_node *entry;
 
 	if (idxd->state != IDXD_DEV_ENABLED)
 		return ERR_PTR(-EIO);
 
-	sbq = &wq->sbq;
-	idx = sbitmap_queue_get(sbq, &cpu);
-	if (idx < 0) {
-		if (optype == IDXD_OP_NONBLOCK)
-			return ERR_PTR(-EAGAIN);
-	} else {
-		return __get_desc(wq, idx, cpu);
-	}
-
-	ws = &sbq->ws[0];
-	for (;;) {
-		sbitmap_prepare_to_wait(sbq, ws, &wait, TASK_INTERRUPTIBLE);
-		if (signal_pending_state(TASK_INTERRUPTIBLE, current))
-			break;
-		idx = sbitmap_queue_get(sbq, &cpu);
-		if (idx >= 0)
-			break;
-		schedule();
-	}
-
-	sbitmap_finish_wait(sbq, ws, &wait);
-	if (idx < 0)
+	entry = llist_del_first(&wq->free_llist);
+	if (entry == NULL)
 		return ERR_PTR(-EAGAIN);
 
-	return __get_desc(wq, idx, cpu);
+	desc = container_of(entry, struct idxd_desc, llnode);
+	__init_desc(idxd, desc);
+
+	return desc;
 }
 EXPORT_SYMBOL_NS_GPL(idxd_alloc_desc, "IDXD");
 
 void idxd_free_desc(struct idxd_wq *wq, struct idxd_desc *desc)
 {
-	int cpu = desc->cpu;
-
-	desc->cpu = -1;
-	sbitmap_queue_clear(&wq->sbq, desc->id, cpu);
+	llist_add(&desc->llnode, &wq->free_llist);
 }
 EXPORT_SYMBOL_NS_GPL(idxd_free_desc, "IDXD");
 
