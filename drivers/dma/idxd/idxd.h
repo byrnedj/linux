@@ -188,6 +188,12 @@ struct idxd_dma_chan {
 	struct idxd_wq *wq;
 
 	struct list_head pending;
+	u32 num_queued;
+
+	/* for KERNEL_USER DMA Channels */
+	int pasid;
+	bool priv;
+	bool pasid_valid;
 };
 
 struct idxd_wq {
@@ -813,7 +819,7 @@ void __idxd_wq_quiesce(struct idxd_wq *wq);
 void idxd_wq_quiesce(struct idxd_wq *wq);
 int idxd_wq_init_percpu_ref(struct idxd_wq *wq);
 void idxd_wq_free_irq(struct idxd_wq *wq);
-int idxd_wq_request_irq(struct idxd_wq *wq);
+int idxd_wq_request_irq(struct idxd_wq *wq, int pasid);
 
 /* submission */
 int idxd_submit_desc(struct idxd_wq *wq, struct idxd_desc *desc);
