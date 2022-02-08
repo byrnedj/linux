@@ -186,6 +186,11 @@ struct idxd_dma_chan {
 
 	struct list_head pending;
 	u32 num_queued;
+
+	/* for KERNEL_USER DMA Channels */
+	int pasid;
+	bool priv;
+	bool pasid_valid;
 };
 
 struct idxd_wq {
