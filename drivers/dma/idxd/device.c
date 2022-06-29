@@ -188,32 +188,29 @@ int idxd_wq_alloc_resources(struct idxd_wq *wq)
 	if (rc < 0)
 		goto fail_alloc_descs;
 
-	rc = sbitmap_queue_init_node(&wq->sbq, num_descs, -1, false, GFP_KERNEL,
-				     dev_to_node(dev));
-	if (rc < 0)
-		goto fail_sbitmap_init;
-
+	init_llist_head(&wq->free_llist);
 	for (i = 0; i < num_descs; i++) {
 		struct idxd_desc *desc = wq->descs[i];
+
+		llist_add(&desc->llnode, &wq->free_llist);
 
 		desc->hw = wq->hw_descs[i];
 		if (idxd->data->type == IDXD_TYPE_DSA) {
 			desc->completion = &wq->compls[i];
 			/* pre-allocate batch for descriptor */
 			if (alloc_desc_batch(wq, desc))
-				goto fail_sbitmap_init;
+				goto fail_descs_init;
 		} else if (idxd->data->type == IDXD_TYPE_IAX)
 			desc->iax_completion = &wq->iax_compls[i];
 		desc->compl_dma = wq->compls_addr + idxd->data->compl_size * i;
 		desc->id = i;
 		desc->gen = 1;
 		desc->wq = wq;
-		desc->cpu = -1;
 	}
 
 	return 0;
 
- fail_sbitmap_init:
+ fail_descs_init:
 	free_descs(wq);
  fail_alloc_descs:
 	dma_free_coherent(dev, wq->compls_size, wq->compls, wq->compls_addr);
@@ -232,7 +229,6 @@ void idxd_wq_free_resources(struct idxd_wq *wq)
 	free_hw_descs(wq);
 	free_descs(wq);
 	dma_free_coherent(dev, wq->compls_size, wq->compls, wq->compls_addr);
-	sbitmap_queue_free(&wq->sbq);
 }
 
 int idxd_wq_enable(struct idxd_wq *wq)
