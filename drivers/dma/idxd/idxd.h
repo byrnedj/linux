@@ -3,7 +3,6 @@
 #ifndef _IDXD_H_
 #define _IDXD_H_
 
-#include <linux/sbitmap.h>
 #include <linux/dmaengine.h>
 #include <linux/percpu-rwsem.h>
 #include <linux/wait.h>
@@ -222,8 +221,9 @@ struct idxd_wq {
 	dma_addr_t compls_addr;
 	int compls_size;
 	struct idxd_desc **descs;
-	struct sbitmap_queue sbq;
 	struct idxd_dma_chan *idxd_chan;
+	atomic_t outstanding;
+	struct llist_head free_llist;
 	char name[WQ_NAME_SIZE + 1];
 	u64 max_xfer_bytes;
 	u32 max_batch_size;
@@ -440,10 +440,11 @@ struct idxd_desc {
 	struct list_head list;
 	u16 id;
 	u16 gen;
-	int cpu;
 	struct idxd_wq *wq;
 
 	struct idxd_batch *batch;
+
+	struct idxd_desc *next_free;
 };
 
 /*
