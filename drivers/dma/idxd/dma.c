@@ -41,10 +41,30 @@ void idxd_dma_complete_txd(struct idxd_desc *desc,
 			   enum idxd_complete_type comp_type,
 			   bool free_desc)
 {
+	struct idxd_desc *indirect, *itr;
 	struct idxd_device *idxd = desc->wq->idxd;
 	struct dma_async_tx_descriptor *tx;
 	struct dmaengine_result res;
 	int complete = 1;
+	uint8_t status;
+
+	/*
+	 * Any time a command is checked for completion, check the indirect
+	 * list to clear them out.
+	 */
+	list_for_each_entry_safe(indirect, itr, &desc->wq->indirects, list) {
+		status = indirect->completion->status & DSA_COMP_STATUS_MASK;
+
+		if (status == 0)
+			break;
+
+		if (status != DSA_COMP_SUCCESS)
+			pr_err("Indirect descriptor failed!\n");
+
+		list_del(&indirect->list);
+		desc->wq->outstanding--;
+		idxd_free_desc(indirect->wq, indirect);
+	}
 
 	if (desc->completion->status == DSA_COMP_SUCCESS) {
 		res.result = DMA_TRANS_NOERROR;
@@ -59,6 +79,8 @@ void idxd_dma_complete_txd(struct idxd_desc *desc,
 	} else {
 		complete = 0;
 	}
+
+	desc->wq->outstanding--;
 
 	tx = &desc->txd;
 	if (complete && tx->cookie) {
@@ -229,17 +251,94 @@ static enum dma_status idxd_dma_tx_status(struct dma_chan *dma_chan,
 	return DMA_IN_PROGRESS;
 }
 
+static struct idxd_desc *idxd_build_desc_set(struct dma_chan *dma_chan)
+{
+	struct idxd_dma_chan *idxd_chan = container_of(dma_chan, struct idxd_dma_chan, chan);
+	struct idxd_wq *wq = to_idxd_wq(dma_chan);
+	struct idxd_desc *parent, *req, *tmp;
+	u32 count;
+	u32 max_indirect_size;
+	u32 desc_flags;
+	struct list_head tmp_list;
 
-/*
- * issue_pending() does not need to do anything since tx_submit() does the job
- * already.
- */
+	if (list_empty(&idxd_chan->pending))
+		return NULL;
+
+	max_indirect_size = idxd_chan->wq->size / 2;
+	if (max_indirect_size > wq->max_batch_size)
+		max_indirect_size = wq->max_batch_size;
+
+	if (wq->outstanding >= max_indirect_size)
+		return NULL;
+
+	parent = dmachan_alloc_desc(dma_chan, IDXD_OP_NONBLOCK);
+	if (!parent)
+		return NULL;
+
+	INIT_LIST_HEAD(&tmp_list);
+	count = 0;
+	list_for_each_entry_safe(req, tmp, &idxd_chan->pending, list) {
+		list_del(&req->list);
+		list_add_tail(&req->list, &tmp_list);
+		count++;
+
+		idxd_desc_assign_ie(wq, req);
+
+		if (count == max_indirect_size - 1)
+			break;
+	}
+
+	parent->batch->num = 0;
+	if (!list_empty(&idxd_chan->pending)) {
+		req = idxd_build_desc_set(dma_chan);
+		if (req != NULL) {
+			memcpy(&parent->batch->descs[parent->batch->num++], req->hw, sizeof(*req->hw));
+			parent->batch->num++;
+			wq->outstanding++;
+		}
+	}
+
+	list_for_each_entry_safe(req, tmp, &tmp_list, list) {
+		list_del(&req->list);
+		memcpy(&parent->batch->descs[parent->batch->num++], req->hw, sizeof(*req->hw));
+		wq->outstanding++;
+	}
+
+	desc_flags = IDXD_OP_FLAG_STORD | IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+	idxd_prep_desc_common(wq, parent->hw, DSA_OPCODE_MEMMOVE,
+		(u64)parent->batch->descs, (u64)wq->unlimited_portal,
+		sizeof(parent->batch->descs[0]) * parent->batch->num,
+		(u64)parent->completion, desc_flags);
+
+	idxd_desc_assign_ie(wq, parent);
+
+	list_add_tail(&parent->list, &wq->indirects);
+
+	return parent;
+}
+
 static void idxd_dma_issue_pending(struct dma_chan *dma_chan)
 {
 	struct idxd_dma_chan *idxd_chan = container_of(dma_chan, struct idxd_dma_chan, chan);
 	struct idxd_wq *wq = to_idxd_wq(dma_chan);
-	struct idxd_desc *desc, *itr;
-	int rc;
+	struct idxd_device *idxd = wq->idxd;
+	struct idxd_desc *desc, *tmp;
+	void __iomem *portal;
+	int rc, i;
+
+	if ((wq->outstanding >= wq->size) ||
+	    list_empty(&idxd_chan->pending) ||
+	    !list_empty(&wq->indirects))
+		return;
+
+	if (idxd->state != IDXD_DEV_ENABLED)
+		return;
+
+	if (!percpu_ref_tryget_live(&wq->wq_active)) {
+		wait_for_completion(&wq->wq_resurrect);
+		if (!percpu_ref_tryget_live(&wq->wq_active))
+			return;
+	}
 
 	/*
 	 * The wmb() flushes writes to coherent DMA data before
@@ -248,16 +347,36 @@ static void idxd_dma_issue_pending(struct dma_chan *dma_chan)
 	 */
 	wmb();
 
-	/* FIXME: Needs a lock to protect the pending list */
-	list_for_each_entry_safe(desc, itr, &idxd_chan->pending, list) {
-		list_del(&desc->list);
-		rc = idxd_submit_desc(wq, desc);
-		if (rc < 0) {
-			/* FIXME: There is no way to return error to the caller */
-			pr_info("%s: desc submit failed rc %d\n", __func__, rc);
-			idxd_free_desc(wq, desc);
+	rc = 0;
+	if (wq_dedicated(wq)) {
+		desc = idxd_build_desc_set(dma_chan);
+		if (desc) {
+			for (i = 0; i < desc->batch->num; i++) {
+				portal = idxd_wq_portal_addr(wq);
+				iosubmit_cmds512(portal, &desc->batch->descs[i], 1);
+			}
+
+			/* Throw away the top-level descriptor */
+			desc->completion->status = IDXD_COMP_DESC_ABORT;
+			idxd_dma_complete_txd(desc, IDXD_COMPLETE_ABORT, true);
+		}
+	} else {
+		list_for_each_entry_safe(desc, tmp, &idxd_chan->pending, list) {
+			list_del(&desc->list);
+			idxd_desc_assign_ie(wq, desc);
+			portal = idxd_wq_portal_addr(wq);
+			rc = idxd_enqcmds(wq, portal, desc->hw);
+			if (rc < 0) {
+				/* abort operation frees the descriptor */
+				idxd_desc_unassign_ie(wq, desc);
+				desc->completion->status = IDXD_COMP_DESC_ABORT;
+				idxd_dma_complete_txd(desc, IDXD_COMPLETE_ABORT, true);
+				break;
+			}
 		}
 	}
+
+	percpu_ref_put(&wq->wq_active);
 }
 
 static dma_cookie_t idxd_dma_tx_submit(struct dma_async_tx_descriptor *tx)

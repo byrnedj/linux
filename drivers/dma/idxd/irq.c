@@ -520,6 +520,7 @@ static void idxd_int_handle_resubmit_work(struct work_struct *work)
 	int rc;
 
 	desc->completion->status = 0;
+	idxd_desc_assign_ie(wq, desc);
 	rc = idxd_submit_desc(wq, desc);
 	if (rc < 0) {
 		dev_dbg(&wq->idxd->pdev->dev, "Failed to resubmit desc %d to wq %d.\n",
@@ -612,7 +613,7 @@ static void irq_process_work_list(struct idxd_irq_entry *irq_entry)
 
 	spin_unlock(&irq_entry->list_lock);
 
-	list_for_each_entry(desc, &flist, list) {
+	list_for_each_entry_safe(desc, n, &flist, list) {
 		/*
 		 * Check against the original status as ABORT is software defined
 		 * and 0xff, which DSA_COMP_STATUS_MASK can mask out.
@@ -622,6 +623,7 @@ static void irq_process_work_list(struct idxd_irq_entry *irq_entry)
 			continue;
 		}
 
+		list_del(&desc->list);
 		idxd_dma_complete_txd(desc, IDXD_COMPLETE_NORMAL, true);
 	}
 }

@@ -135,11 +135,33 @@ int idxd_enqcmds(struct idxd_wq *wq, void __iomem *portal, const void *desc)
 	return rc;
 }
 
+void idxd_desc_assign_ie(struct idxd_wq *wq, struct idxd_desc *desc)
+{
+	u32 desc_flags = desc->hw->flags;
+	struct idxd_irq_entry *ie = NULL;
+
+	/*
+	 * Pending the descriptor to the lockless list for the irq_entry
+	 * that we designated the descriptor to.
+	 */
+	if (desc_flags & IDXD_OP_FLAG_RCI) {
+		ie = &wq->ie;
+		desc->hw->int_handle = ie->int_handle;
+		llist_add(&desc->llnode, &ie->pending_llist);
+	}
+}
+
+void idxd_desc_unassign_ie(struct idxd_wq *wq, struct idxd_desc *desc)
+{
+	u32 desc_flags = desc->hw->flags;
+
+	if (desc_flags & IDXD_OP_FLAG_RCI)
+		llist_abort_desc(wq, &wq->ie, desc);
+}
+
 int idxd_submit_desc(struct idxd_wq *wq, struct idxd_desc *desc)
 {
 	struct idxd_device *idxd = wq->idxd;
-	struct idxd_irq_entry *ie = NULL;
-	u32 desc_flags = desc->hw->flags;
 	void __iomem *portal;
 	int rc;
 
@@ -154,16 +176,6 @@ int idxd_submit_desc(struct idxd_wq *wq, struct idxd_desc *desc)
 
 	portal = idxd_wq_portal_addr(wq);
 
-	/*
-	 * Pending the descriptor to the lockless list for the irq_entry
-	 * that we designated the descriptor to.
-	 */
-	if (desc_flags & IDXD_OP_FLAG_RCI) {
-		ie = &wq->ie;
-		desc->hw->int_handle = ie->int_handle;
-		llist_add(&desc->llnode, &ie->pending_llist);
-	}
-
 	if (wq_dedicated(wq)) {
 		iosubmit_cmds512(portal, desc->hw, 1);
 	} else {
@@ -171,8 +183,7 @@ int idxd_submit_desc(struct idxd_wq *wq, struct idxd_desc *desc)
 		if (rc < 0) {
 			percpu_ref_put(&wq->wq_active);
 			/* abort operation frees the descriptor */
-			if (ie)
-				llist_abort_desc(wq, ie, desc);
+			idxd_desc_unassign_ie(wq, desc);
 			return rc;
 		}
 	}
