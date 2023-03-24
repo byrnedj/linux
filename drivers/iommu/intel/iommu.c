@@ -3956,6 +3956,10 @@ int __init intel_iommu_init(void)
 
 	intel_iommu_enabled = 1;
 
+	/* Reserved RID_PASID from the global namespace for legacy DMA */
+	WARN_ON(iommu_alloc_global_pasid(PASID_RID2PASID, PASID_RID2PASID) !=
+		PASID_RID2PASID);
+
 	return 0;
 
 out_free_dmar:
