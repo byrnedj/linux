@@ -602,8 +602,43 @@ static bool __init paranoid_xstate_size_valid(unsigned int kernel_size)
 		}
 	}
 	size = xstate_calculate_size(fpu_kernel_cfg.max_features, compacted);
-	XSTATE_WARN_ON(size != kernel_size,
-		       "size %u != kernel_size %u\n", size, kernel_size);
+	if (size != kernel_size) {
+		u64 xcr0, ia32_xss;
+
+		XSTATE_WARN_ON(1, "size %u != kernel_size %u\n",
+			       size, kernel_size);
+
+		/* Show more information to help diagnose the size issue. */
+		pr_info("x86/fpu: max_features=0x%llx\n",
+			fpu_kernel_cfg.max_features);
+		print_xstate_offset_size();
+		pr_info("x86/fpu: total size: %u bytes\n", size);
+		xcr0 = xgetbv(XCR_XFEATURE_ENABLED_MASK);
+		if (compacted) {
+			/*
+			 * Get IA32_XSS value without independent features directly from
+			 * xfeatures_mask_supervisor() instead of reading IA32_XSS MSR
+			 * because the current MSR may contain independent feature bits.
+			 */
+			ia32_xss = xfeatures_mask_supervisor();
+			pr_info("x86/fpu: XCR0=0x%llx, IA32_XSS (without independent features)=0x%llx\n",
+				xcr0, ia32_xss);
+		} else {
+			pr_info("x86/fpu: XCR0=0x%llx\n", xcr0);
+		}
+		/*
+		 * In compact case, CPUID.0xd.0x1:EBX reports the size of
+		 * the XSAVE size containing all the state components
+		 * corresponding to bits set in XCR0 | IA32_XSS. No independent
+		 * features in IA32_XSS.
+		 *
+		 * Otherwise, CPUID.0xd.0x0:EBX reports the size of an XSAVE
+		 * area containing all the *user* state components
+		 * corresponding to bits set in XCR0.
+		 */
+		pr_info("x86/fpu: kernel_size from CPUID.0xd.0x%x:EBX: %u bytes\n",
+			compacted ? 1 : 0, kernel_size);
+	}
 	return size == kernel_size;
 }
 
