@@ -6,6 +6,8 @@
 #include <linux/task_work.h>
 #include <linux/bitmap.h>
 #include <linux/llist.h>
+#include <linux/dmaengine.h>
+#include <linux/iommu.h>
 #include <uapi/linux/io_uring.h>
 
 enum {
@@ -254,6 +256,34 @@ struct io_alloc_cache {
 	unsigned int		init_clear;
 };
 
+struct io_dma_channel {
+	struct dma_chan		*chan;
+	struct iommu_sva	*sva;
+	unsigned int		pasid;
+	struct io_dma_task	*head;
+	struct io_dma_task	*tail;
+};
+
+struct io_dma_kiocb {
+	unsigned int		dma_refcnt;
+	int			dma_result;
+	struct io_dma_task	*dma_tasks;
+};
+
+#define IO_DMA_MAX_ELEMENTS 32
+
+struct io_dma_task {
+	struct io_kiocb		*req;
+	dma_cookie_t		cookie;
+	struct iovec		dst[IO_DMA_MAX_ELEMENTS];
+	struct kvec             src[IO_DMA_MAX_ELEMENTS];
+	unsigned long		flags;
+	u32			len;
+	void (*cb_fn)(struct kiocb *, void *, int);
+	void			*cb_arg;
+	struct io_dma_task	*next;
+};
+
 struct io_ring_ctx {
 	/* const or read-mostly hot data */
 	struct {
@@ -349,6 +379,8 @@ struct io_ring_ctx {
 		 */
 		u64					hybrid_poll_time;
 	} ____cacheline_aligned_in_smp;
+
+	struct io_dma_channel		dma;
 
 	struct {
 		/*
@@ -702,6 +734,8 @@ struct io_kiocb {
 
 		struct io_rsrc_node	*buf_node;
 	};
+
+	struct io_dma_kiocb		dma;
 
 	union {
 		/* used by request caches, completion batching and iopoll */

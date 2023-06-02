@@ -646,8 +646,8 @@ static inline void io_rw_done(struct io_kiocb *req, ssize_t ret)
 		io_complete_rw(&rw->kiocb, ret);
 }
 
-static int kiocb_done(struct io_kiocb *req, ssize_t ret,
-		      struct io_br_sel *sel, unsigned int issue_flags)
+int kiocb_done(struct io_kiocb *req, ssize_t ret, struct io_br_sel *sel,
+		       unsigned int issue_flags)
 {
 	struct io_rw *rw = io_kiocb_to_cmd(req, struct io_rw);
 	unsigned final_ret = io_fixup_rw_res(req, ret);
@@ -915,6 +915,7 @@ static int __io_read(struct io_kiocb *req, struct io_br_sel *sel,
 	struct io_async_rw *io = req->async_data;
 	struct kiocb *kiocb = &rw->kiocb;
 	ssize_t ret;
+	int ret2;
 	loff_t *ppos;
 
 	if (req->flags & REQ_F_IMPORT_BUFFER) {
@@ -947,15 +948,28 @@ static int __io_read(struct io_kiocb *req, struct io_br_sel *sel,
 	if (unlikely(ret))
 		return ret;
 
-	ret = io_iter_do_read(rw, &io->iter);
-
-	/*
+	/* Set up support for copy offload */
+	if (force_nonblock) {
+		io_uring_dma_prep(req);
+	}
+	
+        ret = io_iter_do_read(rw, &io->iter);
+	
+        /*
 	 * Some file systems like to return -EOPNOTSUPP for an IOCB_NOWAIT
 	 * issue, even though they should be returning -EAGAIN. To be safe,
 	 * retry from blocking context for either.
 	 */
 	if (ret == -EOPNOTSUPP && force_nonblock)
 		ret = -EAGAIN;
+
+
+	if (ret >= 0) {
+		ret2 = io_dma_submit_queued_tasks(req);
+		if (ret2 < 0) {
+			ret = ret2;
+		}
+	}
 
 	if (ret == -EAGAIN) {
 		/* If we can poll, just do that. */

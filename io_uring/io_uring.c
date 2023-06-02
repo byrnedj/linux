@@ -2839,6 +2839,92 @@ static __cold void io_req_caches_free(struct io_ring_ctx *ctx)
 	__io_req_caches_free(ctx);
 }
 
+static void io_release_dma_chan(struct io_ring_ctx *ctx)
+{
+	unsigned long dma_sync_wait_timeout = jiffies + msecs_to_jiffies(5000);
+	struct io_dma_task *dma, *next;
+	int ret;
+
+	if (ctx->dma.chan != NULL) {
+		dma = ctx->dma.head;
+		while (dma) {
+			next = dma->next;
+
+			do {
+				ret = dmaengine_async_is_tx_complete(ctx->dma.chan, dma->cookie);
+
+				if (time_after_eq(jiffies, dma_sync_wait_timeout))
+					break;
+
+			} while (ret == DMA_IN_PROGRESS);
+
+			if (ret == DMA_IN_PROGRESS)
+				pr_warn("Hung DMA offload task %p\n", dma);
+
+			kmem_cache_free(dma_cachep, dma);
+			dma = next;
+		}
+
+		ctx->dma.head = NULL;
+		ctx->dma.tail = NULL;
+	}
+
+	if (ctx->dma.sva && !IS_ERR(ctx->dma.sva))
+		iommu_sva_unbind_device(ctx->dma.sva);
+	if (ctx->dma.chan && !IS_ERR(ctx->dma.chan))
+		dma_release_channel(ctx->dma.chan);
+	ctx->dma.chan = NULL;
+}
+
+static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
+				struct io_uring_params *p)
+{
+	dma_cap_mask_t mask;
+	struct device *dev;
+	int rc = 0;
+	struct dma_chan_attr_params param;
+
+	dma_cap_zero(mask);
+	dma_cap_set(DMA_MEMCPY, mask);
+	dma_cap_set(DMA_KERNEL_USER, mask);
+
+	ctx->dma.chan = dma_request_chan_by_mask(&mask);
+	if (IS_ERR(ctx->dma.chan)) {
+		rc = PTR_ERR(ctx->dma.chan);
+		ctx->dma.chan = NULL;
+		goto failed;
+	}
+
+	dev = ctx->dma.chan->device->dev;
+	ctx->dma.sva = iommu_sva_bind_device(dev, ctx->mm_account);
+	if (IS_ERR(ctx->dma.sva)) {
+		rc = PTR_ERR(ctx->dma.sva);
+		goto failed;
+	}
+
+	ctx->dma.pasid = iommu_sva_get_pasid(ctx->dma.sva);
+	if (ctx->dma.pasid == IOMMU_PASID_INVALID) {
+		rc = -EINVAL;
+		goto failed;
+	}
+
+	param.p.pasid = ctx->dma.pasid;
+	param.p.priv = true;
+
+	if (dmaengine_chan_set_attr(ctx->dma.chan, DMA_CHAN_SET_PASID, &param)) {
+		rc = -EINVAL;
+		goto failed;
+	}
+
+	ctx->dma.head = NULL;
+	ctx->dma.tail = NULL;
+
+	return 0;
+failed:
+	io_release_dma_chan(ctx);
+	return rc;
+}
+
 static __cold void io_ring_ctx_free(struct io_ring_ctx *ctx)
 {
 	io_sq_thread_finish(ctx);
@@ -2859,6 +2945,8 @@ static __cold void io_ring_ctx_free(struct io_ring_ctx *ctx)
 		put_task_struct(ctx->submitter_task);
 
 	WARN_ON_ONCE(!list_empty(&ctx->ltimeout_list));
+
+	io_release_dma_chan(ctx);
 
 	if (ctx->mm_account) {
 		mmdrop(ctx->mm_account);
@@ -3323,6 +3411,10 @@ iopoll_locked:
 			if (likely(!ret2))
 				ret2 = io_cqring_wait(ctx, min_complete, flags,
 						      &ext_arg);
+
+			mutex_lock(&ctx->uring_lock);
+			__io_dma_poll(ctx);
+			mutex_unlock(&ctx->uring_lock);
 		}
 
 		if (!ret) {
@@ -3654,6 +3746,11 @@ static __cold int io_uring_create(struct io_ctx_config *config)
 		goto err;
 
 	p->features = IORING_FEAT_FLAGS;
+	ret = io_allocate_dma_chan(ctx, p);
+	if (ret) {
+		pr_info("io_uring was unable to allocate a DMA channel. Offloads unavailable.\n");
+		ret = 0;
+	}
 
 	if (copy_to_user(config->uptr, p, sizeof(*p))) {
 		ret = -EFAULT;
@@ -3860,6 +3957,8 @@ static int __init io_uring_init(void)
 	req_cachep = kmem_cache_create("io_kiocb", sizeof(struct io_kiocb), &kmem_args,
 				SLAB_HWCACHE_ALIGN | SLAB_PANIC | SLAB_ACCOUNT |
 				SLAB_TYPESAFE_BY_RCU);
+	
+        dma_cachep = KMEM_CACHE(io_dma_task, SLAB_HWCACHE_ALIGN | SLAB_ACCOUNT);
 
 	iou_wq = alloc_workqueue("iou_exit", WQ_UNBOUND, 64);
 	BUG_ON(!iou_wq);
