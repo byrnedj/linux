@@ -168,6 +168,7 @@ static int __io_sq_thread(struct io_ring_ctx *ctx, bool cap_entries)
 {
 	unsigned int to_submit;
 	int ret = 0;
+	int ret2 = 0;
 
 	to_submit = io_sqring_entries(ctx);
 	/* if we're handling multiple rings, cap submit size for fairness */
@@ -198,6 +199,14 @@ static int __io_sq_thread(struct io_ring_ctx *ctx, bool cap_entries)
 		if (creds)
 			revert_creds(creds);
 	}
+
+	mutex_lock(&ctx->uring_lock);
+
+	ret2 = __io_dma_poll(ctx);
+	if (ret == 0 && ret2 > 0)
+		ret = ret2;
+
+	mutex_unlock(&ctx->uring_lock);
 
 	return ret;
 }
