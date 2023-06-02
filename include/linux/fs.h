@@ -336,6 +336,7 @@ struct page;
 struct address_space;
 struct writeback_control;
 struct readahead_control;
+struct kiocb;
 
 /* Match RWF_* bits to IOCB bits */
 #define IOCB_HIPRI		(__force int) RWF_HIPRI
@@ -359,6 +360,8 @@ struct readahead_control;
 /* kiocb is a read or write operation submitted by fs/aio.c. */
 #define IOCB_AIO_RW		(1 << 22)
 #define IOCB_HAS_METADATA	(1 << 23)
+/* iocb->ki_copy_to_iter can be used to offload data copies */
+#define IOCB_DMA_COPY		(1 << 24)
 
 /* for use in trace events */
 #define TRACE_IOCB_STRINGS \
@@ -378,6 +381,8 @@ struct readahead_control;
 	{ IOCB_AIO_RW,		"AIO_RW" }, \
 	{ IOCB_HAS_METADATA,	"AIO_HAS_METADATA" }
 
+typedef void (*ki_copy_to_iter_cpl)(struct kiocb *, void *, int);
+
 struct kiocb {
 	struct file		*ki_filp;
 	loff_t			ki_pos;
@@ -393,6 +398,11 @@ struct kiocb {
 	 * Valid IFF IOCB_WAITQ is set.
 	 */
 	struct wait_page_queue	*ki_waitq;
+
+	ssize_t (*ki_copy_to_iter)(struct kiocb *iocb, struct iov_iter *dst_iter,
+		 struct iov_iter *src_iter,
+		 ki_copy_to_iter_cpl cb_fn, void *cb_arg,
+		 unsigned long flags);
 };
 
 static inline bool is_sync_kiocb(struct kiocb *kiocb)

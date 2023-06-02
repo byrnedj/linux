@@ -947,7 +947,18 @@ static int __io_read(struct io_kiocb *req, struct io_br_sel *sel,
 	if (unlikely(ret))
 		return ret;
 
-	ret = io_iter_do_read(rw, &io->iter);
+	/* Set up support for copy offload */
+	if (force_nonblock && req->ctx->dma.chan != NULL) {
+		struct kiocb *kiocb = &req->rw.kiocb;
+
+		kiocb->ki_flags |= IOCB_DMA_COPY;
+		kiocb->ki_copy_to_iter = __io_dma_copy_to_iter;
+		req->dma_refcnt = 0;
+		req->dma_result = 0;
+		req->dma_tasks = NULL;
+	}
+	
+        ret = io_iter_do_read(rw, &io->iter);
 
 	/*
 	 * Some file systems like to return -EOPNOTSUPP for an IOCB_NOWAIT
@@ -956,6 +967,45 @@ static int __io_read(struct io_kiocb *req, struct io_br_sel *sel,
 	 */
 	if (ret == -EOPNOTSUPP && force_nonblock)
 		ret = -EAGAIN;
+	
+        if ((kiocb->ki_flags & IOCB_DMA_COPY) != 0) {
+		if (req->dma_refcnt > 0) {
+			struct io_dma_task *dma = req->dma_tasks;
+			struct io_dma_task *next;
+
+			while (dma) {
+				next = dma->next;
+
+				if (dma->cookie == 0 && req->ctx->dma.head == NULL) {
+					/* It's ok if the dma task has not been submitted yet, as
+					* long as it isn't being placed at the head of the list.
+					* If the list is empty, then this dma task failed to
+					* submit for some other reason.
+					*/
+					pr_err("dma_prep failed for some reason other than out "
+						"of resources!\n");
+					__io_dma_task_complete(req->ctx->dma.chan->device->dev,
+								dma, DMA_ERROR);
+					dma = next;
+					continue;
+				}
+
+				if (req->ctx->dma.tail == NULL)
+					req->ctx->dma.head = dma;
+				else
+					req->ctx->dma.tail->next = dma;
+				req->ctx->dma.tail = dma;
+
+				dma = next;
+			}
+
+			req->dma_tasks = NULL;
+			ret = -EIOCBQUEUED;
+		}
+
+		kiocb->ki_flags &= ~IOCB_DMA_COPY;
+		kiocb->ki_copy_to_iter = NULL;
+	}
 
 	if (ret == -EAGAIN) {
 		/* If we can poll, just do that. */
