@@ -336,6 +336,7 @@ struct page;
 struct address_space;
 struct writeback_control;
 struct readahead_control;
+struct kiocb;
 
 /* Match RWF_* bits to IOCB bits */
 #define IOCB_HIPRI		(__force int) RWF_HIPRI
@@ -359,6 +360,8 @@ struct readahead_control;
 /* kiocb is a read or write operation submitted by fs/aio.c. */
 #define IOCB_AIO_RW		(1 << 22)
 #define IOCB_HAS_METADATA	(1 << 23)
+/* iocb->ki_copy_to_iter can be used to offload data copies */
+#define IOCB_DMA_COPY		(1 << 24)
 
 /* for use in trace events */
 #define TRACE_IOCB_STRINGS \
