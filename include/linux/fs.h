@@ -381,8 +381,6 @@ struct kiocb;
 	{ IOCB_AIO_RW,		"AIO_RW" }, \
 	{ IOCB_HAS_METADATA,	"AIO_HAS_METADATA" }
 
-typedef void (*ki_copy_to_iter_cpl)(struct kiocb *, void *, int);
-
 struct kiocb {
 	struct file		*ki_filp;
 	loff_t			ki_pos;

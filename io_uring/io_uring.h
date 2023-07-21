@@ -613,4 +613,8 @@ static inline bool io_has_work(struct io_ring_ctx *ctx)
 	return test_bit(IO_CHECK_CQ_OVERFLOW_BIT, &ctx->check_cq) ||
 	       io_local_work_pending(ctx);
 }
+
+void io_uring_dma_prep(struct io_kiocb *req);
+int io_dma_submit_queued_tasks(struct io_kiocb *req)
+
 #endif
