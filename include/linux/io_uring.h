@@ -36,6 +36,8 @@ struct io_uring_cmd {
 	u8		pdu[32]; /* available inline for free use */
 };
 
+typedef void (*io_uring_copy_to_iter_cb)(struct kiocb *, void *, int);
+
 #if defined(CONFIG_IO_URING)
 int io_uring_cmd_import_fixed(u64 ubuf, unsigned long len, int rw,
 			      struct iov_iter *iter, void *ioucmd);
@@ -66,6 +68,11 @@ static inline void io_uring_free(struct task_struct *tsk)
 	if (tsk->io_uring)
 		__io_uring_free(tsk);
 }
+
+ssize_t io_uring_copy_to_iter(struct kiocb *iocb, struct iov_iter *dst_iter,
+			struct iov_iter *src_iter,
+			io_uring_copy_to_iter_cb cb_fn, void *cb_arg,
+			unsigned long flags);
 #else
 static inline int io_uring_cmd_import_fixed(u64 ubuf, unsigned long len, int rw,
 			      struct iov_iter *iter, void *ioucmd)
@@ -96,6 +103,14 @@ static inline void io_uring_free(struct task_struct *tsk)
 static inline const char *io_uring_get_opcode(u8 opcode)
 {
 	return "";
+}
+
+static inline ssize_t io_uring_copy_to_iter(struct kiocb *iocb, struct iov_iter *dst_iter,
+			struct iov_iter *src_iter,
+			io_uring_copy_to_iter_cb cb_fn, void *cb_arg,
+			unsigned long flags)
+{
+	return -EOPNOTSUPP;
 }
 #endif
 

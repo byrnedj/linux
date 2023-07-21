@@ -43,10 +43,25 @@ struct io_dma {
 	rwf_t				flags;
 };
 
-static ssize_t __io_dma_copy_to_iter(struct kiocb *kiocb,
-		struct iov_iter *dst_iter, struct iov_iter *src_iter,
-		ki_copy_to_iter_cpl cb_fn, void *cb_arg,
-		unsigned long flags)
+void io_uring_dma_prep(struct io_kiocb *req)
+{
+	struct io_dma *dma;
+	
+	if (req->ctx->dma.chan == NULL)
+		return;
+	
+	dma = io_kiocb_to_cmd(req, struct io_dma);
+
+	dma->kiocb.ki_flags |= IOCB_DMA_COPY;
+	req->dma_refcnt = 0;
+	req->dma_result = 0;
+	req->dma_tasks = NULL;
+}
+
+ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
+			struct iov_iter *src_iter,
+			io_uring_copy_to_iter_cb cb_fn, void *cb_arg,
+			unsigned long flags)
 {
 	struct io_dma *cmd;
 	struct io_kiocb *req;
@@ -169,6 +184,53 @@ error_unmap:
 	dma_unmap_sva_sg(dev, src_iter, DMA_TO_DEVICE);
 
 	return rc;
+}
+
+int io_dma_submit_queued_tasks(struct io_kiocb *req)
+{
+	struct io_dma *dma = io_kiocb_to_cmd(req, struct io_dma);
+	struct kiocb *kiocb = &dma->kiocb;
+	int ret;
+
+	if ((kiocb->ki_flags & IOCB_DMA_COPY) != 0) {
+		if (req->dma_refcnt > 0) {
+			struct io_dma_task *dma = req->dma_tasks;
+			struct io_dma_task *next;
+
+			while (dma) {
+				next = dma->next;
+
+				if (dma->cookie == 0 && req->ctx->dma.head == NULL) {
+					/* It's ok if the dma task has not been submitted yet, as
+					* long as it isn't being placed at the head of the list.
+					* If the list is empty, then this dma task failed to
+					* submit for some other reason.
+					*/
+					pr_err("dma_prep failed for some reason other than out "
+						"of resources!\n");
+					__io_dma_task_complete(req->ctx->dma.chan->device->dev,
+								dma, DMA_ERROR);
+					dma = next;
+					continue;
+				}
+
+				if (req->ctx->dma.tail == NULL)
+					req->ctx->dma.head = dma;
+				else
+					req->ctx->dma.tail->next = dma;
+				req->ctx->dma.tail = dma;
+
+				dma = next;
+			}
+
+			req->dma_tasks = NULL;
+			ret = -EIOCBQUEUED;
+		}
+
+		kiocb->ki_flags &= ~IOCB_DMA_COPY;
+	}
+
+	return ret;
 }
 
 static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma, int ret)

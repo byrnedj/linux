@@ -383,4 +383,7 @@ static inline void io_req_queue_tw_complete(struct io_kiocb *req, s32 res)
 	io_req_task_work_add(req);
 }
 
+void io_uring_dma_prep(struct io_kiocb *req);
+int io_dma_submit_queued_tasks(struct io_kiocb *req)
+
 #endif
