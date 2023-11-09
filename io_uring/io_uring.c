@@ -166,7 +166,7 @@ struct sock *io_uring_get_socket(struct file *file)
 }
 EXPORT_SYMBOL(io_uring_get_socket);
 
-static inline void io_submit_flush_completions(struct io_ring_ctx *ctx)
+void io_submit_flush_completions(struct io_ring_ctx *ctx)
 {
 	if (!wq_list_empty(&ctx->submit_state.compl_reqs) ||
 	    ctx->submit_state.cqes_count)
@@ -2816,7 +2816,6 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 	struct device *dev;
 	int rc = 0;
 	struct dma_chan_attr_params param;
-	int flags = IOMMU_SVA_BIND_KERNEL;
 
 	dma_cap_zero(mask);
 	dma_cap_set(DMA_MEMCPY, mask);
@@ -2825,11 +2824,12 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 	ctx->dma.chan = dma_request_chan_by_mask(&mask);
 	if (IS_ERR(ctx->dma.chan)) {
 		rc = PTR_ERR(ctx->dma.chan);
+		ctx->dma.chan = NULL;
 		goto failed;
 	}
 
 	dev = ctx->dma.chan->device->dev;
-	ctx->dma.sva = iommu_sva_bind_device(dev, ctx->mm_account, flags);
+	ctx->dma.sva = iommu_sva_bind_device(dev, ctx->mm_account);
 	if (IS_ERR(ctx->dma.sva)) {
 		rc = PTR_ERR(ctx->dma.sva);
 		goto failed;
@@ -2853,6 +2853,9 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 	ctx->dma.tail = NULL;
 
 	return 0;
+failed:
+	io_release_dma_chan(ctx);
+	return rc;
 }
 
 static __cold void io_ring_ctx_free(struct io_ring_ctx *ctx)

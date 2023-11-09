@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 
 #include <linux/io_uring_types.h>
+#include <linux/io_uring.h>
+#include "io_uring.h"
 
 struct kmem_cache *dma_cachep;
 
@@ -53,14 +55,14 @@ void io_uring_dma_prep(struct io_kiocb *req)
 	dma = io_kiocb_to_cmd(req, struct io_dma);
 
 	dma->kiocb.ki_flags |= IOCB_DMA_COPY;
-	req->dma_refcnt = 0;
-	req->dma_result = 0;
-	req->dma_tasks = NULL;
+	req->dma.dma_refcnt = 0;
+	req->dma.dma_result = 0;
+	req->dma.dma_tasks = NULL;
 }
 
 ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 			struct iov_iter *src_iter,
-			io_uring_copy_to_iter_cb cb_fn, void *cb_arg,
+			void (*cb_fn)(struct kiocb *, void *, int), void *cb_arg,
 			unsigned long flags)
 {
 	struct io_dma *cmd;
@@ -77,25 +79,17 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	req = cmd_to_io_kiocb(cmd);
 
 	ctx = req->ctx;
-	dev = ctx->dma_chan.chan->device->dev;
+	dev = ctx->dma.chan->device->dev;
 
 	iov_iter_save_state(dst_iter, &dst_state);
 	iov_iter_save_state(src_iter, &src_state);
 
 	len = (iov_iter_count(src_iter) > iov_iter_count(dst_iter)) ?
 		iov_iter_count(dst_iter) : iov_iter_count(src_iter);
-	len = (len > req->result) ? req->result : len;
+	len = (len > req->cqe.res) ? req->cqe.res : len;
 
 	iov_iter_truncate(dst_iter, len);
 	iov_iter_truncate(src_iter, len);
-
-	if (!dma_map_sva_sg(dev, dst_iter, DMA_FROM_DEVICE))
-		return -EINVAL;
-
-	if (!dma_map_sva_sg(dev, src_iter, DMA_TO_DEVICE)) {
-		dma_unmap_sva_sg(dev, dst_iter, DMA_FROM_DEVICE);
-		return -EINVAL;
-	}
 
 	/* Remove the interrupt flag. We'll poll for completions. */
 	flags &= ~(unsigned long)DMA_PREP_INTERRUPT;
@@ -120,6 +114,7 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 		i++;
 
 		if (i == IO_DMA_MAX_ELEMENTS) {
+			pr_warn("reached max elements\n");
 			len = bytes;
 			iov_iter_truncate(dst_iter, len);
 			iov_iter_truncate(src_iter, len);
@@ -136,6 +131,7 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 		i++;
 
 		if (i == IO_DMA_MAX_ELEMENTS) {
+			pr_warn("reached max elements\n");
 			len = bytes;
 			iov_iter_truncate(dst_iter, len);
 			iov_iter_truncate(src_iter, len);
@@ -158,12 +154,12 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 		goto error_free;
 	}
 
-	req->dma_refcnt++;
+	req->dma.dma_refcnt++;
 
-	if (!req->dma_tasks)
-		req->dma_tasks = dma;
+	if (!req->dma.dma_tasks)
+		req->dma.dma_tasks = dma;
 	else {
-		tmp = req->dma_tasks;
+		tmp = req->dma.dma_tasks;
 		while (tmp->next)
 			tmp = tmp->next;
 		tmp->next = dma;
@@ -180,21 +176,60 @@ error_unmap:
 	iov_iter_restore(dst_iter, &dst_state);
 	iov_iter_restore(src_iter, &src_state);
 
-	dma_unmap_sva_sg(dev, dst_iter, DMA_FROM_DEVICE);
-	dma_unmap_sva_sg(dev, src_iter, DMA_TO_DEVICE);
-
 	return rc;
+}
+
+static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma, int ret)
+{
+	struct io_kiocb *req;
+	struct iov_iter src;
+	struct iov_iter dst;
+
+	iov_iter_kvec(&src, WRITE, dma->src, IO_DMA_MAX_ELEMENTS, dma->len);
+	iov_iter_init(&dst, READ, dma->dst, IO_DMA_MAX_ELEMENTS, dma->len);
+
+	req = dma->req;
+
+	if (ret == DMA_COMPLETE) {
+		/*
+		* If this DMA was successful and no earlier DMA failed,
+		* we increment the total amount copied. Preserve
+		* earlier failures otherwise.
+		*/
+		if (req->dma.dma_result >= 0)
+			req->dma.dma_result += dma->len;
+	} else {
+		/*
+		* If this DMA failed, report the whole operation
+		* as a failure. Some data may have been copied
+		* as part of an earlier DMA operation that will
+		* be ignored.
+		*/
+		req->dma.dma_result = -EFAULT;
+	}
+
+	if (dma->cb_fn) {
+		struct io_dma *iod = io_kiocb_to_cmd(req, struct io_dma);
+		dma->cb_fn(&iod->kiocb, dma->cb_arg, req->dma.dma_result >= 0 ?
+						dma->len : req->dma.dma_result);
+	}
+
+	kmem_cache_free(dma_cachep, dma);
+	req->dma.dma_refcnt--;
+
+	if (req->dma.dma_refcnt == 0)
+		kiocb_done(req, req->dma.dma_result, IO_URING_F_COMPLETE_DEFER);
 }
 
 int io_dma_submit_queued_tasks(struct io_kiocb *req)
 {
 	struct io_dma *dma = io_kiocb_to_cmd(req, struct io_dma);
 	struct kiocb *kiocb = &dma->kiocb;
-	int ret;
+	int ret = 0;
 
 	if ((kiocb->ki_flags & IOCB_DMA_COPY) != 0) {
-		if (req->dma_refcnt > 0) {
-			struct io_dma_task *dma = req->dma_tasks;
+		if (req->dma.dma_refcnt > 0) {
+			struct io_dma_task *dma = req->dma.dma_tasks;
 			struct io_dma_task *next;
 
 			while (dma) {
@@ -223,7 +258,7 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 				dma = next;
 			}
 
-			req->dma_tasks = NULL;
+			req->dma.dma_tasks = NULL;
 			ret = -EIOCBQUEUED;
 		}
 
@@ -233,52 +268,7 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 	return ret;
 }
 
-static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma, int ret)
-{
-	struct io_kiocb *req;
-	struct iov_iter src;
-	struct iov_iter dst;
-
-	iov_iter_kvec(&src, WRITE, dma->src, IO_DMA_MAX_ELEMENTS, dma->len);
-	iov_iter_init(&dst, READ, dma->dst, IO_DMA_MAX_ELEMENTS, dma->len);
-
-	dma_unmap_sva_sg(dev, &dst, DMA_FROM_DEVICE);
-	dma_unmap_sva_sg(dev, &src, DMA_TO_DEVICE);
-
-	req = dma->req;
-
-	if (ret == DMA_COMPLETE) {
-		/*
-		* If this DMA was successful and no earlier DMA failed,
-		* we increment the total amount copied. Preserve
-		* earlier failures otherwise.
-		*/
-		if (req->dma_result >= 0)
-			req->dma_result += dma->len;
-	} else {
-		/*
-		* If this DMA failed, report the whole operation
-		* as a failure. Some data may have been copied
-		* as part of an earlier DMA operation that will
-		* be ignored.
-		*/
-		req->dma_result = -EFAULT;
-	}
-
-	if (dma->cb_fn)
-		dma->cb_fn(&req->rw.kiocb, dma->cb_arg, req->dma_result >= 0 ?
-						dma->len : req->dma_result);
-
-	kmem_cache_free(dma_cachep, dma);
-	req->dma_refcnt--;
-
-	if (req->dma_refcnt == 0) {
-		__io_complete_rw(req, req->dma_result, IO_URING_F_COMPLETE_DEFER);
-		io_req_add_compl_list(req);
-	}
-}
-
-static int __io_dma_poll(struct io_ring_ctx *ctx)
+int __io_dma_poll(struct io_ring_ctx *ctx)
 {
 	struct io_dma_task *dma, *next, *prev;
 	struct io_kiocb *req;
