@@ -276,10 +276,10 @@ struct io_dma_task {
 	struct io_kiocb		*req;
 	dma_cookie_t		cookie;
 	struct iovec		dst[IO_DMA_MAX_ELEMENTS];
-	struct kvec		src[IO_DMA_MAX_ELEMENTS];
+	struct kvec             src[IO_DMA_MAX_ELEMENTS];
 	unsigned long		flags;
 	u32			len;
-	ki_copy_to_iter_cpl	cb_fn;
+	void (*cb_fn)(struct kiocb *, void *, int);
 	void			*cb_arg;
 	struct io_dma_task	*next;
 };
@@ -380,7 +380,7 @@ struct io_ring_ctx {
 		u64					hybrid_poll_time;
 	} ____cacheline_aligned_in_smp;
 
-	struct io_dma_channel		dma_chan;
+	struct io_dma_channel		dma;
 
 	struct {
 		/*

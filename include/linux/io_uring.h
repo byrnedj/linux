@@ -36,8 +36,6 @@ struct io_uring_cmd {
 	u8		pdu[32]; /* available inline for free use */
 };
 
-typedef void (*io_uring_copy_to_iter_cb)(struct kiocb *, void *, int);
-
 #if defined(CONFIG_IO_URING)
 void __io_uring_cancel(bool cancel_all);
 void __io_uring_free(struct task_struct *tsk);
@@ -63,7 +61,7 @@ static inline void io_uring_free(struct task_struct *tsk)
 
 ssize_t io_uring_copy_to_iter(struct kiocb *iocb, struct iov_iter *dst_iter,
 			struct iov_iter *src_iter,
-			io_uring_copy_to_iter_cb cb_fn, void *cb_arg,
+			void (*cb_fn)(struct kiocb *, void *, int), void *cb_arg,
 			unsigned long flags);
 #else
 static inline void io_uring_task_cancel(void)
@@ -85,7 +83,7 @@ static inline bool io_is_uring_fops(struct file *file)
 }
 static inline ssize_t io_uring_copy_to_iter(struct kiocb *iocb, struct iov_iter *dst_iter,
 			struct iov_iter *src_iter,
-			io_uring_copy_to_iter_cb cb_fn, void *cb_arg,
+			void (*cb_fn)(struct kiocb *, void *, int), void *cb_arg,
 			unsigned long flags)
 {
 	return -EOPNOTSUPP;

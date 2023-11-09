@@ -646,8 +646,8 @@ static inline void io_rw_done(struct io_kiocb *req, ssize_t ret)
 		io_complete_rw(&rw->kiocb, ret);
 }
 
-static int kiocb_done(struct io_kiocb *req, ssize_t ret,
-		      struct io_br_sel *sel, unsigned int issue_flags)
+int kiocb_done(struct io_kiocb *req, ssize_t ret,
+		       unsigned int issue_flags)
 {
 	struct io_rw *rw = io_kiocb_to_cmd(req, struct io_rw);
 	unsigned final_ret = io_fixup_rw_res(req, ret);
