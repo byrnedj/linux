@@ -456,35 +456,14 @@ static enum dma_status idxd_dma_tx_status(struct dma_chan *dma_chan,
  */
 static void idxd_dma_issue_pending(struct dma_chan *dma_chan)
 {
-	struct idxd_dma_chan *idxd_chan = container_of(dma_chan, struct idxd_dma_chan, chan);
-	struct idxd_wq *wq = to_idxd_wq(dma_chan);
-	struct idxd_desc *desc, *itr;
-	int rc;
-
-	/*
-	 * The wmb() flushes writes to coherent DMA data before
-	 * possibly triggering a DMA read. The wmb() is necessary
-	 * even on UP because the recipient is a device.
-	 */
-	wmb();
-
-	/* FIXME: Needs a lock to protect the pending list */
-	list_for_each_entry_safe(desc, itr, &idxd_chan->pending, list) {
-		list_del(&desc->list);
-		rc = idxd_submit_desc(wq, desc);
-		if (rc < 0) {
-			/* FIXME: There is no way to return error to the caller */
-			pr_info("%s: desc submit failed rc %d\n", __func__, rc);
-			idxd_free_desc(wq, desc);
-		}
-	}
 }
 
 static dma_cookie_t idxd_dma_tx_submit(struct dma_async_tx_descriptor *tx)
 {
 	struct dma_chan *c = tx->chan;
-	struct idxd_dma_chan *idxd_chan = container_of(c, struct idxd_dma_chan, chan);
+	struct idxd_wq *wq = to_idxd_wq(c);
 	dma_cookie_t cookie;
+	int rc;
 	struct idxd_desc *desc = container_of(tx, struct idxd_desc, txd);
 
 	cookie = (desc->gen << DESC_ID_BITS) | (desc->id & DESC_ID_MASK);
@@ -499,7 +478,11 @@ static dma_cookie_t idxd_dma_tx_submit(struct dma_async_tx_descriptor *tx)
 
 	tx->cookie = cookie;
 
-	list_add_tail(&desc->list, &idxd_chan->pending);
+	rc = idxd_submit_desc(wq, desc);
+	if (rc < 0) {
+		idxd_free_desc(wq, desc);
+		return rc;
+	}
 
 	return cookie;
 }
@@ -578,7 +561,6 @@ int idxd_register_dma_channel(struct idxd_dma_chan *ichan)
 	struct dma_chan *chan;
 	int rc, i;
 
-	INIT_LIST_HEAD(&ichan->pending);
 	chan = &ichan->chan;
 	chan->device = dma;
 	list_add_tail(&chan->device_node, &dma->channels);

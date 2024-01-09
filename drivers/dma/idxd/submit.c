@@ -159,6 +159,13 @@ int idxd_submit_desc(struct idxd_wq *wq, struct idxd_desc *desc)
 	portal = idxd_wq_portal_addr(wq);
 
 	/*
+	 * The wmb() flushes writes to coherent DMA data before
+	 * possibly triggering a DMA read. The wmb() is necessary
+	 * even on UP because the recipient is a device.
+	 */
+	wmb();
+
+	/*
 	 * Pending the descriptor to the lockless list for the irq_entry
 	 * that we designated the descriptor to.
 	 */

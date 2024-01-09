@@ -187,9 +187,6 @@ struct idxd_dma_chan {
 	struct dma_chan chan;
 	struct idxd_wq *wq;
 
-	struct list_head pending;
-	u32 num_queued;
-
 	/* for KERNEL_USER DMA Channels */
 	int pasid;
 	bool priv;
@@ -233,7 +230,6 @@ struct idxd_wq {
 	struct idxd_desc **descs;
 	struct idxd_dma_chan *idxd_chan;
 	u32 outstanding;
-	struct list_head indirects;
 	struct llist_head free_llist;
 	struct sbitmap_queue sbq;
 	int chan_count;
