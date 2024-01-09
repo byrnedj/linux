@@ -30,7 +30,8 @@
  * The PASID_FLAG_FL5LP flag Indicates using 5-level paging for first-
  * level translation, otherwise, 4-level paging will be used.
  */
-#define PASID_FLAG_FL5LP		BIT(1)
+#define PASID_FLAG_FL5LP		BIT(3)
+#define PASID_FLAG_SUPERVISOR_MODE	BIT(4)
 
 struct pasid_dir_entry {
 	u64 val;

@@ -518,7 +518,7 @@ static int iommufd_hwpt_attach_device(struct iommufd_hw_pagetable *hwpt,
 					       &handle->handle);
 	else
 		rc = iommu_attach_device_pasid(hwpt->domain, idev->dev, pasid,
-					       &handle->handle);
+					       &handle->handle, 0);
 	if (rc)
 		goto out_free_handle;
 

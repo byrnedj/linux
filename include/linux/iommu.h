@@ -319,6 +319,12 @@ struct iommu_iort_rmr_data {
 
 #define IOMMU_NO_PASID	(0U) /* Reserved for DMA w/o PASID */
 #define IOMMU_FIRST_GLOBAL_PASID	(1U) /*starting range for allocation */
+
+/*
+ * Bind a process for kernel work submission to user, returns a kernel PASID
+ * for the process.
+ */
+#define IOMMU_SVA_BIND_KERNEL  BIT(1)
 #define IOMMU_PASID_INVALID	(-1U)
 typedef unsigned int ioasid_t;
 
@@ -754,7 +760,7 @@ struct iommu_domain_ops {
 	int (*attach_dev)(struct iommu_domain *domain, struct device *dev,
 			  struct iommu_domain *old);
 	int (*set_dev_pasid)(struct iommu_domain *domain, struct device *dev,
-			     ioasid_t pasid, struct iommu_domain *old);
+			     ioasid_t pasid, struct iommu_domain *old, uint32_t flags);
 
 	int (*map_pages)(struct iommu_domain *domain, unsigned long iova,
 			 phys_addr_t paddr, size_t pgsize, size_t pgcount,
@@ -1182,7 +1188,7 @@ void iommu_device_release_dma_owner(struct device *dev);
 
 int iommu_attach_device_pasid(struct iommu_domain *domain,
 			      struct device *dev, ioasid_t pasid,
-			      struct iommu_attach_handle *handle);
+			      struct iommu_attach_handle *handle, uint32_t flags);
 void iommu_detach_device_pasid(struct iommu_domain *domain,
 			       struct device *dev, ioasid_t pasid);
 ioasid_t iommu_alloc_global_pasid(struct device *dev);
@@ -1494,7 +1500,7 @@ static inline int iommu_device_claim_dma_owner(struct device *dev, void *owner)
 
 static inline int iommu_attach_device_pasid(struct iommu_domain *domain,
 					    struct device *dev, ioasid_t pasid,
-					    struct iommu_attach_handle *handle)
+					    struct iommu_attach_handle *handle, uint32_t flags)
 {
 	return -ENODEV;
 }
@@ -1615,13 +1621,13 @@ static inline u32 mm_get_enqcmd_pasid(struct mm_struct *mm)
 
 void mm_pasid_drop(struct mm_struct *mm);
 struct iommu_sva *iommu_sva_bind_device(struct device *dev,
-					struct mm_struct *mm);
+				struct mm_struct *mm, uint32_t flags);
 void iommu_sva_unbind_device(struct iommu_sva *handle);
 u32 iommu_sva_get_pasid(struct iommu_sva *handle);
 void iommu_sva_invalidate_kva_range(unsigned long start, unsigned long end);
 #else
 static inline struct iommu_sva *
-iommu_sva_bind_device(struct device *dev, struct mm_struct *mm)
+iommu_sva_bind_device(struct device *dev, struct mm_struct *mm, uint32_t flags)
 {
 	return ERR_PTR(-ENODEV);
 }

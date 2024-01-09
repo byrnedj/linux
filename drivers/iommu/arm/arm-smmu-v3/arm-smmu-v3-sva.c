@@ -269,7 +269,7 @@ void arm_smmu_sva_notifier_synchronize(void)
 
 static int arm_smmu_sva_set_dev_pasid(struct iommu_domain *domain,
 				      struct device *dev, ioasid_t id,
-				      struct iommu_domain *old)
+				      struct iommu_domain *old, uint32_t flags)
 {
 	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
 	struct arm_smmu_master *master = dev_iommu_priv_get(dev);
