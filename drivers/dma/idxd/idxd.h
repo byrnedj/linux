@@ -185,7 +185,6 @@ struct idxd_dma_chan {
 	struct idxd_wq *wq;
 
 	struct list_head pending;
-	u32 num_queued;
 
 	/* for KERNEL_USER DMA Channels */
 	int pasid;
@@ -195,7 +194,6 @@ struct idxd_dma_chan {
 
 struct idxd_wq {
 	void __iomem *portal;
-	void __iomem *unlimited_portal;
 	u32 portal_offset;
 	unsigned int enqcmds_retries;
 	struct percpu_ref wq_active;
@@ -230,7 +228,7 @@ struct idxd_wq {
 	int compls_size;
 	struct idxd_desc **descs;
 	u32 outstanding;
-	struct list_head indirects;
+	struct idxd_dma_chan *idxd_chan;
 	struct llist_head free_llist;
 	struct sbitmap_queue sbq;
 	int chan_count;
@@ -422,8 +420,6 @@ struct idxd_desc {
 	struct list_head list;
 	u16 id;
 	u16 gen;
-	u16 flags;
-	u16 descs_submitted;
 	struct idxd_wq *wq;
 
 	struct idxd_batch *batch;
@@ -739,8 +735,6 @@ void idxd_wq_free_irq(struct idxd_wq *wq);
 int idxd_wq_request_irq(struct idxd_wq *wq, int pasid);
 
 /* submission */
-void idxd_desc_assign_ie(struct idxd_wq *wq, struct idxd_desc *desc);
-void idxd_desc_unassign_ie(struct idxd_wq *wq, struct idxd_desc *desc);
 int idxd_submit_desc(struct idxd_wq *wq, struct idxd_desc *desc);
 struct idxd_desc *idxd_alloc_desc(struct idxd_wq *wq, enum idxd_op_type optype);
 void idxd_free_desc(struct idxd_wq *wq, struct idxd_desc *desc);

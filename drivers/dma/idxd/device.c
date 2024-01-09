@@ -170,8 +170,7 @@ int idxd_wq_alloc_resources(struct idxd_wq *wq)
 	if (wq->type != IDXD_WQT_KERNEL)
 		return 0;
 
-	//num_descs = wq_dedicated(wq) ? wq->size : wq->threshold;
-	num_descs = 1024;
+	num_descs = wq_dedicated(wq) ? wq->size : wq->threshold;
 	wq->num_descs = num_descs;
 
 	rc = alloc_hw_descs(wq, num_descs);
@@ -188,8 +187,6 @@ int idxd_wq_alloc_resources(struct idxd_wq *wq)
 	rc = alloc_descs(wq, num_descs);
 	if (rc < 0)
 		goto fail_alloc_descs;
-
-	INIT_LIST_HEAD(&wq->indirects);
 
 	init_llist_head(&wq->free_llist);
 	for (i = 0; i < num_descs; i++) {
@@ -328,13 +325,11 @@ int idxd_wq_map_portal(struct idxd_wq *wq)
 	resource_size_t start;
 
 	start = pci_resource_start(pdev, IDXD_WQ_BAR);
-	start += idxd_get_wq_portal_full_offset(wq->id, IDXD_PORTAL_UNLIMITED);
+	start += idxd_get_wq_portal_full_offset(wq->id, IDXD_PORTAL_LIMITED);
 
-	wq->unlimited_portal = devm_ioremap(dev, start, IDXD_PORTAL_SIZE * 2);
-	if (!wq->unlimited_portal)
+	wq->portal = devm_ioremap(dev, start, IDXD_PORTAL_SIZE);
+	if (!wq->portal)
 		return -ENOMEM;
-
-	wq->portal = wq->unlimited_portal + IDXD_PORTAL_SIZE;
 
 	return 0;
 }
@@ -343,9 +338,8 @@ void idxd_wq_unmap_portal(struct idxd_wq *wq)
 {
 	struct device *dev = &wq->idxd->pdev->dev;
 
-	devm_iounmap(dev, wq->unlimited_portal);
+	devm_iounmap(dev, wq->portal);
 	wq->portal = NULL;
-	wq->unlimited_portal = NULL;
 	wq->portal_offset = 0;
 }
 
@@ -356,7 +350,7 @@ void idxd_wqs_unmap_portal(struct idxd_device *idxd)
 	for (i = 0; i < idxd->max_wqs; i++) {
 		struct idxd_wq *wq = idxd->wqs[i];
 
-		if (wq->unlimited_portal)
+		if (wq->portal)
 			idxd_wq_unmap_portal(wq);
 	}
 }
