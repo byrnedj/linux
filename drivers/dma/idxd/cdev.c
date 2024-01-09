@@ -272,7 +272,7 @@ static int idxd_cdev_open(struct inode *inode, struct file *filp)
 			dev_warn(dev, "PASID entry already exist in xarray.\n");
 
 		if (wq_dedicated(wq)) {
-			rc = idxd_wq_set_pasid(wq, pasid);
+			rc = idxd_wq_set_pasid(wq, pasid, 0);
 			if (rc < 0) {
 				dev_err(dev, "wq set pasid failed: %d\n", rc);
 				goto failed_set_pasid;

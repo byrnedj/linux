@@ -287,7 +287,7 @@ static inline int idxd_dma_chan_set_attr(struct dma_chan *chan,
 
 		if (wq_dedicated(wq)) {
 			pr_info("setting pasid in wq %d to %d\n", wq->id, param->p.pasid);
-			rc = idxd_wq_set_pasid(wq, param->p.pasid);
+			rc = idxd_wq_set_pasid(wq, param->p.pasid, param->p.priv);
 			if (rc < 0) {
 				dev_err(dev, "wq set pasid failed: %d\n", rc);
 				return rc;
@@ -376,7 +376,7 @@ static void idxd_dma_free_chan_resources(struct dma_chan *chan)
 			int rc;
 
 			pr_info("restoring pasid in wq %d to %d\n", wq->id, wq->idxd->pasid);
-			rc = idxd_wq_set_pasid(wq, wq->idxd->pasid);
+			rc = idxd_wq_set_pasid(wq, wq->idxd->pasid, 0);
 			if (rc < 0)
 				dev_err(dev, "wq set pasid failed: %d\n", rc);
 		}
