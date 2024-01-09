@@ -298,7 +298,7 @@ out:
 }
 
 static int intel_svm_bind_mm(struct intel_iommu *iommu, struct device *dev,
-			     struct mm_struct *mm)
+			     struct mm_struct *mm, uint32_t flags)
 {
 	struct device_domain_info *info = dev_iommu_priv_get(dev);
 	struct intel_svm_dev *sdev;
@@ -350,6 +350,8 @@ static int intel_svm_bind_mm(struct intel_iommu *iommu, struct device *dev,
 
 	/* Setup the pasid table: */
 	sflags = cpu_feature_enabled(X86_FEATURE_LA57) ? PASID_FLAG_FL5LP : 0;
+	if (flags & IOMMU_SVA_BIND_KERNEL)
+		sflags |= PASID_FLAG_SUPERVISOR_MODE;
 	ret = intel_pasid_setup_first_level(iommu, dev, mm->pgd, mm->pasid,
 					    FLPT_DEFAULT_DID, sflags);
 	if (ret)
@@ -835,7 +837,7 @@ void intel_svm_remove_dev_pasid(struct device *dev, ioasid_t pasid)
 }
 
 static int intel_svm_set_dev_pasid(struct iommu_domain *domain,
-				   struct device *dev, ioasid_t pasid)
+			   struct device *dev, ioasid_t pasid, uint32_t flags)
 {
 	struct device_domain_info *info = dev_iommu_priv_get(dev);
 	struct intel_iommu *iommu = info->iommu;
@@ -843,7 +845,7 @@ static int intel_svm_set_dev_pasid(struct iommu_domain *domain,
 	int ret;
 
 	mutex_lock(&pasid_mutex);
-	ret = intel_svm_bind_mm(iommu, dev, mm);
+	ret = intel_svm_bind_mm(iommu, dev, mm, flags);
 	mutex_unlock(&pasid_mutex);
 
 	return ret;

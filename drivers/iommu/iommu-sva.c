@@ -52,7 +52,7 @@ out:
  *
  * On error, returns an ERR_PTR value.
  */
-struct iommu_sva *iommu_sva_bind_device(struct device *dev, struct mm_struct *mm)
+struct iommu_sva *iommu_sva_bind_device(struct device *dev, struct mm_struct *mm, uint32_t flags)
 {
 	struct iommu_domain *domain;
 	struct iommu_sva *handle;
@@ -93,7 +93,7 @@ struct iommu_sva *iommu_sva_bind_device(struct device *dev, struct mm_struct *mm
 		goto out_unlock;
 	}
 
-	ret = iommu_attach_device_pasid(domain, dev, mm->pasid);
+	ret = iommu_attach_device_pasid(domain, dev, mm->pasid, flags);
 	if (ret)
 		goto out_free_domain;
 	domain->users = 1;

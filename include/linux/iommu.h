@@ -190,6 +190,12 @@ enum iommu_dev_features {
 	IOMMU_DEV_FEAT_IOPF,
 };
 
+/*
+ * Bind a process for kernel work submission to user, returns a kernel PASID
+ * for the process.
+ */
+#define IOMMU_SVA_BIND_KERNEL  BIT(1)
+
 #define IOMMU_PASID_INVALID	(-1U)
 typedef unsigned int ioasid_t;
 
@@ -319,7 +325,7 @@ struct iommu_ops {
 struct iommu_domain_ops {
 	int (*attach_dev)(struct iommu_domain *domain, struct device *dev);
 	int (*set_dev_pasid)(struct iommu_domain *domain, struct device *dev,
-			     ioasid_t pasid);
+			     ioasid_t pasid, uint32_t flags);
 
 	int (*map)(struct iommu_domain *domain, unsigned long iova,
 		   phys_addr_t paddr, size_t size, int prot, gfp_t gfp);
@@ -717,7 +723,7 @@ void iommu_device_release_dma_owner(struct device *dev);
 struct iommu_domain *iommu_sva_domain_alloc(struct device *dev,
 					    struct mm_struct *mm);
 int iommu_attach_device_pasid(struct iommu_domain *domain,
-			      struct device *dev, ioasid_t pasid);
+			      struct device *dev, ioasid_t pasid, uint32_t flags);
 void iommu_detach_device_pasid(struct iommu_domain *domain,
 			       struct device *dev, ioasid_t pasid);
 struct iommu_domain *
@@ -1075,7 +1081,7 @@ iommu_sva_domain_alloc(struct device *dev, struct mm_struct *mm)
 }
 
 static inline int iommu_attach_device_pasid(struct iommu_domain *domain,
-					    struct device *dev, ioasid_t pasid)
+				    struct device *dev, ioasid_t pasid, uint32_t flags)
 {
 	return -ENODEV;
 }
@@ -1193,13 +1199,13 @@ static inline void mm_pasid_init(struct mm_struct *mm)
 }
 void mm_pasid_drop(struct mm_struct *mm);
 struct iommu_sva *iommu_sva_bind_device(struct device *dev,
-					struct mm_struct *mm);
+				struct mm_struct *mm, uint32_t flags);
 void iommu_sva_unbind_device(struct iommu_sva *handle);
 u32 iommu_sva_get_pasid(struct iommu_sva *handle);
 
 #else
 static inline struct iommu_sva *
-iommu_sva_bind_device(struct device *dev, struct mm_struct *mm)
+iommu_sva_bind_device(struct device *dev, struct mm_struct *mm, uint32_t flags)
 {
 	return NULL;
 }

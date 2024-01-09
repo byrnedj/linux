@@ -4785,7 +4785,7 @@ static void intel_iommu_remove_dev_pasid(struct device *dev, ioasid_t pasid)
 }
 
 static int intel_iommu_attach_device_pasid(struct iommu_domain *domain,
-					   struct device *dev, ioasid_t pasid)
+			   struct device *dev, ioasid_t pasid, uint32_t flags)
 {
 	struct device_domain_info *info = dev_iommu_priv_get(dev);
 	struct dmar_domain *dmar_domain = to_dmar_domain(domain);
