@@ -3607,7 +3607,7 @@ out_free:
 
 static int intel_iommu_set_dev_pasid(struct iommu_domain *domain,
 				     struct device *dev, ioasid_t pasid,
-				     struct iommu_domain *old)
+				     struct iommu_domain *old, uint32_t flags)
 {
 	struct device_domain_info *info = dev_iommu_priv_get(dev);
 	struct dmar_domain *dmar_domain = to_dmar_domain(domain);

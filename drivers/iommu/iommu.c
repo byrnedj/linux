@@ -3400,12 +3400,12 @@ static void iommu_remove_dev_pasid(struct device *dev, ioasid_t pasid,
 	struct iommu_domain *blocked_domain = ops->blocked_domain;
 
 	WARN_ON(blocked_domain->ops->set_dev_pasid(blocked_domain,
-						   dev, pasid, domain));
+						   dev, pasid, domain, 0));
 }
 
 static int __iommu_set_group_pasid(struct iommu_domain *domain,
 				   struct iommu_group *group, ioasid_t pasid,
-				   struct iommu_domain *old)
+				   struct iommu_domain *old, uint32_t flags)
 {
 	struct group_device *device, *last_gdev;
 	int ret;
@@ -3413,7 +3413,7 @@ static int __iommu_set_group_pasid(struct iommu_domain *domain,
 	for_each_group_device(group, device) {
 		if (device->dev->iommu->max_pasids > 0) {
 			ret = domain->ops->set_dev_pasid(domain, device->dev,
-							 pasid, old);
+							 pasid, old, flags);
 			if (ret)
 				goto err_revert;
 		}
@@ -3468,7 +3468,7 @@ static void __iommu_remove_group_pasid(struct iommu_group *group,
  */
 int iommu_attach_device_pasid(struct iommu_domain *domain,
 			      struct device *dev, ioasid_t pasid,
-			      struct iommu_attach_handle *handle)
+			      struct iommu_attach_handle *handle, uint32_t flags)
 {
 	/* Caller must be a probed driver on dev */
 	struct iommu_group *group = dev->iommu_group;
@@ -3515,7 +3515,7 @@ int iommu_attach_device_pasid(struct iommu_domain *domain,
 	if (ret)
 		goto out_unlock;
 
-	ret = __iommu_set_group_pasid(domain, group, pasid, NULL);
+	ret = __iommu_set_group_pasid(domain, group, pasid, NULL, flags);
 	if (ret) {
 		xa_release(&group->pasid_array, pasid);
 		goto out_unlock;
@@ -3609,7 +3609,7 @@ int iommu_replace_device_pasid(struct iommu_domain *domain,
 
 	if (curr_domain != domain) {
 		ret = __iommu_set_group_pasid(domain, group,
-					      pasid, curr_domain);
+					      pasid, curr_domain, 0);
 		if (ret)
 			goto out_unlock;
 	}
