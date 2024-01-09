@@ -251,7 +251,7 @@ static int idxd_cdev_open(struct inode *inode, struct file *filp)
 	ctx->pid = current->pid;
 
 	if (device_user_pasid_enabled(idxd)) {
-		sva = iommu_sva_bind_device(dev, current->mm);
+		sva = iommu_sva_bind_device(dev, current->mm, 0);
 		if (IS_ERR(sva)) {
 			rc = PTR_ERR(sva);
 			dev_err(dev, "pasid allocation failed: %d\n", rc);
@@ -275,7 +275,7 @@ static int idxd_cdev_open(struct inode *inode, struct file *filp)
 			dev_warn(dev, "PASID entry already exist in xarray.\n");
 
 		if (wq_dedicated(wq)) {
-			rc = idxd_wq_set_pasid(wq, pasid);
+			rc = idxd_wq_set_pasid(wq, pasid, 0);
 			if (rc < 0) {
 				iommu_sva_unbind_device(sva);
 				dev_err(dev, "wq set pasid failed: %d\n", rc);
