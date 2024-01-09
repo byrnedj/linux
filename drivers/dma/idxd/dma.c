@@ -58,8 +58,8 @@ void idxd_dma_complete_txd(struct idxd_desc *desc,
 		if (status == 0)
 			break;
 
-		if (status != DSA_COMP_SUCCESS)
-			pr_err("Indirect descriptor failed!\n");
+		//if (status != DSA_COMP_SUCCESS)
+			//pr_err("Indirect descriptor failed! status %x\n", status);
 
 		list_del(&indirect->list);
 		desc->wq->outstanding--;
@@ -80,8 +80,6 @@ void idxd_dma_complete_txd(struct idxd_desc *desc,
 		complete = 0;
 	}
 
-	desc->wq->outstanding--;
-
 	tx = &desc->txd;
 	if (complete && tx->cookie) {
 		dma_cookie_complete(tx);
@@ -91,8 +89,10 @@ void idxd_dma_complete_txd(struct idxd_desc *desc,
 		tx->callback_result = NULL;
 	}
 
-	if (free_desc)
+	if (free_desc) {
+		desc->wq->outstanding--;
 		idxd_free_desc(desc->wq, desc);
+	}
 }
 
 static void op_flag_setup(unsigned long flags, u32 *desc_flags)
@@ -127,7 +127,7 @@ dmachan_alloc_desc(struct dma_chan *chan, enum idxd_op_type optype)
 	struct idxd_desc *desc;
 
 	desc = idxd_alloc_desc(wq, optype);
-	if (!desc)
+	if (IS_ERR(desc))
 		return NULL;
 	dma_async_tx_descriptor_init(&desc->txd, chan);
 	return desc;
@@ -172,7 +172,7 @@ idxd_dma_submit_memcpy(struct dma_chan *c, dma_addr_t dma_dest,
 
 	op_flag_setup(flags, &desc_flags);
 	desc = dmachan_alloc_desc(c, IDXD_OP_BLOCK);
-	if (IS_ERR(desc))
+	if (!desc)
 		return NULL;
 
 	idxd_prep_desc_common(wq, desc->hw, DSA_OPCODE_MEMMOVE,
@@ -207,7 +207,7 @@ idxd_dma_kernel_user(struct dma_chan *chan, struct iov_iter *u_iter,
 		return NULL;
 
 	desc = dmachan_alloc_desc(chan, IDXD_OP_NONBLOCK);
-	if (IS_ERR(desc))
+	if (!desc)
 		return NULL;
 
 	if (!wq_dedicated(wq)) {
@@ -353,7 +353,7 @@ idxd_dma_single_kernel_user(struct dma_chan *chan, void __user *dst,
 	if (idxd->hw.gen_cap.cache_control_mem)
 		desc_flags |= IDXD_OP_FLAG_CC;
 	desc = dmachan_alloc_desc(chan, IDXD_OP_NONBLOCK);
-	if (IS_ERR(desc))
+	if (!desc)
 		return NULL;
 
 	if (!wq_dedicated(wq)) {
@@ -510,11 +510,8 @@ static struct idxd_desc *idxd_build_desc_set(struct dma_chan *dma_chan)
 	parent->batch->num = 0;
 	if (!list_empty(&idxd_chan->pending)) {
 		req = idxd_build_desc_set(dma_chan);
-		if (req != NULL) {
+		if (req != NULL)
 			memcpy(&parent->batch->descs[parent->batch->num++], req->hw, sizeof(*req->hw));
-			parent->batch->num++;
-			wq->outstanding++;
-		}
 	}
 
 	list_for_each_entry_safe(req, tmp, &tmp_list, list) {
@@ -531,6 +528,7 @@ static struct idxd_desc *idxd_build_desc_set(struct dma_chan *dma_chan)
 
 	idxd_desc_assign_ie(wq, parent);
 
+	wq->outstanding++;
 	list_add_tail(&parent->list, &wq->indirects);
 
 	return parent;
@@ -577,7 +575,7 @@ static void idxd_dma_issue_pending(struct dma_chan *dma_chan)
 
 			/* Throw away the top-level descriptor */
 			desc->completion->status = IDXD_COMP_DESC_ABORT;
-			idxd_dma_complete_txd(desc, IDXD_COMPLETE_ABORT, true);
+			idxd_dma_complete_txd(desc, IDXD_COMPLETE_ABORT, false);
 		}
 	} else {
 		list_for_each_entry_safe(desc, tmp, &idxd_chan->pending, list) {
