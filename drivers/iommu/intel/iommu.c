@@ -2768,7 +2768,7 @@ static int blocking_domain_attach_dev(struct iommu_domain *domain,
 
 static int blocking_domain_set_dev_pasid(struct iommu_domain *domain,
 					 struct device *dev, ioasid_t pasid,
-					 struct iommu_domain *old);
+					 struct iommu_domain *old, uint32_t flags);
 
 static struct iommu_domain blocking_domain = {
 	.type = IOMMU_DOMAIN_BLOCKED,
@@ -3557,7 +3557,7 @@ void domain_remove_dev_pasid(struct iommu_domain *domain,
 
 static int blocking_domain_set_dev_pasid(struct iommu_domain *domain,
 					 struct device *dev, ioasid_t pasid,
-					 struct iommu_domain *old)
+					 struct iommu_domain *old, uint32_t flags)
 {
 	struct device_domain_info *info = dev_iommu_priv_get(dev);
 
@@ -3607,7 +3607,7 @@ out_free:
 
 static int intel_iommu_set_dev_pasid(struct iommu_domain *domain,
 				     struct device *dev, ioasid_t pasid,
-				     struct iommu_domain *old)
+				     struct iommu_domain *old, uint32_t flags)
 {
 	struct device_domain_info *info = dev_iommu_priv_get(dev);
 	struct dmar_domain *dmar_domain = to_dmar_domain(domain);
@@ -3855,7 +3855,7 @@ static int identity_domain_attach_dev(struct iommu_domain *domain,
 
 static int identity_domain_set_dev_pasid(struct iommu_domain *domain,
 					 struct device *dev, ioasid_t pasid,
-					 struct iommu_domain *old)
+					 struct iommu_domain *old, uint32_t flags)
 {
 	struct device_domain_info *info = dev_iommu_priv_get(dev);
 	struct intel_iommu *iommu = info->iommu;

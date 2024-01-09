@@ -36,7 +36,7 @@ static int uio_pci_sva_open(struct uio_info *info, struct inode *inode)
 	if (domain)
 		iommu_detach_device(domain, &udev->pdev->dev);
 
-	handle = iommu_sva_bind_device(&udev->pdev->dev, current->mm);
+	handle = iommu_sva_bind_device(&udev->pdev->dev, current->mm, 0);
 	if (IS_ERR(handle))
 		return -EINVAL;
 
