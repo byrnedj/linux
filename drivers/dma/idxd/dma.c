@@ -470,7 +470,10 @@ static void idxd_dma_issue_pending(struct dma_chan *dma_chan)
 
 	/* FIXME: Needs a lock to protect the pending list */
 	list_for_each_entry_safe(desc, itr, &idxd_chan->pending, list) {
+		if (wq_dedicated(wq) && wq->outstanding >= wq->size)
+			break;
 		list_del(&desc->list);
+		desc->wq->outstanding++;
 		rc = idxd_submit_desc(wq, desc);
 		if (rc < 0) {
 			/* FIXME: There is no way to return error to the caller */
