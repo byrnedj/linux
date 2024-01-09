@@ -2816,6 +2816,7 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 	struct device *dev;
 	int rc = 0;
 	struct dma_chan_attr_params param;
+	int flags = IOMMU_SVA_BIND_KERNEL;
 
 	dma_cap_zero(mask);
 	dma_cap_set(DMA_MEMCPY, mask);
@@ -2829,7 +2830,7 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 	}
 
 	dev = ctx->dma.chan->device->dev;
-	ctx->dma.sva = iommu_sva_bind_device(dev, ctx->mm_account);
+	ctx->dma.sva = iommu_sva_bind_device(dev, ctx->mm_account, flags);
 	if (IS_ERR(ctx->dma.sva)) {
 		rc = PTR_ERR(ctx->dma.sva);
 		goto failed;
