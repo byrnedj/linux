@@ -372,7 +372,7 @@ void idxd_wqs_unmap_portal(struct idxd_device *idxd)
 	}
 }
 
-static void __idxd_wq_set_pasid_locked(struct idxd_wq *wq, int pasid)
+static void __idxd_wq_set_pasid_locked(struct idxd_wq *wq, int pasid, bool priv)
 {
 	struct idxd_device *idxd = wq->idxd;
 	union wqcfg wqcfg;
@@ -383,12 +383,13 @@ static void __idxd_wq_set_pasid_locked(struct idxd_wq *wq, int pasid)
 	wqcfg.bits[WQCFG_PASID_IDX] = ioread32(idxd->reg_base + offset);
 	wqcfg.pasid_en = 1;
 	wqcfg.pasid = pasid;
+	wqcfg.priv = priv;
 	wq->wqcfg->bits[WQCFG_PASID_IDX] = wqcfg.bits[WQCFG_PASID_IDX];
 	iowrite32(wqcfg.bits[WQCFG_PASID_IDX], idxd->reg_base + offset);
 	spin_unlock(&idxd->dev_lock);
 }
 
-int idxd_wq_set_pasid(struct idxd_wq *wq, int pasid)
+int idxd_wq_set_pasid(struct idxd_wq *wq, int pasid, bool priv)
 {
 	struct idxd_device *idxd = wq->idxd;
 	struct device *dev = &idxd->pdev->dev;
@@ -398,7 +399,7 @@ int idxd_wq_set_pasid(struct idxd_wq *wq, int pasid)
 	if (rc < 0)
 		return rc;
 
-	__idxd_wq_set_pasid_locked(wq, pasid);
+	__idxd_wq_set_pasid_locked(wq, pasid, priv);
 
 	idxd_wq_free_irq(wq);
 
@@ -432,6 +433,7 @@ int idxd_wq_disable_pasid(struct idxd_wq *wq)
 	wqcfg.bits[WQCFG_PASID_IDX] = ioread32(idxd->reg_base + offset);
 	wqcfg.pasid_en = 0;
 	wqcfg.pasid = 0;
+	wqcfg.priv = 0;
 	iowrite32(wqcfg.bits[WQCFG_PASID_IDX], idxd->reg_base + offset);
 	spin_unlock(&idxd->dev_lock);
 
@@ -1513,7 +1515,7 @@ int idxd_drv_enable_wq(struct idxd_wq *wq)
 			if (is_idxd_wq_kernel(wq) || wq_shared(wq)) {
 				u32 pasid = wq_dedicated(wq) ? idxd->pasid : 0;
 
-				__idxd_wq_set_pasid_locked(wq, pasid);
+				__idxd_wq_set_pasid_locked(wq, pasid, 0);
 			}
 		}
 	}
