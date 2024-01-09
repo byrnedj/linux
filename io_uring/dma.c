@@ -2,6 +2,7 @@
 
 #include <linux/io_uring_types.h>
 #include <linux/io_uring.h>
+#include <linux/dma-mapping.h>
 #include "io_uring.h"
 
 struct kmem_cache *dma_cachep;
@@ -124,8 +125,15 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	i = 0;
 	bytes = 0;
 	while (iov_iter_count(dst_iter) > 0) {
-		dma->dst[i].iov_base = (void *)iter_iov_addr(dst_iter);
-		dma->dst[i].iov_len = iter_iov_len(dst_iter);
+		if (iter_is_iovec(dst_iter)) {
+			dma->dst[i].iov_base = (void *)iter_iov_addr(dst_iter);
+			dma->dst[i].iov_len = iter_iov_len(dst_iter);
+		} else if (iter_is_ubuf(dst_iter)) {
+			dma->dst[i].iov_base = dst_iter->ubuf;
+			dma->dst[i].iov_len = dst_iter->count;
+		} else {
+			WARN_ONCE(1, "Unknown user iterator type %d\n", dst_iter->iter_type);
+		}
 		bytes += dma->dst[i].iov_len;
 		iov_iter_advance(dst_iter, dma->dst[i].iov_len);
 		i++;
@@ -178,6 +186,7 @@ error_unmap:
 
 	return rc;
 }
+EXPORT_SYMBOL_GPL(io_uring_copy_to_iter);
 
 static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma, int ret)
 {
@@ -260,6 +269,8 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 
 			req->dma.dma_tasks = NULL;
 			ret = -EIOCBQUEUED;
+			/* Queue the task for processing completion later */
+			io_req_complete_defer(req);
 		}
 
 		kiocb->ki_flags &= ~IOCB_DMA_COPY;
@@ -338,7 +349,7 @@ int __io_dma_poll(struct io_ring_ctx *ctx)
 			if (prev)
 				prev->next = next;
 			else
-				ctx->dma.head = dma->next;
+				ctx->dma.head = next;
 
 			if (ctx->dma.tail == dma)
 				ctx->dma.tail = prev;
