@@ -184,8 +184,6 @@ struct idxd_dma_chan {
 	struct dma_chan chan;
 	struct idxd_wq *wq;
 
-	struct list_head pending;
-
 	/* for KERNEL_USER DMA Channels */
 	int pasid;
 	bool priv;
