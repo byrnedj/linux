@@ -226,8 +226,11 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma, 
 	kmem_cache_free(dma_cachep, dma);
 	req->dma.dma_refcnt--;
 
-	if (req->dma.dma_refcnt == 0)
+	if (req->dma.dma_refcnt == 0) {
 		kiocb_done(req, req->dma.dma_result, NULL, IO_URING_F_COMPLETE_DEFER);
+		/* Queue the task for processing completion later */
+		io_req_complete_defer(req);
+	}
 }
 
 int io_dma_submit_queued_tasks(struct io_kiocb *req)
@@ -269,8 +272,6 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 
 			req->dma.dma_tasks = NULL;
 			ret = -EIOCBQUEUED;
-			/* Queue the task for processing completion later */
-			io_req_complete_defer(req);
 		}
 
 		kiocb->ki_flags &= ~IOCB_DMA_COPY;
