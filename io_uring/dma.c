@@ -326,6 +326,8 @@ int __io_dma_poll(struct io_ring_ctx *ctx)
 	if (!dma)
 		ctx->dma.tail = NULL;
 
+	io_submit_flush_completions(ctx);
+
 	/* Try to submit any entries that were queued */
 	prev = NULL;
 	while (dma && count > 0) {
@@ -362,8 +364,6 @@ int __io_dma_poll(struct io_ring_ctx *ctx)
 
 		dma = next;
 	}
-
-	io_submit_flush_completions(ctx);
 
 	return ctx->dma.head ? 1 : 0;
 }

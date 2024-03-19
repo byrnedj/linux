@@ -270,7 +270,7 @@ struct io_dma_kiocb {
 	struct io_dma_task	*dma_tasks;
 };
 
-#define IO_DMA_MAX_ELEMENTS 32
+#define IO_DMA_MAX_ELEMENTS 128
 
 struct io_dma_task {
 	struct io_kiocb		*req;
