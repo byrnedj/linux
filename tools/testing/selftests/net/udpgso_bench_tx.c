@@ -622,11 +622,15 @@ static void print_audit_report(unsigned long num_msgs, unsigned long num_sends)
 
 static void print_report(unsigned long num_msgs, unsigned long num_sends)
 {
+	static unsigned long old_num_msgs;
+
 	fprintf(stderr,
 		"%s tx: %6lu MB/s %8lu calls/s %6lu msg/s\n",
 		cfg_tcp ? "tcp" : "udp",
-		(num_msgs * cfg_payload_len) >> 20,
-		num_sends, num_msgs);
+		((num_msgs - old_num_msgs) * cfg_payload_len) >> 20,
+		num_sends, num_msgs - old_num_msgs);
+
+	old_num_msgs = num_msgs;
 
 	if (cfg_audit) {
 		total_num_msgs += num_msgs;
@@ -707,7 +711,7 @@ int main(int argc, char **argv)
 		tnow = gettimeofday_ms();
 		if (tnow >= treport) {
 			print_report(num_msgs, num_sends);
-			num_msgs = num_sends = 0;
+			num_sends = 0;
 			treport = tnow + 1000;
 		}
 
