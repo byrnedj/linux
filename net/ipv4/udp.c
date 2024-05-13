@@ -113,6 +113,7 @@
 #include <net/sock_reuseport.h>
 #include <net/addrconf.h>
 #include <net/udp_tunnel.h>
+#include <linux/io_uring.h>
 #if IS_ENABLED(CONFIG_IPV6)
 #include <net/ipv6_stubs.h>
 #endif
@@ -1844,6 +1845,14 @@ EXPORT_SYMBOL(udp_read_skb);
  * 	return it, otherwise we block.
  */
 
+void cb_fn(struct kiocb *kiocb, void *arg, int err)
+{
+	struct sk_buff *skb = arg;
+	struct socket *socket = sock_from_file(kiocb->ki_filp);
+
+	skb_consume_udp(socket->sk, skb, err);
+}
+
 int udp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags,
 		int *addr_len)
 {
@@ -1885,11 +1894,21 @@ try_again:
 			goto csum_copy_err;
 	}
 
-	if (checksum_valid || udp_skb_csum_unnecessary(skb)) {
-		if (udp_skb_is_linear(skb))
-			err = copy_linear_skb(skb, copied, off, &msg->msg_iter);
-		else
-			err = skb_copy_datagram_msg(skb, off, msg, copied);
+	if (checksum_valid || udp_skb_csum_unnecessary(skb) || msg->msg_io_iocb) {
+		if (msg->msg_io_iocb) {
+			struct iov_iter src;
+			struct kvec kvec = { .iov_base = skb->data + off, .iov_len = copied };
+
+			iov_iter_kvec(&src, READ, &kvec, 1, copied);
+			err = io_uring_copy_to_iter((struct kiocb *)msg->msg_io_iocb, &msg->msg_iter,
+					&src, cb_fn, skb, 0);
+			return err;
+		} else {
+			if (udp_skb_is_linear(skb))
+				err = copy_linear_skb(skb, copied, off, &msg->msg_iter);
+			else
+				err = skb_copy_datagram_msg(skb, off, msg, copied);
+		}
 	} else {
 		err = skb_copy_and_csum_datagram_msg(skb, off, msg);
 

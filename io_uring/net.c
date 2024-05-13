@@ -856,6 +856,12 @@ int io_recv(struct io_kiocb *req, unsigned int issue_flags)
 	if (!io_check_multishot(req, issue_flags))
 		return -EAGAIN;
 
+	if (force_nonblock && req->ctx->dma.chan) {
+		msg.msg_io_iocb = req;
+		io_uring_dma_prep(req);
+	} else
+		msg.msg_io_iocb = NULL;
+
 	sock = sock_from_file(req->file);
 	if (unlikely(!sock))
 		return -ENOTSOCK;
@@ -890,6 +896,15 @@ retry_multishot:
 		min_ret = iov_iter_count(&msg.msg_iter);
 
 	ret = sock_recvmsg(sock, &msg, flags);
+	if (ret > 0) {
+		int ret2 = io_dma_submit_queued_tasks(req);
+		if (ret2 < 0) {
+			ret = ret2;
+			if (ret == -EIOCBQUEUED)
+				return IOU_ISSUE_SKIP_COMPLETE;
+		}
+	}
+
 	if (ret < min_ret) {
 		if (ret == -EAGAIN && force_nonblock) {
 			if (issue_flags & IO_URING_F_MULTISHOT) {
