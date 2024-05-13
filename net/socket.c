@@ -2802,6 +2802,7 @@ static int ____sys_recvmsg(struct socket *sock, struct msghdr *msg_sys,
 
 	/* We assume all kernel code knows the size of sockaddr_storage */
 	msg_sys->msg_namelen = 0;
+	msg_sys->msg_io_iocb = NULL;
 
 	if (sock->file->f_flags & O_NONBLOCK)
 		flags |= MSG_DONTWAIT;
