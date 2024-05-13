@@ -49,12 +49,14 @@ struct io_dma {
 void io_uring_dma_prep(struct io_kiocb *req)
 {
 	struct io_dma *dma;
-	
+
 	if (req->ctx->dma.chan == NULL)
 		return;
-	
-	dma = io_kiocb_to_cmd(req, struct io_dma);
 
+	dma = io_kiocb_to_cmd(req, struct io_dma);
+	/* DANGER
+	 * for io_recv this field overlaps with msg_flags
+	 */
 	dma->kiocb.ki_flags |= IOCB_DMA_COPY;
 	req->dma.dma_refcnt = 0;
 	req->dma.dma_result = 0;
@@ -87,7 +89,7 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 
 	len = (iov_iter_count(src_iter) > iov_iter_count(dst_iter)) ?
 		iov_iter_count(dst_iter) : iov_iter_count(src_iter);
-	len = (len > req->cqe.res) ? req->cqe.res : len;
+	//len = (len > req->cqe.res) ? req->cqe.res : len;
 
 	iov_iter_truncate(dst_iter, len);
 	iov_iter_truncate(src_iter, len);
@@ -227,7 +229,10 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma, 
 	req->dma.dma_refcnt--;
 
 	if (req->dma.dma_refcnt == 0) {
-		kiocb_done(req, req->dma.dma_result, NULL, IO_URING_F_COMPLETE_DEFER);
+		if (req->opcode != IORING_OP_RECV)
+			kiocb_done(req, req->dma.dma_result, NULL, IO_URING_F_COMPLETE_DEFER);
+		else
+			io_req_set_res(req, dma->len, 0 /*cflags*/);
 		/* Queue the task for processing completion later */
 		io_req_complete_defer(req);
 	}
@@ -238,6 +243,9 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 	struct io_dma *dma = io_kiocb_to_cmd(req, struct io_dma);
 	struct kiocb *kiocb = &dma->kiocb;
 	int ret = 0;
+
+	if (!req->ctx->dma.chan)
+		return 0;
 
 	if ((kiocb->ki_flags & IOCB_DMA_COPY) != 0) {
 		if (req->dma.dma_refcnt > 0) {

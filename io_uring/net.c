@@ -1199,10 +1199,25 @@ retry_multishot:
 	kmsg->msg.msg_flags = 0;
 	kmsg->msg.msg_inq = -1;
 
+	if (force_nonblock && req->ctx->dma.chan) {
+		kmsg->msg.msg_io_iocb = req;
+		io_uring_dma_prep(req);
+	} else {
+		kmsg->msg.msg_io_iocb = NULL;
+	}
+
 	if (flags & MSG_WAITALL)
 		min_ret = iov_iter_count(&kmsg->msg.msg_iter);
 
 	ret = sock_recvmsg(sock, &kmsg->msg, flags);
+	if (ret > 0) {
+		int ret2 = io_dma_submit_queued_tasks(req);
+		if (ret2 < 0) {
+			ret = ret2;
+			if (ret == -EIOCBQUEUED)
+				return IOU_ISSUE_SKIP_COMPLETE;
+		}
+	}
 	if (ret < min_ret) {
 		if (ret == -EAGAIN && force_nonblock) {
 			io_kbuf_recycle(req, sel.buf_list, issue_flags);
