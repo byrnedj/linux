@@ -1853,6 +1853,42 @@ void cb_fn(struct kiocb *kiocb, void *arg, int err)
 	skb_consume_udp(socket->sk, skb, err);
 }
 
+static int printkvec(struct sk_buff *skb, int off, int len, struct kvec *kvec)
+{
+	int start = skb_headlen(skb);
+	int copy;
+	int i;
+
+	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
+		int end;
+		const skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
+
+		end = start + skb_frag_size(frag);
+
+
+		if ((copy = end - off) > 0) {
+			struct page *page = skb_frag_page(frag);
+			u8 *vaddr = kmap(page);
+
+			if (copy > len)
+				copy = len;
+
+			kvec[i].iov_base = vaddr + skb_frag_off(frag) + off - start;
+			kvec[i].iov_len = copy;
+
+			off += copy;
+			kunmap(page);
+			if (!(len -= copy))
+				return 0;
+
+		}
+		start = end;
+
+	}
+
+	return 0;
+}
+
 int udp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags,
 		int *addr_len)
 {
@@ -1897,11 +1933,22 @@ try_again:
 	if (checksum_valid || udp_skb_csum_unnecessary(skb) || msg->msg_io_iocb) {
 		if (msg->msg_io_iocb) {
 			struct iov_iter src;
-			struct kvec kvec = { .iov_base = skb->data + off, .iov_len = copied };
 
-			iov_iter_kvec(&src, READ, &kvec, 1, copied);
-			err = io_uring_copy_to_iter((struct kiocb *)msg->msg_io_iocb, &msg->msg_iter,
-					&src, cb_fn, skb, 0);
+			if (udp_skb_is_linear(skb)) {
+				struct kvec kvec = { .iov_base = skb->data + off, .iov_len = copied };
+
+				iov_iter_kvec(&src, READ, &kvec, 1, copied);
+				err = io_uring_copy_to_iter((struct kiocb *)msg->msg_io_iocb, &msg->msg_iter,
+						&src, cb_fn, skb, 0);
+			} else {
+				struct kvec kvec[16] = {}; // should be equal to number of frags?
+				printkvec(skb, off, len, kvec);
+				iov_iter_kvec(&src, READ, kvec, skb_shinfo(skb)->nr_frags, copied);
+				err = io_uring_copy_to_iter((struct kiocb *)msg->msg_io_iocb, &msg->msg_iter,
+						&src, cb_fn, skb, 0);
+
+
+			}
 			return err;
 		} else {
 			if (udp_skb_is_linear(skb))
