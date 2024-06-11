@@ -113,6 +113,9 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 		dma->src[i].iov_len = iter_iov_len(src_iter);
 		bytes += dma->src[i].iov_len;
 		iov_iter_advance(src_iter, dma->src[i].iov_len);
+		if (dma->src[i].iov_len == 0)
+			pr_warn("iov_len is zero, iter count %ld\n", iov_iter_count(src_iter));
+
 		i++;
 
 		if (i == IO_DMA_MAX_ELEMENTS) {

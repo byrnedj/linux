@@ -2063,10 +2063,30 @@ void cb_fn(struct kiocb *kiocb, void *arg, int err)
 static int printkvec(struct sk_buff *skb, int off, int len, struct kvec *kvec)
 {
 	int start = skb_headlen(skb);
-	int copy;
+	int copy = start - off;
 	int i;
+	int ret;
+	int n = 0;
+	struct sk_buff *frag_iter;
+	struct kvec *saved_kvec = kvec;
 
-	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
+	ret = 0;
+	if (copy > 0) {
+		if (copy > len)
+			copy = len;
+
+		kvec[0].iov_base = skb->data + off;
+		kvec[0].iov_len = copy;
+
+		if ((len -= copy) == 0)
+			return 1;
+		off += copy;
+		kvec++;
+		ret++;
+	}
+
+
+	for (i = 0; len && i < skb_shinfo(skb)->nr_frags; i++) {
 		int end;
 		const skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
 
@@ -2082,19 +2102,42 @@ static int printkvec(struct sk_buff *skb, int off, int len, struct kvec *kvec)
 
 			kvec[i].iov_base = vaddr + skb_frag_off(frag) + off - start;
 			kvec[i].iov_len = copy;
-
+			ret++;
 			off += copy;
 			kunmap(page);
-			if (!(len -= copy))
-				return 0;
+			len -= copy;
+		}
+		start = end;
+	}
+
+	kvec += i;
+	skb_walk_frags(skb, frag_iter) {
+		int end;
+
+		WARN_ON(start > off + len);
+
+
+		end = start + frag_iter->len;
+		if ((copy = end - off) > 0) {
+			if (copy > len)
+				copy = len;
+
+			n = printkvec(frag_iter, off - start, copy, kvec);
+
+			off += copy;
+			kvec += n;
+			if ((len -= copy) == 0)
+				break;
 
 		}
 		start = end;
 
 	}
 
-	return 0;
+	return kvec - saved_kvec;
 }
+
+static struct kvec kvec[256][128];
 
 int udp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags,
 		int *addr_len)
@@ -2148,9 +2191,11 @@ try_again:
 				err = io_uring_copy_to_iter((struct kiocb *)msg->msg_io_iocb, &msg->msg_iter,
 						&src, cb_fn, skb, 0);
 			} else {
-				struct kvec kvec[16] = {}; // should be equal to number of frags?
-				printkvec(skb, off, len, kvec);
-				iov_iter_kvec(&src, READ, kvec, skb_shinfo(skb)->nr_frags, copied);
+				int kvec_len;
+				int cpu = get_cpu();
+				kvec_len = printkvec(skb, off, copied, kvec[cpu]);
+				iov_iter_kvec(&src, READ, kvec[cpu], kvec_len, copied);
+				put_cpu();
 				err = io_uring_copy_to_iter((struct kiocb *)msg->msg_io_iocb, &msg->msg_iter,
 						&src, cb_fn, skb, 0);
 
