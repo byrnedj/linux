@@ -3088,6 +3088,7 @@ static __cold void io_ring_exit_work(struct work_struct *work)
 		if (WARN_ON_ONCE(time_after(jiffies, timeout))) {
 			/* there is little hope left, don't run it too often */
 			interval = HZ * 60;
+			break;
 		}
 	} while (!wait_for_completion_timeout(&ctx->ref_comp, interval));
 
