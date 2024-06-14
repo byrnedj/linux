@@ -3116,6 +3116,7 @@ static __cold void io_ring_exit_work(struct work_struct *work)
 		if (WARN_ON_ONCE(time_after(jiffies, timeout))) {
 			/* there is little hope left, don't run it too often */
 			interval = HZ * 60;
+			break;
 		}
 		/*
 		 * This is really an uninterruptible wait, as it has to be
