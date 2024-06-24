@@ -3046,7 +3046,7 @@ static __cold bool io_cancel_ctx_cb(struct io_wq_work *work, void *data)
 static __cold void io_ring_exit_work(struct work_struct *work)
 {
 	struct io_ring_ctx *ctx = container_of(work, struct io_ring_ctx, exit_work);
-	unsigned long timeout = jiffies + HZ * 60 * 5;
+	unsigned long timeout = jiffies + HZ * 2;// * 5;
 	unsigned long interval = HZ / 20;
 	struct io_tctx_exit exit;
 	struct io_tctx_node *node;
