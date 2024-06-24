@@ -279,7 +279,7 @@
 #include <linux/uaccess.h>
 #include <asm/ioctls.h>
 #include <net/busy_poll.h>
-
+#include <linux/io_uring.h>
 /* Track pending CMSGs. */
 enum {
 	TCP_CMSG_INQ = 1,
@@ -1629,13 +1629,15 @@ void tcp_cleanup_rbuf(struct sock *sk, int copied)
 	__tcp_cleanup_rbuf(sk, copied);
 }
 
-static void tcp_eat_recv_skb(struct sock *sk, struct sk_buff *skb)
+static void tcp_eat_recv_skb(struct sock *sk, struct sk_buff *skb, bool free)
 {
 	__skb_unlink(skb, &sk->sk_receive_queue);
 	if (likely(skb->destructor == sock_rfree)) {
 		sock_rfree(skb);
 		skb->destructor = NULL;
 		skb->sk = NULL;
+		if (!free)
+			return;
 		return skb_attempt_defer_free(skb);
 	}
 	__kfree_skb(skb);
@@ -1660,7 +1662,7 @@ struct sk_buff *tcp_recv_skb(struct sock *sk, u32 seq, u32 *off)
 		 * splitted a fat GRO packet, while we released socket lock
 		 * in skb_splice_bits()
 		 */
-		tcp_eat_recv_skb(sk, skb);
+		tcp_eat_recv_skb(sk, skb, true);
 	}
 	return NULL;
 }
@@ -1729,11 +1731,11 @@ int tcp_read_sock(struct sock *sk, read_descriptor_t *desc,
 				continue;
 		}
 		if (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN) {
-			tcp_eat_recv_skb(sk, skb);
+			tcp_eat_recv_skb(sk, skb, true);
 			++seq;
 			break;
 		}
-		tcp_eat_recv_skb(sk, skb);
+		tcp_eat_recv_skb(sk, skb, true);
 		if (!desc->count)
 			break;
 		WRITE_ONCE(tp->copied_seq, seq);
@@ -1819,11 +1821,11 @@ void tcp_read_done(struct sock *sk, size_t len)
 			break;
 
 		if (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN) {
-			tcp_eat_recv_skb(sk, skb);
+			tcp_eat_recv_skb(sk, skb, true);
 			++seq;
 			break;
 		}
-		tcp_eat_recv_skb(sk, skb);
+		tcp_eat_recv_skb(sk, skb, true);
 	}
 	WRITE_ONCE(tp->copied_seq, seq);
 
@@ -2414,6 +2416,92 @@ static int tcp_inq_hint(struct sock *sk)
 	return inq;
 }
 
+static int printkvec(struct sk_buff *skb, int off, int len, struct kvec *kvec)
+{
+	int start = skb_headlen(skb);
+	int copy = start - off;
+	int i;
+	int ret;
+	int n = 0;
+	struct sk_buff *frag_iter;
+	struct kvec *saved_kvec = kvec;
+
+	ret = 0;
+	if (copy > 0) {
+		if (copy > len)
+			copy = len;
+
+		kvec[0].iov_base = skb->data + off;
+		kvec[0].iov_len = copy;
+
+		if ((len -= copy) == 0)
+			return 1;
+		off += copy;
+		kvec++;
+		ret++;
+	}
+
+
+	for (i = 0; len && i < skb_shinfo(skb)->nr_frags; i++) {
+		int end;
+		const skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
+
+		end = start + skb_frag_size(frag);
+
+
+		if ((copy = end - off) > 0) {
+			struct page *page = skb_frag_page(frag);
+			u8 *vaddr = kmap(page);
+
+			if (copy > len)
+				copy = len;
+
+			kvec[i].iov_base = vaddr + skb_frag_off(frag) + off - start;
+			kvec[i].iov_len = copy;
+			ret++;
+			off += copy;
+			kunmap(page);
+			len -= copy;
+		}
+		start = end;
+	}
+
+	kvec += i;
+	skb_walk_frags(skb, frag_iter) {
+		int end;
+
+		WARN_ON(start > off + len);
+
+
+		end = start + frag_iter->len;
+		if ((copy = end - off) > 0) {
+			if (copy > len)
+				copy = len;
+
+			n = printkvec(frag_iter, off - start, copy, kvec);
+
+			off += copy;
+			kvec += n;
+			if ((len -= copy) == 0)
+				break;
+
+		}
+		start = end;
+
+	}
+
+	return kvec - saved_kvec;
+}
+
+static void cb_fn(struct kiocb *kiocb, void *arg, int err)
+{
+	struct sk_buff *skb = arg;
+
+	skb_attempt_defer_free(skb);
+}
+
+static struct kvec kvec[256][128];
+
 /*
  *	This routine copies from a sock struct into the user buffer.
  *
@@ -2600,12 +2688,25 @@ found_ok_skb:
 		}
 
 		if (!(flags & MSG_TRUNC)) {
-			err = skb_copy_datagram_msg(skb, offset, msg, used);
-			if (err) {
-				/* Exception. Bailout! */
-				if (!copied)
-					copied = -EFAULT;
-				break;
+			if (msg->msg_io_iocb) {
+				struct iov_iter src;
+
+				int kvec_len;
+				int cpu = get_cpu();
+				kvec_len = printkvec(skb, offset, used, kvec[cpu]);
+				iov_iter_kvec(&src, READ, kvec[cpu], kvec_len, used);
+				put_cpu();
+				err = io_uring_copy_to_iter((struct kiocb *)msg->msg_io_iocb, &msg->msg_iter,
+						&src, cb_fn, skb, 0);
+
+			} else {
+				err = skb_copy_datagram_msg(skb, offset, msg, used);
+				if (err) {
+					/* Exception. Bailout! */
+					if (!copied)
+						copied = -EFAULT;
+					break;
+				}
 			}
 		}
 
@@ -2626,20 +2727,24 @@ skip_copy:
 			*cmsg_flags |= TCP_CMSG_TS;
 		}
 
-		if (used + offset < skb->len)
+		if (used + offset < skb->len && !msg->msg_io_iocb)
 			continue;
 
 		if (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN)
 			goto found_fin_ok;
 		if (!(flags & MSG_PEEK))
-			tcp_eat_recv_skb(sk, skb);
-		continue;
+			tcp_eat_recv_skb(sk, skb, !msg->msg_io_iocb);
+
+		if (!msg->msg_io_iocb)
+			continue;
+		else
+			break;
 
 found_fin_ok:
 		/* Process the FIN. */
 		WRITE_ONCE(*seq, *seq + 1);
 		if (!(flags & MSG_PEEK))
-			tcp_eat_recv_skb(sk, skb);
+			tcp_eat_recv_skb(sk, skb, !msg->msg_io_iocb);
 		break;
 	} while (len > 0);
 
