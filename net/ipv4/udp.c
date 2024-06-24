@@ -2052,7 +2052,7 @@ EXPORT_IPV6_MOD(udp_read_skb);
  * 	return it, otherwise we block.
  */
 
-void cb_fn(struct kiocb *kiocb, void *arg, int err)
+static void cb_fn(struct kiocb *kiocb, void *arg, int err)
 {
 	struct sk_buff *skb = arg;
 	struct socket *socket = sock_from_file(kiocb->ki_filp);
