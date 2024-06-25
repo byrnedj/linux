@@ -2794,11 +2794,22 @@ static int tcp_recvmsg_locked(struct sock *sk, struct msghdr *msg, size_t len,
 			/* Now that we have two receive queues this
 			 * shouldn't happen.
 			 */
+			if (0) {
 			if (WARN(before(*seq, TCP_SKB_CB(skb)->seq),
 				 "TCP recvmsg seq # bug: copied %X, seq %X, rcvnxt %X, fl %X\n",
 				 *seq, TCP_SKB_CB(skb)->seq, tp->rcv_nxt,
 				 flags))
 				break;
+			}
+
+			/* Convert to printk to avoid backtrace() */
+			if (before(*seq, TCP_SKB_CB(skb)->seq)) {
+
+				 printk(KERN_ERR "TCP recvmsg seq # bug: copied %X, seq %X, rcvnxt %X, fl %X\n",
+				 *seq, TCP_SKB_CB(skb)->seq, tp->rcv_nxt,
+				 flags);
+				break;
+			}
 
 			offset = *seq - TCP_SKB_CB(skb)->seq;
 			if (unlikely(TCP_SKB_CB(skb)->tcp_flags & TCPHDR_SYN)) {
@@ -2910,7 +2921,6 @@ found_ok_skb:
 			if (skb_frags_readable(skb)) {
 				if (msg->msg_io_iocb) {
 					struct iov_iter src;
-
 					int kvec_len;
 					int cpu = get_cpu();
 					kvec_len = printkvec(skb, offset, used, kvec[cpu]);
@@ -2973,6 +2983,14 @@ skip_copy:
 			*cmsg_flags |= TCP_CMSG_TS;
 		}
 
+		/*
+		 * if the (used + offset < skb->len) is true then we hit the
+		 * if (before(*seq, TCP_SKB_CB(skb)->seq)) {
+		 * error condition - to avoid this the user buffer has to be sized large
+		 * e.g., 2MB
+		 */
+		if (msg->msg_io_iocb && (used + offset < skb->len))
+			printk(KERN_ERR "used %d offset %d skblen %d\n", used, offset, skb->len);
 		if (used + offset < skb->len && !msg->msg_io_iocb)
 			continue;
 
