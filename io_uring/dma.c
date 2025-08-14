@@ -5,7 +5,45 @@
 #include <linux/dma-mapping.h>
 #include "io_uring.h"
 
+#ifndef pr_fmt
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+#endif
+
+static const char *dma_status_str(int s)
+{
+	switch (s) {
+	case DMA_COMPLETE:    return "DMA_COMPLETE";
+	case DMA_IN_PROGRESS: return "DMA_IN_PROGRESS";
+	case DMA_PAUSED:      return "DMA_PAUSED";
+	case DMA_ERROR:       return "DMA_ERROR";
+	default:              return "DMA_?";
+	}
+}
+
+
 struct kmem_cache *dma_cachep;
+
+void io_dma_poll_workfn(struct work_struct *w)
+{
+        /* work_struct is embedded in ctx->dma (struct io_dma_channel) */
+        struct io_dma_channel *d = container_of(w, struct io_dma_channel, poll_work);
+        /* io_dma_channel is embedded in io_ring_ctx as 'dma' */
+        struct io_ring_ctx *ctx = container_of(d, struct io_ring_ctx, dma);
+
+        /* Drain until the list is empty */
+        do {
+pr_debug("running the poll: dma=%px\n",ctx->dma.chan);
+                __io_dma_poll(ctx);
+                cpu_relax();
+        } while (READ_ONCE(ctx->dma.head));
+
+        /* Disarm; if new tasks arrived meanwhile, re-arm */
+        atomic_set(&ctx->dma.poll_armed, 0);
+        if (READ_ONCE(ctx->dma.head) &&
+            atomic_cmpxchg(&ctx->dma.poll_armed, 0, 1) == 0)
+                queue_work(system_unbound_wq, &ctx->dma.poll_work);
+}
+
 
 static int __io_dma_task_submit(struct dma_chan *chan, struct io_dma_task *dma)
 {
@@ -19,13 +57,21 @@ static int __io_dma_task_submit(struct dma_chan *chan, struct io_dma_task *dma)
 	tx = dmaengine_prep_memcpy_sva_kernel_user(chan,
 		&dst, &src, dma->flags);
 	if (!tx) {
+	       pr_err("dma prep failed: len=%zu flags=0x%lx\n",
+	             (size_t)dma->len, dma->flags);
 		/* We don't actually know why the prep step failed, so
 		* just pick an error code for the most likely reason.
 		*/
 		return -EAGAIN;
 	}
+	pr_debug("dma prep OK: len=%zu flags=0x%lx tx=%px\n",
+	 (size_t)dma->len, dma->flags, tx);
 
 	dma->cookie = dmaengine_submit(tx);
+
+        pr_debug("dma submit cookie=%d (submit_error=%d)\n",
+	dma->cookie, dma_submit_error(dma->cookie));
+
 	if (dma_submit_error(dma->cookie)) {
 		/*
 		* This failure is never due to lack of resources, so we can really fail
@@ -60,6 +106,7 @@ void io_uring_dma_prep(struct io_kiocb *req)
 	dma->kiocb.ki_flags |= IOCB_DMA_COPY;
 	req->dma.dma_refcnt = 0;
 	req->dma.dma_result = 0;
+	//req->dma.remaining = req->rw.len;
 	req->dma.dma_tasks = NULL;
 }
 
@@ -89,6 +136,9 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 
 	len = (iov_iter_count(src_iter) > iov_iter_count(dst_iter)) ?
 		iov_iter_count(dst_iter) : iov_iter_count(src_iter);
+	if (len > req->cqe.res) {
+		pr_err("len %d cqe.res %d\n", len, req->cqe.res);
+	}
 	//len = (len > req->cqe.res) ? req->cqe.res : len;
 
 	iov_iter_truncate(dst_iter, len);
@@ -157,17 +207,23 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	dma->cb_fn = cb_fn;
 	dma->cb_arg = cb_arg;
 
+pr_debug("copy_to_iter: len=%zu (dst_cnt=%zu src_cnt=%zu) cqe->res %d\n",
+	 (size_t)len, iov_iter_count(dst_iter), iov_iter_count(src_iter), req->cqe.res);
 	rc = __io_dma_task_submit(ctx->dma.chan, dma);
 	if (rc == -EAGAIN) {
+	pr_debug("submit returns EAGAIN; deferring (cookie=0)\n");
 		/*
 		* Continue on and resubmit this operation when another one completes.
 		*/
 		dma->cookie = 0;
 	} else if (rc != 0) {
+	pr_err("submit failed: rc=%d\n", rc);
 		goto error_free;
 	}
 
 	req->dma.dma_refcnt++;
+pr_debug("queued dma task %px cookie=%d refcnt=%d\n",
+	 dma, dma->cookie, req->dma.dma_refcnt);
 
 	if (!req->dma.dma_tasks)
 		req->dma.dma_tasks = dma;
@@ -176,6 +232,10 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 		while (tmp->next)
 			tmp = tmp->next;
 		tmp->next = dma;
+	}
+	if (atomic_cmpxchg(&ctx->dma.poll_armed, 0, 1) == 0) {
+pr_debug("queueing the poll: dma=%px\n",ctx->dma.chan);
+		    queue_work(system_unbound_wq, &ctx->dma.poll_work);
 	}
 
 	iov_iter_restore(dst_iter, &dst_state);
@@ -203,7 +263,8 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma, 
 	iov_iter_init(&dst, READ, dma->dst, IO_DMA_MAX_ELEMENTS, dma->len);
 
 	req = dma->req;
-
+pr_debug("task_complete: dma=%px ret=%s(%d) len=%zu prev_total=%d\n",
+	 dma, dma_status_str(ret), ret, (size_t)dma->len, req->dma.dma_result);
 	if (ret == DMA_COMPLETE) {
 		/*
 		* If this DMA was successful and no earlier DMA failed,
@@ -230,8 +291,11 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma, 
 
 	kmem_cache_free(dma_cachep, dma);
 	req->dma.dma_refcnt--;
+pr_debug("task_complete: refcnt=%d after free\n", req->dma.dma_refcnt);
 
 	if (req->dma.dma_refcnt == 0) {
+	pr_debug("finalize: opcode=%d total_res=%d (recv? %d) -> defer CQE\n",
+		 req->opcode, req->dma.dma_result, req->opcode == IORING_OP_RECV);
 		if (req->opcode != IORING_OP_RECV)
 			kiocb_done(req, req->dma.dma_result, NULL, IO_URING_F_COMPLETE_DEFER);
 		else
@@ -298,13 +362,19 @@ int __io_dma_poll(struct io_ring_ctx *ctx)
 	int ret;
 	struct device *dev;
 	int count;
+pr_info("poll: poller entered ctx=%px chan=%px\n",
+		        ctx, ctx->dma.chan);
 
 	if (!ctx->dma.chan)
 		return 0;
 
 	dma_async_issue_pending(ctx->dma.chan);
+pr_debug("poll: issue_pending; head=%px tail=%px\n", ctx->dma.head, ctx->dma.tail);
 
 	dev = ctx->dma.chan->device->dev;
+    //pr_info("DMA dev=%s copy_align=%u residue_granularity=%u max_sg_burst=%u\n",
+///		                dev_driver_string(dev), dev->copy_align, dev->residue_granularity,
+//				            dev->max_sg_burst);
 
 	dma = ctx->dma.head;
 	count = 0;
@@ -313,10 +383,13 @@ int __io_dma_poll(struct io_ring_ctx *ctx)
 
 		if (dma->cookie == 0)
 			break;
-
+pr_debug("poll: check cookie=%d\n", dma->cookie);
 		ret = dmaengine_async_is_tx_complete(ctx->dma.chan, dma->cookie);
+pr_debug("poll: cookie=%d status=%s(%d)\n",
+	 dma->cookie, dma_status_str(ret), ret);
 
 		if (ret == DMA_IN_PROGRESS) {
+	pr_debug("poll: in progress; stop at this cookie\n");
 			/*
 			* Stop polling here. We rely on completing operations
 			* in submission order for error handling below to be
@@ -326,7 +399,7 @@ int __io_dma_poll(struct io_ring_ctx *ctx)
 			*/
 			break;
 		}
-
+pr_debug("poll: complete cookie=%d; calling task_complete\n", dma->cookie);
 		__io_dma_task_complete(dev, dma, ret);
 
 		count++;
@@ -337,7 +410,7 @@ int __io_dma_poll(struct io_ring_ctx *ctx)
 	ctx->dma.head = dma;
 	if (!dma)
 		ctx->dma.tail = NULL;
-
+pr_debug("poll: flushing io_uring completions\n");
 	io_submit_flush_completions(ctx);
 
 	/* Try to submit any entries that were queued */
