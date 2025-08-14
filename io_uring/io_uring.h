@@ -6,6 +6,7 @@
 #include <linux/resume_user_mode.h>
 #include <linux/kasan.h>
 #include <linux/io_uring_types.h>
+#include <linux/workqueue.h>
 #include <uapi/linux/eventpoll.h>
 #include "io-wq.h"
 #include "slist.h"
@@ -27,6 +28,7 @@ enum {
 	IOU_STOP_MULTISHOT	= -ECANCELED,
 };
 
+void io_dma_poll_workfn(struct work_struct *w);
 struct io_uring_cqe *__io_get_cqe(struct io_ring_ctx *ctx, bool overflow);
 bool io_req_cqe_overflow(struct io_kiocb *req);
 int io_run_task_work_sig(struct io_ring_ctx *ctx);
