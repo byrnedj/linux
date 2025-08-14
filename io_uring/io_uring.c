@@ -2867,6 +2867,7 @@ static void io_release_dma_chan(struct io_ring_ctx *ctx)
 
 		ctx->dma.head = NULL;
 		ctx->dma.tail = NULL;
+		cancel_work_sync(&ctx->dma.poll_work);
 	}
 
 	if (ctx->dma.sva && !IS_ERR(ctx->dma.sva))
@@ -2892,6 +2893,8 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 	ctx->dma.chan = dma_request_chan_by_mask(&mask);
 	if (IS_ERR(ctx->dma.chan)) {
 		rc = PTR_ERR(ctx->dma.chan);
+                pr_err("dma_request_chan_by_mask() failed: %d (%pe)\n",
+                       rc, ctx->dma.chan);
 		ctx->dma.chan = NULL;
 		goto failed;
 	}
@@ -2900,25 +2903,36 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 	ctx->dma.sva = iommu_sva_bind_device(dev, ctx->mm_account, flags);
 	if (IS_ERR(ctx->dma.sva)) {
 		rc = PTR_ERR(ctx->dma.sva);
+                dev_err(dev, "iommu_sva_bind_device() failed: %d (%pe)\n",
+                        rc, ctx->dma.sva);
 		goto failed;
 	}
 
 	ctx->dma.pasid = iommu_sva_get_pasid(ctx->dma.sva);
 	if (ctx->dma.pasid == IOMMU_PASID_INVALID) {
 		rc = -EINVAL;
+                dev_err(dev, "iommu_sva_get_pasid() returned IOMMU_PASID_INVALID\n");
 		goto failed;
 	}
 
 	param.p.pasid = ctx->dma.pasid;
 	param.p.priv = true;
 
-	if (dmaengine_chan_set_attr(ctx->dma.chan, DMA_CHAN_SET_PASID, &param)) {
-		rc = -EINVAL;
-		goto failed;
+	rc = dmaengine_chan_set_attr(ctx->dma.chan, DMA_CHAN_SET_PASID, &param);
+	if (rc) {
+                if (rc == -EOPNOTSUPP) {
+                        dev_warn(dev, "DMA_CHAN_SET_PASID not supported; continuing without PASID\n");
+                } else {
+                        dev_err(dev, "dmaengine_chan_set_attr(DMA_CHAN_SET_PASID) failed: %d (%pe)\n",
+                                rc, ERR_PTR(rc));
+                        goto failed;
+                }		
 	}
 
 	ctx->dma.head = NULL;
 	ctx->dma.tail = NULL;
+        INIT_WORK(&ctx->dma.poll_work, io_dma_poll_workfn);
+        atomic_set(&ctx->dma.poll_armed, 0);
 
 	return 0;
 failed:
