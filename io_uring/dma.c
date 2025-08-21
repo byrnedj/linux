@@ -136,6 +136,9 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 
 	len = (iov_iter_count(src_iter) > iov_iter_count(dst_iter)) ?
 		iov_iter_count(dst_iter) : iov_iter_count(src_iter);
+	if (len > req->cqe.res) {
+		pr_err("len %d cqe.res %d\n", len, req->cqe.res);
+	}
 	//len = (len > req->cqe.res) ? req->cqe.res : len;
 
 	iov_iter_truncate(dst_iter, len);
@@ -204,8 +207,8 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	dma->cb_fn = cb_fn;
 	dma->cb_arg = cb_arg;
 
-pr_debug("copy_to_iter: len=%zu (dst_cnt=%zu src_cnt=%zu)\n",
-	 (size_t)len, iov_iter_count(dst_iter), iov_iter_count(src_iter));
+pr_debug("copy_to_iter: len=%zu (dst_cnt=%zu src_cnt=%zu) cqe->res %d\n",
+	 (size_t)len, iov_iter_count(dst_iter), iov_iter_count(src_iter), req->cqe.res);
 	rc = __io_dma_task_submit(ctx->dma.chan, dma);
 	if (rc == -EAGAIN) {
 	pr_debug("submit returns EAGAIN; deferring (cookie=0)\n");
@@ -369,6 +372,9 @@ pr_info("poll: poller entered ctx=%px chan=%px\n",
 pr_debug("poll: issue_pending; head=%px tail=%px\n", ctx->dma.head, ctx->dma.tail);
 
 	dev = ctx->dma.chan->device->dev;
+    //pr_info("DMA dev=%s copy_align=%u residue_granularity=%u max_sg_burst=%u\n",
+///		                dev_driver_string(dev), dev->copy_align, dev->residue_granularity,
+//				            dev->max_sg_burst);
 
 	dma = ctx->dma.head;
 	count = 0;
