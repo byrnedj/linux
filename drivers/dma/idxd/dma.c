@@ -109,6 +109,12 @@ dmachan_alloc_desc(struct dma_chan *chan, enum idxd_op_type optype)
 	if (!desc)
 		return NULL;
 	dma_async_tx_descriptor_init(&desc->txd, chan);
+
+    pr_debug("txd=%p cookie=%d flags=0x%x chan=%p\n",
+         &desc->txd,
+         desc->txd.cookie,
+         desc->txd.flags ,
+         desc->txd.chan);
 	return desc;
 }
 
@@ -344,6 +350,141 @@ idxd_dma_single_kernel_user(struct dma_chan *chan, void __user *dst,
 	idxd_prep_desc_common(wq, desc->hw, DSA_OPCODE_MEMMOVE,
 			      (u64)src, (u64)dst, len, (u64)desc->completion,
 			      desc_flags);
+	return &desc->txd;
+}
+
+static inline int fetch_sg_and_pos(struct scatterlist **sg, size_t *remain,
+				   unsigned int len)
+{
+	struct scatterlist *next = *sg;
+	int count = 0;
+
+	*remain -= len;
+
+	while (*remain == 0 && next && !sg_is_last(next)) {
+		next = sg_next(next);
+		*remain = sg_dma_len(next);
+		count++;
+	}
+
+	*sg = next;
+
+	return count;
+}
+
+/*
+ * idxd_dma_prep_memcpy_sg - prepare descriptors for a memcpy_sg transcation
+ *
+ * @chan: DMA channel
+ * @dst_sg: Destination scatter list
+ * @dst_nents: Number of entries in destination scatter list
+ * @src_sg: Source scatter list
+ * @src_nents: Number of entries in source scatter list
+ * @flags: DMA transcation flags
+ *
+ * Return: Async transcation descriptor on success and NULL in failure.
+ *
+ * DSA batch descriptor and work queue depth can provide large memcpy
+ * operation. Combined batch descriptor with WQ depth to support scatter
+ * list.
+ */
+static struct dma_async_tx_descriptor *
+idxd_dma_prep_memcpy_sg(struct dma_chan *chan,
+			struct scatterlist *dst_sg, unsigned int dst_nents,
+			struct scatterlist *src_sg, unsigned int src_nents,
+			unsigned long flags)
+{
+	struct idxd_wq *wq = to_idxd_wq(chan);
+	struct idxd_desc *desc;
+	struct idxd_batch *batch;
+	dma_addr_t dma_dst, dma_src;
+	size_t dst_avail, src_avail, len;
+	u32 desc_flags;
+	int i;
+
+	/* sanity check */
+	if (unlikely(!dst_sg || !src_sg))
+		return NULL;
+	if (unlikely(dst_nents == 0 || src_nents == 0))
+		return NULL;
+
+	if (min(dst_nents, src_nents) > wq->max_batch_size)
+		return NULL;
+
+	dst_avail = sg_dma_len(dst_sg);
+	src_avail = sg_dma_len(src_sg);
+	char*       devname = dev_name(chan->device->dev);
+	pr_debug("prep_memcpy_sg: src_nent %d, dst_nents %d\n", src_nents, dst_nents);
+	   pr_debug("prep_memcpy_sg: chan=%p client_count=%u dev=%s cookie=%d\n",
+			             chan, chan->client_count, devname, chan->cookie);
+	       pr_debug("prep_memcpy_sg: wq=%p id=%d type=%d size=%u flags=0x%lx state=%d\n",
+			                wq, wq->id, wq->type, wq->size, wq->flags, wq->state);
+
+	if (dst_nents == 1 && src_nents == 1) {
+		if (unlikely(dst_avail != src_avail))
+			return NULL;
+
+		return idxd_dma_submit_memcpy(chan, sg_dma_address(dst_sg),
+				sg_dma_address(src_sg), dst_avail, flags);
+	}
+
+	desc = idxd_alloc_desc(wq, IDXD_OP_NONBLOCK);
+	if (IS_ERR(desc))
+		return NULL;
+
+	/*
+	 * DSA Batch descriptor has a set of descriptors in array
+	 * is called 'batch'. fill up 'batch' field with some
+	 * descriptors of DSA_OPCODE_MEMMOVE until max_batch_size
+	 * or scatter list is consumed.
+	 */
+	batch = desc->batch;
+	for (i = 0; i < wq->max_batch_size; i++) {
+		dma_dst = sg_dma_address(dst_sg) + sg_dma_len(dst_sg) -
+			dst_avail;
+		dma_src = sg_dma_address(src_sg) + sg_dma_len(src_sg) -
+			src_avail;
+
+		len = min_t(size_t, dst_avail, src_avail);
+		len = min_t(size_t, len, wq->idxd->max_xfer_bytes);
+
+		memset(batch->descs + i, 0, sizeof(struct dsa_hw_desc));
+		idxd_prep_desc_common(wq, batch->descs + i, DSA_OPCODE_MEMMOVE,
+				dma_src, dma_dst, len, 0, IDXD_OP_FLAG_CC);
+		const struct dsa_hw_desc *hw;
+	    hw = (const struct dsa_hw_desc *)batch->descs+i;
+	    pr_debug("idxd prep_memcpy_sg: hw opcode=0x%x flags=0x%x xfer=%u src=0x%llx dst=0x%llx comp=0x%llx\n",
+			             hw->opcode, hw->flags, hw->xfer_size,
+				              (unsigned long long)hw->src_addr,
+					               (unsigned long long)hw->dst_addr,
+						                (unsigned long long)hw->completion_addr);
+		batch->num++;
+
+		dst_nents -= fetch_sg_and_pos(&dst_sg, &dst_avail, len);
+		src_nents -= fetch_sg_and_pos(&src_sg, &src_avail, len);
+
+		/* entries or src or dst consumed */
+		if (!dst_nents || !src_nents ||
+				!min_t(size_t, dst_avail, src_avail)) {
+			break;
+		}
+	}
+
+	struct device *dev = &wq->idxd->pdev->dev;
+	dev_dbg(dev, "%s: batch count: %d\n", __func__,
+		batch->num);
+	/* prepare DSA_OPCODE_BATCH */
+	op_flag_setup(flags, &desc_flags);
+	idxd_prep_desc_common(wq, desc->hw, DSA_OPCODE_BATCH,
+			batch->dma_descs, 0, batch->num,
+			desc->compl_dma, desc_flags);
+		const struct dsa_hw_desc *hw;
+	    hw   = desc ? (const struct dsa_hw_desc *)desc->hw : NULL;
+	    pr_debug("idxd prep_memcpy_sg: hw opcode=0x%x flags=0x%x xfer=%u src=0x%llx dst=0x%llx comp=0x%llx\n",
+			             hw->opcode, hw->flags, hw->xfer_size,
+				              (unsigned long long)hw->src_addr,
+					               (unsigned long long)hw->dst_addr,
+						                (unsigned long long)hw->completion_addr);
 
 	return &desc->txd;
 }
@@ -461,10 +602,19 @@ static void idxd_dma_issue_pending(struct dma_chan *dma_chan)
 static dma_cookie_t idxd_dma_tx_submit(struct dma_async_tx_descriptor *tx)
 {
 	struct dma_chan *c = tx->chan;
+	pr_debug("idxd: have tx->chan\n");
 	struct idxd_wq *wq = to_idxd_wq(c);
+	pr_debug("idxd: have wq\n");
 	dma_cookie_t cookie;
 	int rc;
 	struct idxd_desc *desc = container_of(tx, struct idxd_desc, txd);
+		const struct dsa_hw_desc *hw;
+	    hw   = desc ? (const struct dsa_hw_desc *)desc->hw : NULL;
+	    pr_debug("idxd: hw opcode=0x%x flags=0x%x xfer=%u src=0x%llx dst=0x%llx comp=0x%llx\n",
+			             hw->opcode, hw->flags, hw->xfer_size,
+				              (unsigned long long)hw->src_addr,
+					               (unsigned long long)hw->dst_addr,
+						                (unsigned long long)hw->completion_addr);
 
 	cookie = (desc->gen << DESC_ID_BITS) | (desc->id & DESC_ID_MASK);
 
@@ -526,6 +676,11 @@ int idxd_register_dma_device(struct idxd_device *idxd)
 			dma->device_chan_set_attr =
 				idxd_dma_chan_set_attr;
 		}
+	}
+
+	if (idxd->hw.opcap.bits[0] & IDXD_OPCAP_BATCH) {
+		dma_cap_set(DMA_MEMCPY_SG, dma->cap_mask);
+		dma->device_prep_dma_memcpy_sg = idxd_dma_prep_memcpy_sg;
 	}
 
 	dma->device_tx_status = idxd_dma_tx_status;
