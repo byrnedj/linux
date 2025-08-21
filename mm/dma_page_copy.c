@@ -2,6 +2,7 @@
 #include <linux/mm.h>
 #include <linux/dmaengine.h>
 #include <linux/dma-mapping.h>
+#include <linux/printk.h>
 
 static bool dma_migrate_enabled __read_mostly;
 static unsigned int dma_migrate_segment = 32;
@@ -173,6 +174,7 @@ int dma_migrate_folio_copy(struct folio *src, struct folio *dst)
 		return -EINVAL;
 
 	nr = folio_nr_pages(src);
+	pr_debug("dma_migrate: folio copy size=%zu nr=%u\n", folio_size(src), nr);
 
 	src_sg = kmalloc_array(dma_migrate_segment, sizeof(*src_sg),
 			GFP_KERNEL);
@@ -187,18 +189,18 @@ int dma_migrate_folio_copy(struct folio *src, struct folio *dst)
 		err = -ENOMEM;
 		goto done;
 	}
-#ifdef CONFIG_HAVE_SG_SET_FOLIO
-	if (nr > 1) {
-	        sg_init_table(src_sg, 1);
-	        sg_init_table(dst_sg, 1);
-	        sg_set_folio(&src_sg[0], src, folio_size(src), 0);
-	        sg_set_folio(&dst_sg[0], dst, folio_size(dst), 0);
-	        sg_mark_end(&src_sg[0]);
-	        sg_mark_end(&dst_sg[0]);
-	        err = __dma_page_copy_sg(src_sg, dst_sg, 1);
-		goto done;
-	}
-#endif
+//#ifdef CONFIG_HAVE_SG_SET_FOLIO
+//	if (nr > 1) {
+//	        sg_init_table(src_sg, 1);
+//	        sg_init_table(dst_sg, 1);
+//	        sg_set_folio(&src_sg[0], src, folio_size(src), 0);
+//	        sg_set_folio(&dst_sg[0], dst, folio_size(dst), 0);
+//	        sg_mark_end(&src_sg[0]);
+//	        sg_mark_end(&dst_sg[0]);
+//	        err = __dma_page_copy_sg(src_sg, dst_sg, 1);
+//		goto done;
+//	}
+//#endif
 
 	while (i < nr) {
 		//attempt to batch
@@ -224,6 +226,7 @@ int dma_migrate_folio_copy(struct folio *src, struct folio *dst)
 		sg_mark_end(&dst_sg[batch-1]);
 
 		if (__dma_page_copy_sg(src_sg, dst_sg, batch)) {
+			pr_err("dma_migrate: __dma_page_copy_sg(batch=%u) err=%d\n", batch, err);
 			err = -ENODEV;
 			goto done;
 		}

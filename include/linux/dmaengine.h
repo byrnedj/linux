@@ -1086,7 +1086,6 @@ static inline struct dma_async_tx_descriptor *dmaengine_prep_dma_memcpy(
 						    len, flags);
 }
 
-<<<<<<< HEAD
 static inline struct dma_async_tx_descriptor *dmaengine_prep_memcpy_sva_kernel_user(
 		struct dma_chan *chan, struct iov_iter *dst_iter,
 		struct iov_iter *src_iter, unsigned long flags)
