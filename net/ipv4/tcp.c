@@ -2709,15 +2709,28 @@ found_ok_skb:
 		if (!(flags & MSG_TRUNC)) {
 			if (msg->msg_io_iocb) {
 				struct iov_iter src;
-
+				struct kvec *kv;
 				int kvec_len;
-				int cpu = get_cpu();
-				kvec_len = printkvec(skb, offset, used, kvec[cpu]);
+				
+				get_cpu();
+				size_t avail = iov_iter_count(&msg->msg_iter);
+                		pr_debug("tcp_recvmsg: used=%zu avail_before=%zu flags=0x%x\n",
+				                         (size_t)used, avail, flags);
+				dbg_iter(&msg->msg_iter, "before-copy");
+
+				kv = this_cpu_ptr(tcp_recv_kvec);
+				kvec_len = printkvec(skb, offset, used, kv);
 				//printk(KERN_ERR "used %d skb %px ref %d\n", used, skb, refcount_read(&skb->users));
-				iov_iter_kvec(&src, READ, kvec[cpu], kvec_len, used);
+				//pr_debug("used %d skb %px ref %d\n", used, skb, refcount_read(&skb->users));
+				iov_iter_kvec(&src, READ, kv, kvec_len, used);
+                                pr_debug("tcp_recvmsg: kvec_len=%d used=%zu\n", kvec_len, (size_t)used);
 				put_cpu();
 				err = io_uring_copy_to_iter((struct kiocb *)msg->msg_io_iocb, &msg->msg_iter,
 						&src, cb_fn, skb, 0);
+
+				                pr_debug("tcp_recvmsg: io_uring_copy_to_iter ret=%d avail_after=%zu\n",
+								                         err, iov_iter_count(&msg->msg_iter));
+						                dbg_iter(&msg->msg_iter, "after-copy");
 
 			} else {
 				err = skb_copy_datagram_msg(skb, offset, msg, used);
