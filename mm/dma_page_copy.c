@@ -45,12 +45,21 @@ static int __dma_page_copy_sg(struct scatterlist *src, struct scatterlist *dst,
 	/* prep DMA scatterlist memcpy */
 	tx = dmaengine_prep_dma_memcpy_sg(dma_copy_chan, dst, nents,
 					src, nents, 0);
+
+	pr_debug("dma_migrate_prep: folio copy ents=%u\n", nents);
 	if (!tx) {
 		pr_err("DMA dev prep copy failed\n");
 		err = -EIO;
 		goto unmap_sg;
 	}
 
+        const char *devname = "?";
+
+        if (tx->chan && tx->chan->device && tx->chan->device->dev)
+            devname = dev_name(tx->chan->device->dev);
+
+        pr_debug("dma_migrate: tx=%p cookie=%d flags=0x%x chan=%p dev=%s\n",
+         tx, tx->cookie, tx->flags, tx->chan, devname);
 	/* submit DMA request */
 	cookie = dmaengine_submit(tx);
 	if (dma_submit_error(cookie)) {
@@ -59,6 +68,7 @@ static int __dma_page_copy_sg(struct scatterlist *src, struct scatterlist *dst,
 		goto unmap_sg;
 	}
 
+	pr_debug("dma_engine_wait: folio copy ents=%u\n", nents);
 	status = dma_sync_wait(dma_copy_chan, cookie);
 	if (status != DMA_COMPLETE)
 		err = -EIO;
