@@ -2710,7 +2710,8 @@ static void cb_fn(struct kiocb *kiocb, void *arg, int err)
 	skb_attempt_defer_free(skb);
 }
 
-static struct kvec kvec[512][512]; //this needs to be fixed, this is per CPU so 512 is just an arbitrary upper bound
+#define KVEC_MAX 256
+static DEFINE_PER_CPU(struct kvec[KVEC_MAX], tcp_recv_kvec);
 
 /*
  *	This routine copies from a sock struct into the user buffer.
@@ -2921,10 +2922,12 @@ found_ok_skb:
 			if (skb_frags_readable(skb)) {
 				if (msg->msg_io_iocb) {
 					struct iov_iter src;
+					struct kvec *kv;
 					int kvec_len;
-					int cpu = get_cpu();
-					kvec_len = printkvec(skb, offset, used, kvec[cpu]);
-					iov_iter_kvec(&src, READ, kvec[cpu], kvec_len, used);
+					get_cpu();
+					kv = this_cpu_ptr(tcp_recv_kvec);
+					kvec_len = printkvec(skb, offset, used, kv);
+					iov_iter_kvec(&src, READ, kv, kvec_len, used);
 					put_cpu();
 					err = io_uring_copy_to_iter((struct kiocb *)msg->msg_io_iocb, &msg->msg_iter,
 							&src, cb_fn, skb, 0);
