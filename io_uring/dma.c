@@ -39,9 +39,9 @@ pr_debug("running the poll: dma=%px\n",ctx->dma.chan);
 
         /* Disarm; if new tasks arrived meanwhile, re-arm */
         atomic_set(&ctx->dma.poll_armed, 0);
-        if (READ_ONCE(ctx->dma.head) &&
-            atomic_cmpxchg(&ctx->dma.poll_armed, 0, 1) == 0)
-                queue_work(system_unbound_wq, &ctx->dma.poll_work);
+        //if (READ_ONCE(ctx->dma.head) &&
+        //    atomic_cmpxchg(&ctx->dma.poll_armed, 0, 1) == 0)
+        //        queue_work(system_unbound_wq, &ctx->dma.poll_work);
 }
 
 
