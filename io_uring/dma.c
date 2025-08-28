@@ -136,6 +136,11 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 
 	len = (iov_iter_count(src_iter) > iov_iter_count(dst_iter)) ?
 		iov_iter_count(dst_iter) : iov_iter_count(src_iter);
+
+
+    pr_debug("io_uring_copy_to_iter: enter to=%px from=%px dst=%zu src=%zu\n",
+             dst_iter, src_iter,
+				               iov_iter_count(dst_iter), iov_iter_count(src_iter));
 	if (len > req->cqe.res) {
 		pr_err("len %d cqe.res %d\n", len, req->cqe.res);
 	}
@@ -207,7 +212,7 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	dma->cb_fn = cb_fn;
 	dma->cb_arg = cb_arg;
 
-pr_debug("copy_to_iter: len=%zu (dst_cnt=%zu src_cnt=%zu) cqe->res %d\n",
+pr_debug("copy_to_iter (%px <- %px): len=%zu (dst_cnt=%zu src_cnt=%zu) cqe->res %d\n", dst_iter, src_iter,
 	 (size_t)len, iov_iter_count(dst_iter), iov_iter_count(src_iter), req->cqe.res);
 	rc = __io_dma_task_submit(ctx->dma.chan, dma);
 	if (rc == -EAGAIN) {
@@ -233,19 +238,30 @@ pr_debug("queued dma task %px cookie=%d refcnt=%d\n",
 			tmp = tmp->next;
 		tmp->next = dma;
 	}
-	if (atomic_cmpxchg(&ctx->dma.poll_armed, 0, 1) == 0) {
-pr_debug("queueing the poll: dma=%px\n",ctx->dma.chan);
-		    queue_work(system_unbound_wq, &ctx->dma.poll_work);
-	}
+
+        //__
+	//if (atomic_cmpxchg(&ctx->dma.poll_armed, 0, 1) == 0) {
+        //    pr_debug("queueing the poll: dma=%px\n",ctx->dma.chan);
+	//	    queue_work(system_unbound_wq, &ctx->dma.poll_work);
+	//}
+        //while (atomic_read(&ctx->dma.poll_armed) == 1) {
+        //    //pr_debug("polling: dma=%px\n",ctx->dma.chan);
+        //    
+        //}
 
 	iov_iter_restore(dst_iter, &dst_state);
 	iov_iter_restore(src_iter, &src_state);
-
+        pr_debug("io_uring_copy_to_iter: exit  ret=%d dst_cnt=%zu src_cnt=%zu\n",
+			                 len, iov_iter_count(dst_iter), iov_iter_count(src_iter));
 	return len;
 
 error_free:
+	        pr_debug("error free io_uring_copy_to_iter: exit  ret=%d dst_cnt=%zu src_cnt=%zu\n",
+			                 len, iov_iter_count(dst_iter), iov_iter_count(src_iter));
 	kmem_cache_free(dma_cachep, dma);
 error_unmap:
+	        pr_debug("error unmap io_uring_copy_to_iter: exit  ret=%d dst_cnt=%zu src_cnt=%zu\n",
+			                 len, iov_iter_count(dst_iter), iov_iter_count(src_iter));
 	iov_iter_restore(dst_iter, &dst_state);
 	iov_iter_restore(src_iter, &src_state);
 

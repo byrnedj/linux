@@ -2500,7 +2500,15 @@ static void cb_fn(struct kiocb *kiocb, void *arg, int err)
 	skb_attempt_defer_free(skb);
 }
 
-static struct kvec kvec[256][128];
+#define KVEC_MAX 256
+static DEFINE_PER_CPU(struct kvec[KVEC_MAX], tcp_recv_kvec);
+/* helper: put this near the top of tcp.c */
+static inline void dbg_iter(const struct iov_iter *it, const char *tag)
+{
+	        pr_debug("iter %s: type=%u count=%zu nr_segs=%zu iov_off=%zu\n",
+				                 tag, iov_iter_type(it),
+						                  iov_iter_count(it), it->nr_segs, it->iov_offset);
+}
 
 /*
  *	This routine copies from a sock struct into the user buffer.
