@@ -109,6 +109,12 @@ dmachan_alloc_desc(struct dma_chan *chan, enum idxd_op_type optype)
 	if (!desc)
 		return NULL;
 	dma_async_tx_descriptor_init(&desc->txd, chan);
+
+    pr_debug("txd=%p cookie=%d flags=0x%x chan=%p\n",
+         &desc->txd,
+         desc->txd.cookie,
+         desc->txd.flags ,
+         desc->txd.chan);
 	return desc;
 }
 
@@ -407,6 +413,12 @@ idxd_dma_prep_memcpy_sg(struct dma_chan *chan,
 
 	dst_avail = sg_dma_len(dst_sg);
 	src_avail = sg_dma_len(src_sg);
+	char*       devname = dev_name(chan->device->dev);
+	pr_debug("prep_memcpy_sg: src_nent %d, dst_nents %d\n", src_nents, dst_nents);
+	   pr_debug("prep_memcpy_sg: chan=%p client_count=%u dev=%s cookie=%d\n",
+			             chan, chan->client_count, devname, chan->cookie);
+	       pr_debug("prep_memcpy_sg: wq=%p id=%d type=%d size=%u flags=0x%lx state=%d\n",
+			                wq, wq->id, wq->type, wq->size, wq->flags, wq->state);
 
 	if (dst_nents == 1 && src_nents == 1) {
 		if (unlikely(dst_avail != src_avail))
@@ -439,6 +451,13 @@ idxd_dma_prep_memcpy_sg(struct dma_chan *chan,
 		memset(batch->descs + i, 0, sizeof(struct dsa_hw_desc));
 		idxd_prep_desc_common(wq, batch->descs + i, DSA_OPCODE_MEMMOVE,
 				dma_src, dma_dst, len, 0, IDXD_OP_FLAG_CC);
+		const struct dsa_hw_desc *hw;
+	    hw = (const struct dsa_hw_desc *)batch->descs+i;
+	    pr_debug("idxd prep_memcpy_sg: hw opcode=0x%x flags=0x%x xfer=%u src=0x%llx dst=0x%llx comp=0x%llx\n",
+			             hw->opcode, hw->flags, hw->xfer_size,
+				              (unsigned long long)hw->src_addr,
+					               (unsigned long long)hw->dst_addr,
+						                (unsigned long long)hw->completion_addr);
 		batch->num++;
 
 		dst_nents -= fetch_sg_and_pos(&dst_sg, &dst_avail, len);
@@ -451,11 +470,21 @@ idxd_dma_prep_memcpy_sg(struct dma_chan *chan,
 		}
 	}
 
+	struct device *dev = &wq->idxd->pdev->dev;
+	dev_dbg(dev, "%s: batch count: %d\n", __func__,
+		batch->num);
 	/* prepare DSA_OPCODE_BATCH */
 	op_flag_setup(flags, &desc_flags);
 	idxd_prep_desc_common(wq, desc->hw, DSA_OPCODE_BATCH,
 			batch->dma_descs, 0, batch->num,
 			desc->compl_dma, desc_flags);
+		const struct dsa_hw_desc *hw;
+	    hw   = desc ? (const struct dsa_hw_desc *)desc->hw : NULL;
+	    pr_debug("idxd prep_memcpy_sg: hw opcode=0x%x flags=0x%x xfer=%u src=0x%llx dst=0x%llx comp=0x%llx\n",
+			             hw->opcode, hw->flags, hw->xfer_size,
+				              (unsigned long long)hw->src_addr,
+					               (unsigned long long)hw->dst_addr,
+						                (unsigned long long)hw->completion_addr);
 
 	return &desc->txd;
 }
@@ -573,10 +602,19 @@ static void idxd_dma_issue_pending(struct dma_chan *dma_chan)
 static dma_cookie_t idxd_dma_tx_submit(struct dma_async_tx_descriptor *tx)
 {
 	struct dma_chan *c = tx->chan;
+	pr_debug("idxd: have tx->chan\n");
 	struct idxd_wq *wq = to_idxd_wq(c);
+	pr_debug("idxd: have wq\n");
 	dma_cookie_t cookie;
 	int rc;
 	struct idxd_desc *desc = container_of(tx, struct idxd_desc, txd);
+		const struct dsa_hw_desc *hw;
+	    hw   = desc ? (const struct dsa_hw_desc *)desc->hw : NULL;
+	    pr_debug("idxd: hw opcode=0x%x flags=0x%x xfer=%u src=0x%llx dst=0x%llx comp=0x%llx\n",
+			             hw->opcode, hw->flags, hw->xfer_size,
+				              (unsigned long long)hw->src_addr,
+					               (unsigned long long)hw->dst_addr,
+						                (unsigned long long)hw->completion_addr);
 
 	cookie = (desc->gen << DESC_ID_BITS) | (desc->id & DESC_ID_MASK);
 
