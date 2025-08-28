@@ -39,9 +39,9 @@ pr_debug("running the poll: dma=%px\n",ctx->dma.chan);
 
         /* Disarm; if new tasks arrived meanwhile, re-arm */
         atomic_set(&ctx->dma.poll_armed, 0);
-        if (READ_ONCE(ctx->dma.head) &&
-            atomic_cmpxchg(&ctx->dma.poll_armed, 0, 1) == 0)
-                queue_work(system_unbound_wq, &ctx->dma.poll_work);
+        //if (READ_ONCE(ctx->dma.head) &&
+        //    atomic_cmpxchg(&ctx->dma.poll_armed, 0, 1) == 0)
+        //        queue_work(system_unbound_wq, &ctx->dma.poll_work);
 }
 
 
@@ -293,7 +293,6 @@ pr_debug("task_complete: dma=%px ret=%s(%d) len=%zu prev_total=%d\n",
 	req->dma.dma_refcnt--;
 pr_debug("task_complete: refcnt=%d after free\n", req->dma.dma_refcnt);
 
-	if (req->dma.dma_refcnt == 0)
 	if (req->dma.dma_refcnt == 0) {
 	pr_debug("finalize: opcode=%d total_res=%d (recv? %d) -> defer CQE\n",
 		 req->opcode, req->dma.dma_result, req->opcode == IORING_OP_RECV);
