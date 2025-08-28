@@ -2924,13 +2924,24 @@ found_ok_skb:
 					struct iov_iter src;
 					struct kvec *kv;
 					int kvec_len;
+					size_t avail = iov_iter_count(&msg->msg_iter);
+
+					pr_debug("tcp_recvmsg: used=%zu avail=%zu flags=0x%x\n",
+						 (size_t)used, avail, flags);
+
 					get_cpu();
 					kv = this_cpu_ptr(tcp_recv_kvec);
 					kvec_len = printkvec(skb, offset, used, kv);
 					iov_iter_kvec(&src, READ, kv, kvec_len, used);
 					put_cpu();
+
+					pr_debug("tcp_recvmsg: kvec_len=%d\n", kvec_len);
+
 					err = io_uring_copy_to_iter((struct kiocb *)msg->msg_io_iocb, &msg->msg_iter,
 							&src, cb_fn, skb, 0);
+
+					pr_debug("tcp_recvmsg: io_uring_copy ret=%d avail_after=%zu\n",
+						 err, iov_iter_count(&msg->msg_iter));
 
 				} else {
 					err = skb_copy_datagram_msg(skb, offset, msg, used);
