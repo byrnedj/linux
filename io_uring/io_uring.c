@@ -3608,9 +3608,6 @@ iopoll_locked:
 						      argsz, ts);
 			}
 
-			mutex_lock(&ctx->uring_lock);
-			__io_dma_poll(ctx);
-			mutex_unlock(&ctx->uring_lock);
 		}
 
 		if (!ret) {
