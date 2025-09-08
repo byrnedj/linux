@@ -3428,9 +3428,6 @@ iopoll_locked:
 				ret2 = io_cqring_wait(ctx, min_complete, flags,
 						      &ext_arg);
 
-			mutex_lock(&ctx->uring_lock);
-			__io_dma_poll(ctx);
-			mutex_unlock(&ctx->uring_lock);
 		}
 
 		if (!ret) {

@@ -2,6 +2,7 @@
 
 #include <linux/io_uring_types.h>
 #include <linux/io_uring.h>
+#include <linux/uio.h>
 #include <linux/dma-mapping.h>
 #include "io_uring.h"
 
@@ -32,16 +33,10 @@ void io_dma_poll_workfn(struct work_struct *w)
 
         /* Drain until the list is empty */
         do {
-pr_debug("running the poll: dma=%px\n",ctx->dma.chan);
                 __io_dma_poll(ctx);
                 cpu_relax();
         } while (READ_ONCE(ctx->dma.head));
 
-        /* Disarm; if new tasks arrived meanwhile, re-arm */
-        atomic_set(&ctx->dma.poll_armed, 0);
-        //if (READ_ONCE(ctx->dma.head) &&
-        //    atomic_cmpxchg(&ctx->dma.poll_armed, 0, 1) == 0)
-        //        queue_work(system_unbound_wq, &ctx->dma.poll_work);
 }
 
 
@@ -110,6 +105,8 @@ void io_uring_dma_prep(struct io_kiocb *req)
 	req->dma.dma_tasks = NULL;
 }
 
+#define IO_DMA_CPU_THRESHOLD 0
+
 ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 			struct iov_iter *src_iter,
 			void (*cb_fn)(struct kiocb *, void *, int), void *cb_arg,
@@ -138,12 +135,40 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 		iov_iter_count(dst_iter) : iov_iter_count(src_iter);
 
 
-    pr_debug("io_uring_copy_to_iter: enter to=%px from=%px dst=%zu src=%zu\n",
-             dst_iter, src_iter,
+        pr_debug("io_uring_copy_to_iter: enter to=%px from=%px dst=%zu src=%zu\n",dst_iter, src_iter,
 				               iov_iter_count(dst_iter), iov_iter_count(src_iter));
-	if (len > req->cqe.res) {
-		pr_err("len %d cqe.res %d\n", len, req->cqe.res);
-	}
+        if (len && len < IO_DMA_CPU_THRESHOLD && iov_iter_is_kvec(src_iter)) {
+                /* For small copies, just do it on the CPU */
+            size_t left = len;
+            ssize_t copied_total = 0;
+            while (left > 0) {
+                const size_t seg_avail = min_t(size_t, left, src_iter->iov->iov_len - src_iter->iov_offset);
+                size_t copied;
+                const void *base;
+                if (!seg_avail)
+                    break;
+                base = src_iter->iov->iov_base + src_iter->iov_offset;
+                copied = copy_to_iter(base, seg_avail, dst_iter);
+                if (!copied) {
+                    return copied_total ? copied_total : -EFAULT;
+                }
+                iov_iter_advance(src_iter, copied);
+                copied_total += copied;
+                left -= copied;
+                if (copied < seg_avail)
+                    break;
+            }
+            pr_debug("io_uring_copy_to_iter: CPU fallback ret=%zd dst_cnt=%zu src_cnt=%zu\n",
+                         copied_total, iov_iter_count(dst_iter), iov_iter_count(src_iter));
+            return copied_total;
+        }
+
+        iov_iter_save_state(dst_iter, &dst_state);
+        iov_iter_save_state(src_iter, &src_state);
+                   
+	//if (len > req->cqe.res) {
+	    //pr_err("len %d cqe.res %d\n", len, req->cqe.res);
+	//}
 	//len = (len > req->cqe.res) ? req->cqe.res : len;
 
 	iov_iter_truncate(dst_iter, len);
@@ -214,7 +239,10 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 
 pr_debug("copy_to_iter (%px <- %px): len=%zu (dst_cnt=%zu src_cnt=%zu) cqe->res %d\n", dst_iter, src_iter,
 	 (size_t)len, iov_iter_count(dst_iter), iov_iter_count(src_iter), req->cqe.res);
-	rc = __io_dma_task_submit(ctx->dma.chan, dma);
+	 rc = __io_dma_task_submit(ctx->dma.chan, dma);
+        //
+        // we want sync mode
+
 	if (rc == -EAGAIN) {
 	pr_debug("submit returns EAGAIN; deferring (cookie=0)\n");
 		/*
@@ -239,11 +267,11 @@ pr_debug("queued dma task %px cookie=%d refcnt=%d\n",
 		tmp->next = dma;
 	}
 
+        //do {
+        //        __io_dma_poll(ctx);
+        //        cpu_relax();
+        //} while (READ_ONCE(ctx->dma.head));
         //__
-	//if (atomic_cmpxchg(&ctx->dma.poll_armed, 0, 1) == 0) {
-        //    pr_debug("queueing the poll: dma=%px\n",ctx->dma.chan);
-	//	    queue_work(system_unbound_wq, &ctx->dma.poll_work);
-	//}
         //while (atomic_read(&ctx->dma.poll_armed) == 1) {
         //    //pr_debug("polling: dma=%px\n",ctx->dma.chan);
         //    
@@ -351,6 +379,8 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 					dma = next;
 					continue;
 				}
+				pr_debug("io_submit_queued: %d cookie=%d\n",
+					  dma->len, dma->cookie);
 
 				if (req->ctx->dma.tail == NULL)
 					req->ctx->dma.head = dma;
@@ -368,6 +398,11 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 		kiocb->ki_flags &= ~IOCB_DMA_COPY;
 	}
 
+	if (atomic_read(&req->ctx->dma.poll_armed) == 0) {
+            pr_debug("queueing the poll: dma=%px\n",req->ctx->dma.chan);
+	    //queue_work(system_unbound_wq, &req->ctx->dma.poll_work);
+            __io_dma_poll(req->ctx);
+	}
 	return ret;
 }
 
@@ -378,8 +413,11 @@ int __io_dma_poll(struct io_ring_ctx *ctx)
 	int ret;
 	struct device *dev;
 	int count;
-pr_info("poll: poller entered ctx=%px chan=%px\n",
-		        ctx, ctx->dma.chan);
+        if (atomic_cmpxchg(&ctx->dma.poll_armed, 0, 1) != 0) {
+            return 0;
+        }
+//pr_info("poll: poller entered ctx=%px chan=%px\n",
+//		        ctx, ctx->dma.chan);
 
 	if (!ctx->dma.chan)
 		return 0;
@@ -403,9 +441,15 @@ pr_debug("poll: check cookie=%d\n", dma->cookie);
 		ret = dmaengine_async_is_tx_complete(ctx->dma.chan, dma->cookie);
 pr_debug("poll: cookie=%d status=%s(%d)\n",
 	 dma->cookie, dma_status_str(ret), ret);
-
-		if (ret == DMA_IN_PROGRESS) {
-	pr_debug("poll: in progress; stop at this cookie\n");
+        /* If the operation is still in progress, stop checking */  
+                uint64_t a = 0;
+		while (ret == DMA_IN_PROGRESS) {
+                    if (a % 100000 == 0) {
+	                //pr_debug("poll: in progress; stop at this cookie\n");
+	                pr_debug("poll: in progress\n");
+                    }
+                    a++;
+    
 			/*
 			* Stop polling here. We rely on completing operations
 			* in submission order for error handling below to be
@@ -413,7 +457,8 @@ pr_debug("poll: cookie=%d status=%s(%d)\n",
 			* complete at this point, but we cannot process
 			* them yet. Re-ordering, fortunately, is rare.
 			*/
-			break;
+			//break;
+		    ret = dmaengine_async_is_tx_complete(ctx->dma.chan, dma->cookie);
 		}
 pr_debug("poll: complete cookie=%d; calling task_complete\n", dma->cookie);
 		__io_dma_task_complete(dev, dma, ret);
@@ -466,5 +511,6 @@ pr_debug("poll: flushing io_uring completions\n");
 		dma = next;
 	}
 
+        atomic_set(&ctx->dma.poll_armed, 0);
 	return ctx->dma.head ? 1 : 0;
 }
