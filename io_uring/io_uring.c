@@ -2931,8 +2931,9 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 
 	ctx->dma.head = NULL;
 	ctx->dma.tail = NULL;
-        INIT_WORK(&ctx->dma.poll_work, io_dma_poll_workfn);
-        atomic_set(&ctx->dma.poll_armed, 0);
+	spin_lock_init(&ctx->dma.lock);
+	INIT_WORK(&ctx->dma.poll_work, io_dma_poll_workfn);
+	atomic_set(&ctx->dma.poll_armed, 0);
 
 	return 0;
 failed:
@@ -3428,9 +3429,6 @@ iopoll_locked:
 				ret2 = io_cqring_wait(ctx, min_complete, flags,
 						      &ext_arg);
 
-			mutex_lock(&ctx->uring_lock);
-			__io_dma_poll(ctx);
-			mutex_unlock(&ctx->uring_lock);
 		}
 
 		if (!ret) {

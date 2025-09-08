@@ -1212,6 +1212,9 @@ retry_multishot:
 	ret = sock_recvmsg(sock, &kmsg->msg, flags);
 	if (ret > 0) {
 		int ret2 = io_dma_submit_queued_tasks(req);
+		//mutex_lock(&req->ctx->uring_lock);
+		//__io_dma_poll(req->ctx);
+		//mutex_unlock(&req->ctx->uring_lock);
 		if (ret2 < 0) {
 			ret = ret2;
 			if (ret == -EIOCBQUEUED)
