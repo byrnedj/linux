@@ -10,6 +10,19 @@
 
 #include "page_pool_priv.h"
 
+static void net_rxq_restart_log(struct net_device *dev, unsigned int rxq_idx,
+                               const char *fmt, ...)
+{
+        struct va_format vaf;
+        va_list args;
+
+        va_start(args, fmt);
+        vaf.fmt = fmt;
+        vaf.va = &args;
+        netdev_info(dev, "rxq_restart[%u]: %pV", rxq_idx, &vaf);
+        va_end(args);
+}
+
 static void net_mp_log(struct net_device *dev, unsigned int rxq_idx,
                       const char *fmt, ...)
 {
@@ -25,53 +38,105 @@ static void net_mp_log(struct net_device *dev, unsigned int rxq_idx,
 
 int netdev_rx_queue_restart(struct net_device *dev, unsigned int rxq_idx)
 {
-	struct netdev_rx_queue *rxq = __netif_get_rx_queue(dev, rxq_idx);
-	const struct netdev_queue_mgmt_ops *qops = dev->queue_mgmt_ops;
-	void *new_mem, *old_mem;
-	int err;
+        struct netdev_rx_queue *rxq = __netif_get_rx_queue(dev, rxq_idx);
+        const struct netdev_queue_mgmt_ops *qops = dev->queue_mgmt_ops;
+        void *new_mem, *old_mem;
+        int err;
 
-	if (!qops || !qops->ndo_queue_stop || !qops->ndo_queue_mem_free ||
-	    !qops->ndo_queue_mem_alloc || !qops->ndo_queue_start)
-		return -EOPNOTSUPP;
+        net_rxq_restart_log(dev, rxq_idx,
+                            "attempt: qops=%p ops_stop=%p ops_free=%p ops_alloc=%p ops_start=%p",
+                            qops,
+                            qops ? qops->ndo_queue_stop : NULL,
+                            qops ? qops->ndo_queue_mem_free : NULL,
+                            qops ? qops->ndo_queue_mem_alloc : NULL,
+                            qops ? qops->ndo_queue_start : NULL);
 
-	netdev_assert_locked(dev);
+        if (!qops) {
+                net_rxq_restart_log(dev, rxq_idx,
+                                    "reject: device lacks queue_mgmt_ops (unsupported)");
+                return -EOPNOTSUPP;
+        }
+        if (!qops->ndo_queue_stop) {
+                net_rxq_restart_log(dev, rxq_idx,
+                                    "reject: ndo_queue_stop is not implemented");
+                return -EOPNOTSUPP;
+        }
+        if (!qops->ndo_queue_mem_free) {
+                net_rxq_restart_log(dev, rxq_idx,
+                                    "reject: ndo_queue_mem_free is not implemented");
+                return -EOPNOTSUPP;
+        }
+        if (!qops->ndo_queue_mem_alloc) {
+                net_rxq_restart_log(dev, rxq_idx,
+                                    "reject: ndo_queue_mem_alloc is not implemented");
+                return -EOPNOTSUPP;
+        }
+        if (!qops->ndo_queue_start) {
+                net_rxq_restart_log(dev, rxq_idx,
+                                    "reject: ndo_queue_start is not implemented");
+                return -EOPNOTSUPP;
+        }
 
-	new_mem = kvzalloc(qops->ndo_queue_mem_size, GFP_KERNEL);
-	if (!new_mem)
-		return -ENOMEM;
+        netdev_assert_locked(dev);
 
-	old_mem = kvzalloc(qops->ndo_queue_mem_size, GFP_KERNEL);
-	if (!old_mem) {
-		err = -ENOMEM;
-		goto err_free_new_mem;
-	}
+        new_mem = kvzalloc(qops->ndo_queue_mem_size, GFP_KERNEL);
+        if (!new_mem) {
+                net_rxq_restart_log(dev, rxq_idx,
+                                    "alloc: failed to allocate new queue memory (%zu bytes)",
+                                    qops->ndo_queue_mem_size);
+                return -ENOMEM;
+        }
 
-	err = qops->ndo_queue_mem_alloc(dev, new_mem, rxq_idx);
-	if (err)
-		goto err_free_old_mem;
+        old_mem = kvzalloc(qops->ndo_queue_mem_size, GFP_KERNEL);
+        if (!old_mem) {
+                err = -ENOMEM;
+                net_rxq_restart_log(dev, rxq_idx,
+                                    "alloc: failed to allocate old queue memory (%zu bytes)",
+                                    qops->ndo_queue_mem_size);
+                goto err_free_new_mem;
+        }
 
-	err = page_pool_check_memory_provider(dev, rxq);
-	if (err)
-		goto err_free_new_queue_mem;
+        err = qops->ndo_queue_mem_alloc(dev, new_mem, rxq_idx);
+        if (err) {
+                net_rxq_restart_log(dev, rxq_idx,
+                                    "ndo_queue_mem_alloc() -> %d", err);
+                goto err_free_old_mem;
+        }
 
-	if (netif_running(dev)) {
-		err = qops->ndo_queue_stop(dev, old_mem, rxq_idx);
-		if (err)
-			goto err_free_new_queue_mem;
+        err = page_pool_check_memory_provider(dev, rxq);
+        if (err) {
+                net_rxq_restart_log(dev, rxq_idx,
+                                    "page_pool_check_memory_provider() -> %d", err);
+                goto err_free_new_queue_mem;
+        }
 
-		err = qops->ndo_queue_start(dev, new_mem, rxq_idx);
-		if (err)
-			goto err_start_queue;
-	} else {
-		swap(new_mem, old_mem);
-	}
+        if (netif_running(dev)) {
+                err = qops->ndo_queue_stop(dev, old_mem, rxq_idx);
+                if (err) {
+                        net_rxq_restart_log(dev, rxq_idx,
+                                            "ndo_queue_stop() -> %d", err);
+                        goto err_free_new_queue_mem;
+                }
 
-	qops->ndo_queue_mem_free(dev, old_mem);
+                err = qops->ndo_queue_start(dev, new_mem, rxq_idx);
+                if (err) {
+                        net_rxq_restart_log(dev, rxq_idx,
+                                            "ndo_queue_start(new) -> %d", err);
+                        goto err_start_queue;
+                }
+        } else {
+                net_rxq_restart_log(dev, rxq_idx,
+                                    "netif not running -- swapping queue memory without stop/start");
+                swap(new_mem, old_mem);
+        }
 
-	kvfree(old_mem);
-	kvfree(new_mem);
+        qops->ndo_queue_mem_free(dev, old_mem);
 
-	return 0;
+        kvfree(old_mem);
+        kvfree(new_mem);
+
+        net_rxq_restart_log(dev, rxq_idx, "success");
+        return 0;
 
 err_start_queue:
 	/* Restarting the queue with old_mem should be successful as we haven't
@@ -81,23 +146,28 @@ err_start_queue:
 	 * WARN if we fail to recover the old rx queue, and at least free
 	 * old_mem so we don't also leak that.
 	 */
-	if (qops->ndo_queue_start(dev, old_mem, rxq_idx)) {
-		WARN(1,
-		     "Failed to restart old queue in error path. RX queue %d may be unhealthy.",
-		     rxq_idx);
-		qops->ndo_queue_mem_free(dev, old_mem);
-	}
+        if (qops->ndo_queue_start(dev, old_mem, rxq_idx)) {
+                net_rxq_restart_log(dev, rxq_idx,
+                                    "error path: failed to restart old queue");
+                WARN(1,
+                     "Failed to restart old queue in error path. RX queue %d may be unhealthy.",
+                     rxq_idx);
+                qops->ndo_queue_mem_free(dev, old_mem);
+        }
 
 err_free_new_queue_mem:
-	qops->ndo_queue_mem_free(dev, new_mem);
+        net_rxq_restart_log(dev, rxq_idx, "freeing new queue memory");
+        qops->ndo_queue_mem_free(dev, new_mem);
 
 err_free_old_mem:
-	kvfree(old_mem);
+        net_rxq_restart_log(dev, rxq_idx, "freeing old queue memory");
+        kvfree(old_mem);
 
 err_free_new_mem:
-	kvfree(new_mem);
+        net_rxq_restart_log(dev, rxq_idx, "returning error %d", err);
+        kvfree(new_mem);
 
-	return err;
+        return err;
 }
 EXPORT_SYMBOL_NS_GPL(netdev_rx_queue_restart, "NETDEV_INTERNAL");
 
