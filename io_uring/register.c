@@ -630,29 +630,40 @@ static int io_register_mem_region(struct io_ring_ctx *ctx, void __user *uarg)
 }
 
 static int __io_uring_register(struct io_ring_ctx *ctx, unsigned opcode,
-			       void __user *arg, unsigned nr_args)
-	__releases(ctx->uring_lock)
-	__acquires(ctx->uring_lock)
+                               void __user *arg, unsigned nr_args)
+        __releases(ctx->uring_lock)
+        __acquires(ctx->uring_lock)
 {
-	int ret;
+        int ret;
 
-	/*
-	 * We don't quiesce the refs for register anymore and so it can't be
-	 * dying as we're holding a file ref here.
-	 */
-	if (WARN_ON_ONCE(percpu_ref_is_dying(&ctx->refs)))
-		return -ENXIO;
+        pr_info("io_uring register: ctx=%p opcode=%u nr_args=%u arg=%px\n",
+                ctx, opcode, nr_args, arg);
 
-	if (ctx->submitter_task && ctx->submitter_task != current)
-		return -EEXIST;
+        /*
+         * We don't quiesce the refs for register anymore and so it can't be
+         * dying as we're holding a file ref here.
+         */
+        if (WARN_ON_ONCE(percpu_ref_is_dying(&ctx->refs))) {
+                pr_info("io_uring register: ctx=%p dying percpu ref\n", ctx);
+                return -ENXIO;
+        }
 
-	if (ctx->restricted) {
-		opcode = array_index_nospec(opcode, IORING_REGISTER_LAST);
-		if (!test_bit(opcode, ctx->restrictions.register_op))
-			return -EACCES;
-	}
+        if (ctx->submitter_task && ctx->submitter_task != current) {
+                pr_info("io_uring register: ctx=%p submitter mismatch current=%p expected=%p\n",
+                        ctx, current, ctx->submitter_task);
+                return -EEXIST;
+        }
 
-	switch (opcode) {
+        if (ctx->restricted) {
+                opcode = array_index_nospec(opcode, IORING_REGISTER_LAST);
+                if (!test_bit(opcode, ctx->restrictions.register_op)) {
+                        pr_info("io_uring register: ctx=%p opcode=%u restricted\n",
+                                ctx, opcode);
+                        return -EACCES;
+                }
+        }
+
+        switch (opcode) {
 	case IORING_REGISTER_BUFFERS:
 		ret = -EFAULT;
 		if (!arg)
@@ -817,12 +828,19 @@ static int __io_uring_register(struct io_ring_ctx *ctx, unsigned opcode,
 			break;
 		ret = io_register_clone_buffers(ctx, arg);
 		break;
-	case IORING_REGISTER_ZCRX_IFQ:
-		ret = -EINVAL;
-		if (!arg || nr_args != 1)
-			break;
-		ret = io_register_zcrx_ifq(ctx, arg);
-		break;
+        case IORING_REGISTER_ZCRX_IFQ:
+                ret = -EINVAL;
+                if (!arg || nr_args != 1) {
+                        pr_info("io_uring register: ctx=%p invalid args for zcrx_ifq arg=%px nr_args=%u\n",
+                                ctx, arg, nr_args);
+                        break;
+                }
+                pr_info("io_uring register: ctx=%p invoking io_register_zcrx_ifq\n",
+                        ctx);
+                ret = io_register_zcrx_ifq(ctx, arg);
+                pr_info("io_uring register: ctx=%p io_register_zcrx_ifq ret=%d\n",
+                        ctx, ret);
+                break;
 	case IORING_REGISTER_RESIZE_RINGS:
 		ret = -EINVAL;
 		if (!arg || nr_args != 1)
@@ -835,12 +853,14 @@ static int __io_uring_register(struct io_ring_ctx *ctx, unsigned opcode,
 			break;
 		ret = io_register_mem_region(ctx, arg);
 		break;
-	default:
-		ret = -EINVAL;
-		break;
-	}
+        default:
+                ret = -EINVAL;
+                break;
+        }
 
-	return ret;
+        pr_info("io_uring register: ctx=%p opcode=%u returning %d\n",
+                ctx, opcode, ret);
+        return ret;
 }
 
 /*

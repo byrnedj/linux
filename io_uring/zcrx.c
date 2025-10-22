@@ -28,6 +28,9 @@
 
 #define IO_DMA_ATTR (DMA_ATTR_SKIP_CPU_SYNC | DMA_ATTR_WEAK_ORDERING)
 
+#define io_zcrx_pr(fmt, ...) \
+	pr_info("io_uring zcrx: " fmt, ##__VA_ARGS__)
+
 static inline struct io_zcrx_ifq *io_pp_to_ifq(struct page_pool *pp)
 {
 	return pp->mp_priv;
@@ -178,38 +181,57 @@ static unsigned long io_count_account_pages(struct page **pages, unsigned nr_pag
 }
 
 static int io_import_umem(struct io_zcrx_ifq *ifq,
-			  struct io_zcrx_mem *mem,
-			  struct io_uring_zcrx_area_reg *area_reg)
+                          struct io_zcrx_mem *mem,
+                          struct io_uring_zcrx_area_reg *area_reg)
 {
-	struct page **pages;
-	int nr_pages, ret;
+        struct page **pages;
+        int nr_pages, ret;
 
-	if (area_reg->dmabuf_fd)
-		return -EINVAL;
-	if (!area_reg->addr)
-		return -EFAULT;
-	pages = io_pin_pages((unsigned long)area_reg->addr, area_reg->len,
-				   &nr_pages);
-	if (IS_ERR(pages))
-		return PTR_ERR(pages);
+        io_zcrx_pr("import_umem: ifq=%p addr=%#llx len=%llu dmabuf_fd=%d\n",
+                    ifq,
+                    (unsigned long long)area_reg->addr,
+                    (unsigned long long)area_reg->len,
+                    area_reg->dmabuf_fd);
+        if (area_reg->dmabuf_fd) {
+                io_zcrx_pr("import_umem: unexpected dmabuf_fd=%d\n",
+                            area_reg->dmabuf_fd);
+                return -EINVAL;
+        }
+        if (!area_reg->addr) {
+                io_zcrx_pr("import_umem: null address provided\n");
+                return -EFAULT;
+        }
+        pages = io_pin_pages((unsigned long)area_reg->addr, area_reg->len,
+                                   &nr_pages);
+        if (IS_ERR(pages)) {
+                ret = PTR_ERR(pages);
+                io_zcrx_pr("import_umem: io_pin_pages failed ret=%d\n", ret);
+                return PTR_ERR(pages);
+        }
 
-	ret = sg_alloc_table_from_pages(&mem->page_sg_table, pages, nr_pages,
-					0, nr_pages << PAGE_SHIFT,
-					GFP_KERNEL_ACCOUNT);
-	if (ret) {
-		unpin_user_pages(pages, nr_pages);
-		return ret;
-	}
+        ret = sg_alloc_table_from_pages(&mem->page_sg_table, pages, nr_pages,
+                                        0, nr_pages << PAGE_SHIFT,
+                                        GFP_KERNEL_ACCOUNT);
+        if (ret) {
+                unpin_user_pages(pages, nr_pages);
+                io_zcrx_pr("import_umem: sg_alloc_table_from_pages failed ret=%d\n",
+                            ret);
+                return ret;
+        }
 
-	mem->account_pages = io_count_account_pages(pages, nr_pages);
-	ret = io_account_mem(ifq->ctx, mem->account_pages);
-	if (ret < 0)
-		mem->account_pages = 0;
+        mem->account_pages = io_count_account_pages(pages, nr_pages);
+        ret = io_account_mem(ifq->ctx, mem->account_pages);
+        if (ret < 0) {
+                io_zcrx_pr("import_umem: io_account_mem failed ret=%d\n", ret);
+                mem->account_pages = 0;
+        }
 
-	mem->pages = pages;
-	mem->nr_folios = nr_pages;
-	mem->size = area_reg->len;
-	return ret;
+        mem->pages = pages;
+        mem->nr_folios = nr_pages;
+        mem->size = area_reg->len;
+        io_zcrx_pr("import_umem: success nr_pages=%d account_pages=%lu ret=%d\n",
+                    nr_pages, mem->account_pages, ret);
+        return ret;
 }
 
 static void io_release_area_mem(struct io_zcrx_mem *mem)
@@ -226,20 +248,37 @@ static void io_release_area_mem(struct io_zcrx_mem *mem)
 }
 
 static int io_import_area(struct io_zcrx_ifq *ifq,
-			  struct io_zcrx_mem *mem,
-			  struct io_uring_zcrx_area_reg *area_reg)
+                          struct io_zcrx_mem *mem,
+                          struct io_uring_zcrx_area_reg *area_reg)
 {
-	int ret;
+        int ret;
 
-	ret = io_validate_user_buf_range(area_reg->addr, area_reg->len);
-	if (ret)
-		return ret;
-	if (area_reg->addr & ~PAGE_MASK || area_reg->len & ~PAGE_MASK)
-		return -EINVAL;
+        io_zcrx_pr("import_area: ifq=%p addr=%#llx len=%llu flags=%#x dmabuf_fd=%d\n",
+                    ifq,
+                    (unsigned long long)area_reg->addr,
+                    (unsigned long long)area_reg->len,
+                    area_reg->flags, area_reg->dmabuf_fd);
+        ret = io_validate_user_buf_range(area_reg->addr, area_reg->len);
+        if (ret) {
+                io_zcrx_pr("import_area: validate_user_buf_range failed ret=%d\n",
+                            ret);
+                return ret;
+        }
+        if (area_reg->addr & ~PAGE_MASK || area_reg->len & ~PAGE_MASK) {
+                io_zcrx_pr("import_area: addr or len not page aligned addr=%#llx len=%llu\n",
+                            (unsigned long long)area_reg->addr,
+                            (unsigned long long)area_reg->len);
+                return -EINVAL;
+        }
 
-	if (area_reg->flags & IORING_ZCRX_AREA_DMABUF)
-		return io_import_dmabuf(ifq, mem, area_reg);
-	return io_import_umem(ifq, mem, area_reg);
+        if (area_reg->flags & IORING_ZCRX_AREA_DMABUF) {
+                ret = io_import_dmabuf(ifq, mem, area_reg);
+                io_zcrx_pr("import_area: io_import_dmabuf ret=%d\n", ret);
+                return ret;
+        }
+        ret = io_import_umem(ifq, mem, area_reg);
+        io_zcrx_pr("import_area: io_import_umem ret=%d\n", ret);
+        return ret;
 }
 
 static void io_zcrx_unmap_area(struct io_zcrx_ifq *ifq,
@@ -343,31 +382,41 @@ static void io_zcrx_get_niov_uref(struct net_iov *niov)
 }
 
 static int io_allocate_rbuf_ring(struct io_zcrx_ifq *ifq,
-				 struct io_uring_zcrx_ifq_reg *reg,
-				 struct io_uring_region_desc *rd,
-				 u32 id)
+                                 struct io_uring_zcrx_ifq_reg *reg,
+                                 struct io_uring_region_desc *rd,
+                                 u32 id)
 {
-	u64 mmap_offset;
-	size_t off, size;
-	void *ptr;
-	int ret;
+        u64 mmap_offset;
+        size_t off, size;
+        void *ptr;
+        int ret;
 
-	off = sizeof(struct io_uring);
-	size = off + sizeof(struct io_uring_zcrx_rqe) * reg->rq_entries;
-	if (size > rd->size)
-		return -EINVAL;
+        io_zcrx_pr("allocate_rbuf_ring: ifq=%p id=%u rq_entries=%u rd_size=%zu\n",
+                    ifq, id, reg->rq_entries, rd->size);
+        off = sizeof(struct io_uring);
+        size = off + sizeof(struct io_uring_zcrx_rqe) * reg->rq_entries;
+        if (size > rd->size) {
+                io_zcrx_pr("allocate_rbuf_ring: ifq=%p size=%zu exceeds rd_size=%zu\n",
+                           ifq, size, rd->size);
+                return -EINVAL;
+        }
 
-	mmap_offset = IORING_MAP_OFF_ZCRX_REGION;
-	mmap_offset += id << IORING_OFF_PBUF_SHIFT;
+        mmap_offset = IORING_MAP_OFF_ZCRX_REGION;
+        mmap_offset += id << IORING_OFF_PBUF_SHIFT;
 
-	ret = io_create_region(ifq->ctx, &ifq->region, rd, mmap_offset);
-	if (ret < 0)
-		return ret;
+        ret = io_create_region(ifq->ctx, &ifq->region, rd, mmap_offset);
+        if (ret < 0) {
+                io_zcrx_pr("allocate_rbuf_ring: ifq=%p io_create_region failed ret=%d\n",
+                           ifq, ret);
+                return ret;
+        }
 
-	ptr = io_region_get_ptr(&ifq->region);
-	ifq->rq_ring = (struct io_uring *)ptr;
-	ifq->rqes = (struct io_uring_zcrx_rqe *)(ptr + off);
-	return 0;
+        ptr = io_region_get_ptr(&ifq->region);
+        ifq->rq_ring = (struct io_uring *)ptr;
+        ifq->rqes = (struct io_uring_zcrx_rqe *)(ptr + off);
+        io_zcrx_pr("allocate_rbuf_ring: ifq=%p rq_ring=%p rqes=%p\n",
+                    ifq, ifq->rq_ring, ifq->rqes);
+        return 0;
 }
 
 static void io_free_rbuf_ring(struct io_zcrx_ifq *ifq)
@@ -394,85 +443,117 @@ static void io_zcrx_free_area(struct io_zcrx_area *area)
 #define IO_ZCRX_AREA_SUPPORTED_FLAGS	(IORING_ZCRX_AREA_DMABUF)
 
 static int io_zcrx_create_area(struct io_zcrx_ifq *ifq,
-			       struct io_zcrx_area **res,
-			       struct io_uring_zcrx_area_reg *area_reg)
+                               struct io_zcrx_area **res,
+                               struct io_uring_zcrx_area_reg *area_reg)
 {
-	struct io_zcrx_area *area;
-	unsigned nr_iovs;
-	int i, ret;
+        struct io_zcrx_area *area;
+        unsigned nr_iovs;
+        int i, ret;
 
-	if (area_reg->flags & ~IO_ZCRX_AREA_SUPPORTED_FLAGS)
-		return -EINVAL;
-	if (area_reg->rq_area_token)
-		return -EINVAL;
-	if (area_reg->__resv2[0] || area_reg->__resv2[1])
-		return -EINVAL;
+        io_zcrx_pr("create_area: ifq=%p flags=%#x len=%llu addr=%#llx dmabuf_fd=%d\n",
+                    ifq, area_reg->flags,
+                    (unsigned long long)area_reg->len,
+                    (unsigned long long)area_reg->addr,
+                    area_reg->dmabuf_fd);
+        if (area_reg->flags & ~IO_ZCRX_AREA_SUPPORTED_FLAGS) {
+                io_zcrx_pr("create_area: unsupported flags=%#x\n",
+                            area_reg->flags);
+                return -EINVAL;
+        }
+        if (area_reg->rq_area_token) {
+                io_zcrx_pr("create_area: rq_area_token already set=%#llx\n",
+                            (unsigned long long)area_reg->rq_area_token);
+                return -EINVAL;
+        }
+        if (area_reg->__resv2[0] || area_reg->__resv2[1]) {
+                io_zcrx_pr("create_area: reserved fields not zero\n");
+                return -EINVAL;
+        }
 
-	ret = -ENOMEM;
-	area = kzalloc(sizeof(*area), GFP_KERNEL);
-	if (!area)
-		goto err;
-	area->ifq = ifq;
+        ret = -ENOMEM;
+        area = kzalloc(sizeof(*area), GFP_KERNEL);
+        if (!area) {
+                io_zcrx_pr("create_area: memory allocation failed\n");
+                goto err;
+        }
+        area->ifq = ifq;
 
-	ret = io_import_area(ifq, &area->mem, area_reg);
-	if (ret)
-		goto err;
+        ret = io_import_area(ifq, &area->mem, area_reg);
+        if (ret) {
+                io_zcrx_pr("create_area: io_import_area failed ret=%d\n", ret);
+                goto err;
+        }
 
-	nr_iovs = area->mem.size >> PAGE_SHIFT;
-	area->nia.num_niovs = nr_iovs;
+        nr_iovs = area->mem.size >> PAGE_SHIFT;
+        area->nia.num_niovs = nr_iovs;
 
-	ret = -ENOMEM;
-	area->nia.niovs = kvmalloc_array(nr_iovs, sizeof(area->nia.niovs[0]),
-					 GFP_KERNEL | __GFP_ZERO);
-	if (!area->nia.niovs)
-		goto err;
+        ret = -ENOMEM;
+        area->nia.niovs = kvmalloc_array(nr_iovs, sizeof(area->nia.niovs[0]),
+                                         GFP_KERNEL | __GFP_ZERO);
+        if (!area->nia.niovs) {
+                io_zcrx_pr("create_area: failed to alloc niovs count=%u\n", nr_iovs);
+                goto err;
+        }
 
-	area->freelist = kvmalloc_array(nr_iovs, sizeof(area->freelist[0]),
-					GFP_KERNEL | __GFP_ZERO);
-	if (!area->freelist)
-		goto err;
+        area->freelist = kvmalloc_array(nr_iovs, sizeof(area->freelist[0]),
+                                        GFP_KERNEL | __GFP_ZERO);
+        if (!area->freelist) {
+                io_zcrx_pr("create_area: failed to alloc freelist count=%u\n",
+                            nr_iovs);
+                goto err;
+        }
 
-	area->user_refs = kvmalloc_array(nr_iovs, sizeof(area->user_refs[0]),
-					GFP_KERNEL | __GFP_ZERO);
-	if (!area->user_refs)
-		goto err;
+        area->user_refs = kvmalloc_array(nr_iovs, sizeof(area->user_refs[0]),
+                                        GFP_KERNEL | __GFP_ZERO);
+        if (!area->user_refs) {
+                io_zcrx_pr("create_area: failed to alloc user_refs count=%u\n",
+                            nr_iovs);
+                goto err;
+        }
 
-	for (i = 0; i < nr_iovs; i++) {
-		struct net_iov *niov = &area->nia.niovs[i];
+        for (i = 0; i < nr_iovs; i++) {
+                struct net_iov *niov = &area->nia.niovs[i];
 
-		niov->owner = &area->nia;
+                niov->owner = &area->nia;
 		area->freelist[i] = i;
 		atomic_set(&area->user_refs[i], 0);
 		niov->type = NET_IOV_IOURING;
 	}
 
-	area->free_count = nr_iovs;
-	/* we're only supporting one area per ifq for now */
-	area->area_id = 0;
-	area_reg->rq_area_token = (u64)area->area_id << IORING_ZCRX_AREA_SHIFT;
-	spin_lock_init(&area->freelist_lock);
-	*res = area;
-	return 0;
+        area->free_count = nr_iovs;
+        /* we're only supporting one area per ifq for now */
+        area->area_id = 0;
+        area_reg->rq_area_token = (u64)area->area_id << IORING_ZCRX_AREA_SHIFT;
+        spin_lock_init(&area->freelist_lock);
+        *res = area;
+        io_zcrx_pr("create_area: success ifq=%p area=%p num_niovs=%u\n",
+                    ifq, area, nr_iovs);
+        return 0;
 err:
-	if (area)
-		io_zcrx_free_area(area);
-	return ret;
+        if (area)
+                io_zcrx_free_area(area);
+        io_zcrx_pr("create_area: failed ret=%d\n", ret);
+        return ret;
 }
 
 static struct io_zcrx_ifq *io_zcrx_ifq_alloc(struct io_ring_ctx *ctx)
 {
-	struct io_zcrx_ifq *ifq;
+        struct io_zcrx_ifq *ifq;
 
-	ifq = kzalloc(sizeof(*ifq), GFP_KERNEL);
-	if (!ifq)
-		return NULL;
+        io_zcrx_pr("ifq_alloc: ctx=%p\n", ctx);
+        ifq = kzalloc(sizeof(*ifq), GFP_KERNEL);
+        if (!ifq) {
+                io_zcrx_pr("ifq_alloc: ctx=%p allocation failed\n", ctx);
+                return NULL;
+        }
 
-	ifq->if_rxq = -1;
-	ifq->ctx = ctx;
-	spin_lock_init(&ifq->lock);
-	spin_lock_init(&ifq->rq_lock);
-	mutex_init(&ifq->dma_lock);
-	return ifq;
+        ifq->if_rxq = -1;
+        ifq->ctx = ctx;
+        spin_lock_init(&ifq->lock);
+        spin_lock_init(&ifq->rq_lock);
+        mutex_init(&ifq->dma_lock);
+        io_zcrx_pr("ifq_alloc: ctx=%p allocated ifq=%p\n", ctx, ifq);
+        return ifq;
 }
 
 static void io_zcrx_drop_netdev(struct io_zcrx_ifq *ifq)
@@ -536,112 +617,162 @@ struct io_mapped_region *io_zcrx_get_region(struct io_ring_ctx *ctx,
 }
 
 int io_register_zcrx_ifq(struct io_ring_ctx *ctx,
-			  struct io_uring_zcrx_ifq_reg __user *arg)
+                          struct io_uring_zcrx_ifq_reg __user *arg)
 {
-	struct pp_memory_provider_params mp_param = {};
-	struct io_uring_zcrx_area_reg area;
-	struct io_uring_zcrx_ifq_reg reg;
-	struct io_uring_region_desc rd;
-	struct io_zcrx_ifq *ifq;
-	int ret;
-	u32 id;
+        struct pp_memory_provider_params mp_param = {};
+        struct io_uring_zcrx_area_reg area;
+        struct io_uring_zcrx_ifq_reg reg;
+        struct io_uring_region_desc rd;
+        struct io_zcrx_ifq *ifq;
+        int ret;
+        u32 id;
 
-	/*
-	 * 1. Interface queue allocation.
-	 * 2. It can observe data destined for sockets of other tasks.
-	 */
-	if (!capable(CAP_NET_ADMIN))
-		return -EPERM;
+        io_zcrx_pr("register_ifq: ctx=%p arg=%px\n", ctx, arg);
+        /*
+         * 1. Interface queue allocation.
+         * 2. It can observe data destined for sockets of other tasks.
+         */
+        if (!capable(CAP_NET_ADMIN)) {
+                io_zcrx_pr("register_ifq: missing CAP_NET_ADMIN\n");
+                return -EPERM;
+        }
 
-	/* mandatory io_uring features for zc rx */
-	if (!(ctx->flags & IORING_SETUP_DEFER_TASKRUN &&
-	      ctx->flags & IORING_SETUP_CQE32))
-		return -EINVAL;
-	if (copy_from_user(&reg, arg, sizeof(reg)))
-		return -EFAULT;
-	if (copy_from_user(&rd, u64_to_user_ptr(reg.region_ptr), sizeof(rd)))
-		return -EFAULT;
-	if (memchr_inv(&reg.__resv, 0, sizeof(reg.__resv)) ||
-	    reg.__resv2 || reg.zcrx_id)
-		return -EINVAL;
-	if (reg.if_rxq == -1 || !reg.rq_entries || reg.flags)
-		return -EINVAL;
-	if (reg.rq_entries > IO_RQ_MAX_ENTRIES) {
-		if (!(ctx->flags & IORING_SETUP_CLAMP))
-			return -EINVAL;
-		reg.rq_entries = IO_RQ_MAX_ENTRIES;
-	}
-	reg.rq_entries = roundup_pow_of_two(reg.rq_entries);
+        /* mandatory io_uring features for zc rx */
+        if (!(ctx->flags & IORING_SETUP_DEFER_TASKRUN &&
+              ctx->flags & IORING_SETUP_CQE32)) {
+                io_zcrx_pr("register_ifq: missing mandatory ctx flags=0x%x\n",
+                            ctx->flags);
+                return -EINVAL;
+        }
+        if (copy_from_user(&reg, arg, sizeof(reg))) {
+                io_zcrx_pr("register_ifq: copy_from_user reg failed\n");
+                return -EFAULT;
+        }
+        if (copy_from_user(&rd, u64_to_user_ptr(reg.region_ptr), sizeof(rd))) {
+                io_zcrx_pr("register_ifq: copy_from_user region_desc failed ptr=%#llx\n",
+                            (unsigned long long)reg.region_ptr);
+                return -EFAULT;
+        }
+        io_zcrx_pr("register_ifq: if_idx=%u if_rxq=%d rq_entries=%u flags=%#x\n",
+                    reg.if_idx, reg.if_rxq, reg.rq_entries, reg.flags);
+        if (memchr_inv(&reg.__resv, 0, sizeof(reg.__resv)) ||
+            reg.__resv2 || reg.zcrx_id) {
+                io_zcrx_pr("register_ifq: reserved fields invalid resv2=%llu zcrx_id=%u\n",
+                            reg.__resv2, reg.zcrx_id);
+                return -EINVAL;
+        }
+        if (reg.if_rxq == -1 || !reg.rq_entries || reg.flags) {
+                io_zcrx_pr("register_ifq: invalid queue params if_rxq=%d rq_entries=%u flags=%#x\n",
+                            reg.if_rxq, reg.rq_entries, reg.flags);
+                return -EINVAL;
+        }
+        if (reg.rq_entries > IO_RQ_MAX_ENTRIES) {
+                if (!(ctx->flags & IORING_SETUP_CLAMP)) {
+                        io_zcrx_pr("register_ifq: rq_entries=%u exceeds max and clamp disabled\n",
+                                    reg.rq_entries);
+                        return -EINVAL;
+                }
+                reg.rq_entries = IO_RQ_MAX_ENTRIES;
+                io_zcrx_pr("register_ifq: clamping rq_entries to %u\n",
+                            reg.rq_entries);
+        }
+        reg.rq_entries = roundup_pow_of_two(reg.rq_entries);
+        io_zcrx_pr("register_ifq: rounded rq_entries=%u\n", reg.rq_entries);
 
-	if (copy_from_user(&area, u64_to_user_ptr(reg.area_ptr), sizeof(area)))
-		return -EFAULT;
+        if (copy_from_user(&area, u64_to_user_ptr(reg.area_ptr), sizeof(area))) {
+                io_zcrx_pr("register_ifq: copy_from_user area failed ptr=%#llx\n",
+                            (unsigned long long)reg.area_ptr);
+                return -EFAULT;
+        }
 
-	ifq = io_zcrx_ifq_alloc(ctx);
-	if (!ifq)
-		return -ENOMEM;
-	ifq->rq_entries = reg.rq_entries;
+        ifq = io_zcrx_ifq_alloc(ctx);
+        if (!ifq) {
+                io_zcrx_pr("register_ifq: ifq allocation failed\n");
+                return -ENOMEM;
+        }
+        ifq->rq_entries = reg.rq_entries;
 
-	scoped_guard(mutex, &ctx->mmap_lock) {
-		/* preallocate id */
-		ret = xa_alloc(&ctx->zcrx_ctxs, &id, NULL, xa_limit_31b, GFP_KERNEL);
-		if (ret)
-			goto ifq_free;
-	}
+        scoped_guard(mutex, &ctx->mmap_lock) {
+                /* preallocate id */
+                ret = xa_alloc(&ctx->zcrx_ctxs, &id, NULL, xa_limit_31b, GFP_KERNEL);
+                if (ret) {
+                        io_zcrx_pr("register_ifq: xa_alloc failed ret=%d\n", ret);
+                        goto ifq_free;
+                }
+        }
 
-	ret = io_allocate_rbuf_ring(ifq, &reg, &rd, id);
-	if (ret)
-		goto err;
+        ret = io_allocate_rbuf_ring(ifq, &reg, &rd, id);
+        if (ret) {
+                io_zcrx_pr("register_ifq: io_allocate_rbuf_ring failed ret=%d\n", ret);
+                goto err;
+        }
 
-	ifq->netdev = netdev_get_by_index(current->nsproxy->net_ns, reg.if_idx,
-					  &ifq->netdev_tracker, GFP_KERNEL);
-	if (!ifq->netdev) {
-		ret = -ENODEV;
-		goto err;
-	}
+        ifq->netdev = netdev_get_by_index(current->nsproxy->net_ns, reg.if_idx,
+                                          &ifq->netdev_tracker, GFP_KERNEL);
+        if (!ifq->netdev) {
+                ret = -ENODEV;
+                io_zcrx_pr("register_ifq: netdev lookup failed if_idx=%u\n",
+                            reg.if_idx);
+                goto err;
+        }
 
-	ifq->dev = ifq->netdev->dev.parent;
-	if (!ifq->dev) {
-		ret = -EOPNOTSUPP;
-		goto err;
-	}
-	get_device(ifq->dev);
+        ifq->dev = ifq->netdev->dev.parent;
+        if (!ifq->dev) {
+                ret = -EOPNOTSUPP;
+                io_zcrx_pr("register_ifq: netdev missing parent device\n");
+                goto err;
+        }
+        get_device(ifq->dev);
 
-	ret = io_zcrx_create_area(ifq, &ifq->area, &area);
-	if (ret)
-		goto err;
+        ret = io_zcrx_create_area(ifq, &ifq->area, &area);
+        if (ret) {
+                io_zcrx_pr("register_ifq: io_zcrx_create_area failed ret=%d\n", ret);
+                goto err;
+        }
 
-	mp_param.mp_ops = &io_uring_pp_zc_ops;
-	mp_param.mp_priv = ifq;
-	ret = net_mp_open_rxq(ifq->netdev, reg.if_rxq, &mp_param);
-	if (ret)
-		goto err;
-	ifq->if_rxq = reg.if_rxq;
+        mp_param.mp_ops = &io_uring_pp_zc_ops;
+        mp_param.mp_priv = ifq;
+        ret = net_mp_open_rxq(ifq->netdev, reg.if_rxq, &mp_param);
+        if (ret) {
+                io_zcrx_pr("register_ifq: net_mp_open_rxq failed ret=%d\n", ret);
+                goto err;
+        }
+        ifq->if_rxq = reg.if_rxq;
 
-	reg.offsets.rqes = sizeof(struct io_uring);
-	reg.offsets.head = offsetof(struct io_uring, head);
-	reg.offsets.tail = offsetof(struct io_uring, tail);
-	reg.zcrx_id = id;
+        reg.offsets.rqes = sizeof(struct io_uring);
+        reg.offsets.head = offsetof(struct io_uring, head);
+        reg.offsets.tail = offsetof(struct io_uring, tail);
+        reg.zcrx_id = id;
+        io_zcrx_pr("register_ifq: prepared offsets rqes=%zu head=%zu tail=%zu id=%u\n",
+                    sizeof(struct io_uring),
+                    offsetof(struct io_uring, head),
+                    offsetof(struct io_uring, tail), id);
 
-	scoped_guard(mutex, &ctx->mmap_lock) {
-		/* publish ifq */
-		ret = -ENOMEM;
-		if (xa_store(&ctx->zcrx_ctxs, id, ifq, GFP_KERNEL))
-			goto err;
-	}
+        scoped_guard(mutex, &ctx->mmap_lock) {
+                /* publish ifq */
+                ret = -ENOMEM;
+                if (xa_store(&ctx->zcrx_ctxs, id, ifq, GFP_KERNEL)) {
+                        io_zcrx_pr("register_ifq: xa_store failed id=%u\n", id);
+                        goto err;
+                }
+        }
 
-	if (copy_to_user(arg, &reg, sizeof(reg)) ||
-	    copy_to_user(u64_to_user_ptr(reg.region_ptr), &rd, sizeof(rd)) ||
-	    copy_to_user(u64_to_user_ptr(reg.area_ptr), &area, sizeof(area))) {
-		ret = -EFAULT;
-		goto err;
-	}
-	return 0;
+        if (copy_to_user(arg, &reg, sizeof(reg)) ||
+            copy_to_user(u64_to_user_ptr(reg.region_ptr), &rd, sizeof(rd)) ||
+            copy_to_user(u64_to_user_ptr(reg.area_ptr), &area, sizeof(area))) {
+                ret = -EFAULT;
+                io_zcrx_pr("register_ifq: copy_to_user failed ret=%d\n", ret);
+                goto err;
+        }
+        io_zcrx_pr("register_ifq: success ctx=%p id=%u\n", ctx, id);
+        return 0;
 err:
-	scoped_guard(mutex, &ctx->mmap_lock)
-		xa_erase(&ctx->zcrx_ctxs, id);
+        scoped_guard(mutex, &ctx->mmap_lock)
+                xa_erase(&ctx->zcrx_ctxs, id);
 ifq_free:
-	io_zcrx_ifq_free(ifq);
-	return ret;
+        io_zcrx_ifq_free(ifq);
+        io_zcrx_pr("register_ifq: failure ret=%d\n", ret);
+        return ret;
 }
 
 void io_unregister_zcrx_ifqs(struct io_ring_ctx *ctx)
