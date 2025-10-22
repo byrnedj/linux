@@ -2,12 +2,26 @@
 
 #include <linux/ethtool_netlink.h>
 #include <linux/netdevice.h>
+#include <linux/printk.h>
 #include <net/netdev_lock.h>
 #include <net/netdev_queues.h>
 #include <net/netdev_rx_queue.h>
 #include <net/page_pool/memory_provider.h>
 
 #include "page_pool_priv.h"
+
+static void net_mp_log(struct net_device *dev, unsigned int rxq_idx,
+                      const char *fmt, ...)
+{
+        struct va_format vaf;
+        va_list args;
+
+        va_start(args, fmt);
+        vaf.fmt = fmt;
+        vaf.va = &args;
+        netdev_info(dev, "mp_open_rxq[%u]: %pV", rxq_idx, &vaf);
+        va_end(args);
+}
 
 int netdev_rx_queue_restart(struct net_device *dev, unsigned int rxq_idx)
 {
@@ -88,64 +102,99 @@ err_free_new_mem:
 EXPORT_SYMBOL_NS_GPL(netdev_rx_queue_restart, "NETDEV_INTERNAL");
 
 int __net_mp_open_rxq(struct net_device *dev, unsigned int rxq_idx,
-		      const struct pp_memory_provider_params *p,
-		      struct netlink_ext_ack *extack)
+                      const struct pp_memory_provider_params *p,
+                      struct netlink_ext_ack *extack)
 {
-	struct netdev_rx_queue *rxq;
-	int ret;
+        unsigned int xdp_prog_cnt;
+        struct netdev_rx_queue *rxq;
+        int ret;
 
-	if (!netdev_need_ops_lock(dev))
-		return -EOPNOTSUPP;
+        net_mp_log(dev, rxq_idx,
+                   "attempt: mp_ops=%p mp_priv=%p",
+                   p ? p->mp_ops : NULL, p ? p->mp_priv : NULL);
 
-	if (rxq_idx >= dev->real_num_rx_queues) {
-		NL_SET_ERR_MSG(extack, "rx queue index out of range");
-		return -ERANGE;
-	}
-	rxq_idx = array_index_nospec(rxq_idx, dev->real_num_rx_queues);
+        if (!netdev_need_ops_lock(dev)) {
+                net_mp_log(dev, rxq_idx,
+                           "reject: device does not require ops lock (unsupported)");
+                return -EOPNOTSUPP;
+        }
 
-	if (dev->cfg->hds_config != ETHTOOL_TCP_DATA_SPLIT_ENABLED) {
-		NL_SET_ERR_MSG(extack, "tcp-data-split is disabled");
-		return -EINVAL;
-	}
-	if (dev->cfg->hds_thresh) {
-		NL_SET_ERR_MSG(extack, "hds-thresh is not zero");
-		return -EINVAL;
-	}
-	if (dev_xdp_prog_count(dev)) {
-		NL_SET_ERR_MSG(extack, "unable to custom memory provider to device with XDP program attached");
-		return -EEXIST;
-	}
+        if (rxq_idx >= dev->real_num_rx_queues) {
+                NL_SET_ERR_MSG(extack, "rx queue index out of range");
+                net_mp_log(dev, rxq_idx,
+                           "reject: queue index %u >= real_num_rx_queues %u",
+                           rxq_idx, dev->real_num_rx_queues);
+                return -ERANGE;
+        }
+        rxq_idx = array_index_nospec(rxq_idx, dev->real_num_rx_queues);
 
-	rxq = __netif_get_rx_queue(dev, rxq_idx);
-	if (rxq->mp_params.mp_ops) {
-		NL_SET_ERR_MSG(extack, "designated queue already memory provider bound");
-		return -EEXIST;
-	}
+        if (dev->cfg->hds_config != ETHTOOL_TCP_DATA_SPLIT_ENABLED) {
+                NL_SET_ERR_MSG(extack, "tcp-data-split is disabled");
+                net_mp_log(dev, rxq_idx,
+                           "reject: tcp-data-split disabled (cfg=%u)",
+                           dev->cfg->hds_config);
+                return -EINVAL;
+        }
+        if (dev->cfg->hds_thresh) {
+                NL_SET_ERR_MSG(extack, "hds-thresh is not zero");
+                net_mp_log(dev, rxq_idx,
+                           "reject: hds_thresh=%u (expected zero)",
+                           dev->cfg->hds_thresh);
+                return -EINVAL;
+        }
+        xdp_prog_cnt = dev_xdp_prog_count(dev);
+        if (xdp_prog_cnt) {
+                NL_SET_ERR_MSG(extack, "unable to custom memory provider to device with XDP program attached");
+                net_mp_log(dev, rxq_idx,
+                           "reject: device has %u XDP programs attached",
+                           xdp_prog_cnt);
+                return -EEXIST;
+        }
+
+        rxq = __netif_get_rx_queue(dev, rxq_idx);
+        if (rxq->mp_params.mp_ops) {
+                NL_SET_ERR_MSG(extack, "designated queue already memory provider bound");
+                net_mp_log(dev, rxq_idx,
+                           "reject: queue already bound to mp_ops=%p mp_priv=%p",
+                           rxq->mp_params.mp_ops, rxq->mp_params.mp_priv);
+                return -EEXIST;
+        }
 #ifdef CONFIG_XDP_SOCKETS
-	if (rxq->pool) {
-		NL_SET_ERR_MSG(extack, "designated queue already in use by AF_XDP");
-		return -EBUSY;
-	}
+        if (rxq->pool) {
+                NL_SET_ERR_MSG(extack, "designated queue already in use by AF_XDP");
+                net_mp_log(dev, rxq_idx,
+                           "reject: queue has AF_XDP pool=%p", rxq->pool);
+                return -EBUSY;
+        }
 #endif
 
-	rxq->mp_params = *p;
-	ret = netdev_rx_queue_restart(dev, rxq_idx);
-	if (ret) {
-		rxq->mp_params.mp_ops = NULL;
-		rxq->mp_params.mp_priv = NULL;
-	}
-	return ret;
+        net_mp_log(dev, rxq_idx,
+                   "binding provider: mp_ops=%p mp_priv=%p",
+                   p ? p->mp_ops : NULL, p ? p->mp_priv : NULL);
+        rxq->mp_params = *p;
+        ret = netdev_rx_queue_restart(dev, rxq_idx);
+        if (ret) {
+                net_mp_log(dev, rxq_idx,
+                           "restart failed with %d -- rolling back", ret);
+                rxq->mp_params.mp_ops = NULL;
+                rxq->mp_params.mp_priv = NULL;
+        } else {
+                net_mp_log(dev, rxq_idx, "success");
+        }
+        return ret;
 }
 
 int net_mp_open_rxq(struct net_device *dev, unsigned int rxq_idx,
-		    struct pp_memory_provider_params *p)
+                    struct pp_memory_provider_params *p)
 {
-	int ret;
+        int ret;
 
-	netdev_lock(dev);
-	ret = __net_mp_open_rxq(dev, rxq_idx, p, NULL);
-	netdev_unlock(dev);
-	return ret;
+        netdev_lock(dev);
+        net_mp_log(dev, rxq_idx, "invocation from unlocked context");
+        ret = __net_mp_open_rxq(dev, rxq_idx, p, NULL);
+        netdev_unlock(dev);
+        net_mp_log(dev, rxq_idx, "returning %d", ret);
+        return ret;
 }
 
 void __net_mp_close_rxq(struct net_device *dev, unsigned int ifq_idx,
