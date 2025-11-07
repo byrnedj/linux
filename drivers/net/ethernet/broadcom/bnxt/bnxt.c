@@ -16798,8 +16798,18 @@ static int bnxt_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 	if (BNXT_SUPPORTS_NTUPLE_VNIC(bp))
 		bp->rss_cap |= BNXT_RSS_CAP_MULTI_RSS_CTX;
-	if (BNXT_SUPPORTS_QUEUE_API(bp))
+	if (BNXT_SUPPORTS_QUEUE_API(bp)) {
 		dev->queue_mgmt_ops = &bnxt_queue_mgmt_ops;
+        } else {
+            pr_warn("Queue management API not supported by firmware, disabling related features\n");
+            pr_warn("brnxt fw_cap=0x%x, ntuple=%d, pf=%d\n",
+                            bp->fw_cap, BNXT_SUPPORTS_NTUPLE_VNIC(bp), BNXT_PF(bp));
+        }
+        pr_info("brnxt fw_cap=0x%x, ntuple=%d, pf=%d RE_FLUSH %d\n",
+                        bp->fw_cap, BNXT_SUPPORTS_NTUPLE_VNIC(bp), BNXT_PF(bp),
+                        bp->fw_cap & BNXT_FW_CAP_VNIC_RE_FLUSH);
+
+
 	dev->request_ops_lock = true;
 	dev->netmem_tx = true;
 
