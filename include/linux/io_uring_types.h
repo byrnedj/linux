@@ -262,10 +262,11 @@ struct io_dma_channel {
 	struct dma_chan		*chan;
 	struct iommu_sva	*sva;
 	unsigned int		pasid;
-	
-	struct work_struct      poll_work;
-	atomic_t                poll_armed;
-	
+
+	struct work_struct	poll_work;
+	atomic_t		poll_armed;
+
+	spinlock_t		lock;
 	struct io_dma_task	*head;
 	struct io_dma_task	*tail;
 };
@@ -273,8 +274,9 @@ struct io_dma_channel {
 struct io_dma_kiocb {
 	unsigned int		dma_refcnt;
 	int			dma_result;
-	size_t                  remaining;
+	size_t			remaining;
 	struct io_dma_task	*dma_tasks;
+	struct io_dma_task	*dma_tasks_tail;
 };
 
 #define IO_DMA_MAX_ELEMENTS 128
