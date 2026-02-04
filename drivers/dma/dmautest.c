@@ -383,7 +383,7 @@ static const struct file_operations dmautest_fops = {
 	.read_iter		= dmautest_read_iter,
 	.open			= dmautest_open,
 	.release		= dmautest_release,
-	.llseek			= no_llseek,
+	.llseek			= noop_llseek,
 };
 
 struct miscdevice dmautest_device = {
