@@ -142,12 +142,12 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
             size_t left = len;
             ssize_t copied_total = 0;
             while (left > 0) {
-                const size_t seg_avail = min_t(size_t, left, src_iter->iov->iov_len - src_iter->iov_offset);
+                const size_t seg_avail = min_t(size_t, left, iter_iov_len(src_iter));
                 size_t copied;
                 const void *base;
                 if (!seg_avail)
                     break;
-                base = src_iter->iov->iov_base + src_iter->iov_offset;
+                base = iter_iov_addr(src_iter);
                 copied = copy_to_iter(base, seg_avail, dst_iter);
                 if (!copied) {
                     return copied_total ? copied_total : -EFAULT;
