@@ -396,11 +396,6 @@ struct kiocb {
 	 * Valid IFF IOCB_WAITQ is set.
 	 */
 	struct wait_page_queue	*ki_waitq;
-
-	ssize_t (*ki_copy_to_iter)(struct kiocb *iocb, struct iov_iter *dst_iter,
-		 struct iov_iter *src_iter,
-		 ki_copy_to_iter_cpl cb_fn, void *cb_arg,
-		 unsigned long flags);
 };
 
 static inline bool is_sync_kiocb(struct kiocb *kiocb)

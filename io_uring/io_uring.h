@@ -618,7 +618,7 @@ void io_uring_dma_prep(struct io_kiocb *req);
 int io_dma_submit_queued_tasks(struct io_kiocb *req);
 extern struct kmem_cache *dma_cachep;
 int __io_dma_poll(struct io_ring_ctx *ctx);
-int kiocb_done(struct io_kiocb *req, ssize_t ret, unsigned int issue_flags);
+int kiocb_done(struct io_kiocb *req, ssize_t ret, struct io_br_sel *sel, unsigned int issue_flags);
 void io_submit_flush_completions(struct io_ring_ctx *ctx);
 
 #endif

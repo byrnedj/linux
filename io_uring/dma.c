@@ -106,9 +106,8 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	i = 0;
 	bytes = 0;
 	while (iov_iter_count(src_iter) > 0) {
-		dma->src[i].iov_base = src_iter->iov->iov_base + src_iter->iov_offset;
-		dma->src[i].iov_len = min(src_iter->count,
-					src_iter->iov->iov_len - src_iter->iov_offset);
+		dma->src[i].iov_base = (void *)iter_iov_addr(src_iter);
+		dma->src[i].iov_len = iter_iov_len(src_iter);
 		bytes += dma->src[i].iov_len;
 		iov_iter_advance(src_iter, dma->src[i].iov_len);
 		i++;
@@ -125,7 +124,8 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	i = 0;
 	bytes = 0;
 	while (iov_iter_count(dst_iter) > 0) {
-		dma->dst[i] = iov_iter_iovec(dst_iter);
+		dma->dst[i].iov_base = (void *)iter_iov_addr(dst_iter);
+		dma->dst[i].iov_len = iter_iov_len(dst_iter);
 		bytes += dma->dst[i].iov_len;
 		iov_iter_advance(dst_iter, dma->dst[i].iov_len);
 		i++;
@@ -218,7 +218,7 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma, 
 	req->dma.dma_refcnt--;
 
 	if (req->dma.dma_refcnt == 0)
-		kiocb_done(req, req->dma.dma_result, IO_URING_F_COMPLETE_DEFER);
+		kiocb_done(req, req->dma.dma_result, NULL, IO_URING_F_COMPLETE_DEFER);
 }
 
 int io_dma_submit_queued_tasks(struct io_kiocb *req)

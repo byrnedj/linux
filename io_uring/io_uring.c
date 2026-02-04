@@ -3944,7 +3944,6 @@ static int __init io_uring_init(void)
 
 	io_uring_optable_init();
 
-<<<<<<< HEAD
 	/* imu->dir is u8 */
 	BUILD_BUG_ON((IO_IMU_DEST | IO_IMU_SOURCE) > U8_MAX);
 

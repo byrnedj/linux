@@ -646,7 +646,7 @@ static inline void io_rw_done(struct io_kiocb *req, ssize_t ret)
 		io_complete_rw(&rw->kiocb, ret);
 }
 
-int kiocb_done(struct io_kiocb *req, ssize_t ret,
+int kiocb_done(struct io_kiocb *req, ssize_t ret, struct io_br_sel *sel,
 		       unsigned int issue_flags)
 {
 	struct io_rw *rw = io_kiocb_to_cmd(req, struct io_rw);
@@ -915,6 +915,7 @@ static int __io_read(struct io_kiocb *req, struct io_br_sel *sel,
 	struct io_async_rw *io = req->async_data;
 	struct kiocb *kiocb = &rw->kiocb;
 	ssize_t ret;
+	int ret2;
 	loff_t *ppos;
 
 	if (req->flags & REQ_F_IMPORT_BUFFER) {

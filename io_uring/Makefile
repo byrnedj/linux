@@ -2,7 +2,6 @@
 #
 # Makefile for io_uring
 
-<<<<<<< HEAD
 ifdef CONFIG_GCOV_PROFILE_URING
 GCOV_PROFILE := y
 endif
