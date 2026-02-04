@@ -2896,7 +2896,7 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 	}
 
 	dev = ctx->dma.chan->device->dev;
-	ctx->dma.sva = iommu_sva_bind_device(dev, ctx->mm_account);
+	ctx->dma.sva = iommu_sva_bind_device(dev, ctx->mm_account, IOMMU_SVA_BIND_KERNEL);
 	if (IS_ERR(ctx->dma.sva)) {
 		rc = PTR_ERR(ctx->dma.sva);
 		goto failed;

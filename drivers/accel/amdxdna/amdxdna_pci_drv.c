@@ -71,7 +71,7 @@ static int amdxdna_drm_open(struct drm_device *ddev, struct drm_file *filp)
 	client->pid = pid_nr(rcu_access_pointer(filp->pid));
 	client->xdna = xdna;
 
-	client->sva = iommu_sva_bind_device(xdna->ddev.dev, current->mm);
+	client->sva = iommu_sva_bind_device(xdna->ddev.dev, current->mm, 0);
 	if (IS_ERR(client->sva)) {
 		ret = PTR_ERR(client->sva);
 		XDNA_ERR(xdna, "SVA bind device failed, ret %d", ret);

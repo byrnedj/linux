@@ -3435,7 +3435,7 @@ err_revert:
 			 */
 			if (!old ||
 			    WARN_ON(old->ops->set_dev_pasid(old, device->dev,
-							    pasid, domain)))
+							    pasid, domain, 0)))
 				iommu_remove_dev_pasid(device->dev, pasid, domain);
 		}
 	}
