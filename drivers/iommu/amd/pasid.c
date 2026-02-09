@@ -101,12 +101,11 @@ static const struct mmu_notifier_ops sva_mn = {
 
 int iommu_sva_set_dev_pasid(struct iommu_domain *domain,
 			    struct device *dev, ioasid_t pasid,
-			    struct iommu_domain *old)
+			    struct iommu_domain *old, uint32_t flags)
 {
 	struct pdom_dev_data *pdom_dev_data;
 	struct protection_domain *sva_pdom = to_pdomain(domain);
 	struct iommu_dev_data *dev_data = dev_iommu_priv_get(dev);
-	unsigned long flags;
 	int ret = -EINVAL;
 
 	if (old)

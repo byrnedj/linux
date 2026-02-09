@@ -2833,7 +2833,7 @@ static int blocked_domain_attach_device(struct iommu_domain *domain,
 
 static int blocked_domain_set_dev_pasid(struct iommu_domain *domain,
 					struct device *dev, ioasid_t pasid,
-					struct iommu_domain *old)
+					struct iommu_domain *old, uint32_t flags)
 {
 	amd_iommu_remove_dev_pasid(dev, pasid, old);
 	return 0;
