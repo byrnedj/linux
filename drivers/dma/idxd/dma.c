@@ -213,7 +213,7 @@ idxd_dma_kernel_user(struct dma_chan *chan, struct iov_iter *u_iter,
 			kbuf = k_iter->kvec->iov_base + k_iter->iov_offset;
 
 			while (ofs < slen && iov_iter_count(u_iter)) {
-				const struct iovec *iov = iter_iov_addr(u_iter);
+				const struct iovec *iov = iter_iov(u_iter);
 				size_t len = min(u_iter->count,
 					iov->iov_len - u_iter->iov_offset);
 				struct dsa_hw_desc *hw;
