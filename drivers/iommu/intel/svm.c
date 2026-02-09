@@ -27,23 +27,27 @@
 
 void intel_svm_check(struct intel_iommu *iommu)
 {
-	if (!pasid_supported(iommu))
+	if (!pasid_supported(iommu)) {
+		pr_info("%s: SVM check - PASID not supported (ecap=0x%llx)\n",
+			iommu->name, iommu->ecap);
 		return;
+	}
 
 	if (cpu_feature_enabled(X86_FEATURE_GBPAGES) &&
 	    !cap_fl1gp_support(iommu->cap)) {
-		pr_err("%s SVM disabled, incompatible 1GB page capability\n",
-		       iommu->name);
+		pr_err("%s SVM disabled, incompatible 1GB page capability (cap=0x%llx)\n",
+		       iommu->name, iommu->cap);
 		return;
 	}
 
 	if (cpu_feature_enabled(X86_FEATURE_LA57) &&
 	    !cap_fl5lp_support(iommu->cap)) {
-		pr_err("%s SVM disabled, incompatible paging mode\n",
-		       iommu->name);
+		pr_err("%s SVM disabled, incompatible paging mode (cap=0x%llx)\n",
+		       iommu->name, iommu->cap);
 		return;
 	}
 
+	pr_info("%s: SVM capable, setting VTD_FLAG_SVM_CAPABLE\n", iommu->name);
 	iommu->flags |= VTD_FLAG_SVM_CAPABLE;
 }
 
@@ -115,18 +119,29 @@ static int intel_iommu_sva_supported(struct device *dev)
 	struct device_domain_info *info = dev_iommu_priv_get(dev);
 	struct intel_iommu *iommu;
 
-	if (!info || dmar_disabled)
+	if (!info || dmar_disabled) {
+		dev_err(dev, "%s: info=%p dmar_disabled=%d\n",
+			__func__, info, dmar_disabled);
 		return -EINVAL;
+	}
 
 	iommu = info->iommu;
-	if (!iommu)
+	if (!iommu) {
+		dev_err(dev, "%s: info->iommu is NULL\n", __func__);
 		return -EINVAL;
+	}
 
-	if (!(iommu->flags & VTD_FLAG_SVM_CAPABLE))
+	if (!(iommu->flags & VTD_FLAG_SVM_CAPABLE)) {
+		dev_err(dev, "%s: IOMMU %s not SVM capable (flags=0x%lx)\n",
+			__func__, iommu->name, iommu->flags);
 		return -ENODEV;
+	}
 
-	if (!info->pasid_enabled || !info->ats_enabled)
+	if (!info->pasid_enabled || !info->ats_enabled) {
+		dev_err(dev, "%s: pasid_enabled=%d ats_enabled=%d\n",
+			__func__, info->pasid_enabled, info->ats_enabled);
 		return -EINVAL;
+	}
 
 	/*
 	 * Devices having device-specific I/O fault handling should not

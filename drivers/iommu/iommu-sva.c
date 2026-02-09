@@ -78,8 +78,14 @@ struct iommu_sva *iommu_sva_bind_device(struct device *dev, struct mm_struct *mm
 	struct iommu_sva *handle;
 	int ret;
 
-	if (!group)
+	if (!group) {
+		dev_err(dev, "%s: device has no iommu_group (dev->iommu=%p)\n",
+			__func__, dev->iommu);
 		return ERR_PTR(-ENODEV);
+	}
+
+	dev_info(dev, "%s: starting SVA bind, group=%p flags=0x%x\n",
+		__func__, group, flags);
 
 	mutex_lock(&iommu_sva_lock);
 
@@ -87,8 +93,12 @@ struct iommu_sva *iommu_sva_bind_device(struct device *dev, struct mm_struct *mm
 	iommu_mm = iommu_alloc_mm_data(mm, dev);
 	if (IS_ERR(iommu_mm)) {
 		ret = PTR_ERR(iommu_mm);
+		dev_err(dev, "%s: iommu_alloc_mm_data() failed: %d\n",
+			__func__, ret);
 		goto out_unlock;
 	}
+	dev_info(dev, "%s: iommu_mm allocated, pasid=%u\n",
+		__func__, iommu_mm->pasid);
 
 	/* A bond already exists, just take a reference`. */
 	attach_handle = iommu_attach_handle_get(group, iommu_mm->pasid, IOMMU_DOMAIN_SVA);
@@ -105,6 +115,8 @@ struct iommu_sva *iommu_sva_bind_device(struct device *dev, struct mm_struct *mm
 
 	if (PTR_ERR(attach_handle) != -ENOENT) {
 		ret = PTR_ERR(attach_handle);
+		dev_err(dev, "%s: iommu_attach_handle_get() failed: %d\n",
+			__func__, ret);
 		goto out_unlock;
 	}
 
@@ -122,19 +134,29 @@ struct iommu_sva *iommu_sva_bind_device(struct device *dev, struct mm_struct *mm
 			domain->users++;
 			goto out;
 		}
+		dev_info(dev, "%s: existing domain attach failed: %d\n",
+			__func__, ret);
 	}
 
 	/* Allocate a new domain and set it on device pasid. */
+	dev_info(dev, "%s: allocating new SVA domain\n", __func__);
 	domain = iommu_sva_domain_alloc(dev, mm);
 	if (IS_ERR(domain)) {
 		ret = PTR_ERR(domain);
+		dev_err(dev, "%s: iommu_sva_domain_alloc() failed: %d\n",
+			__func__, ret);
 		goto out_free_handle;
 	}
 
+	dev_info(dev, "%s: calling iommu_attach_device_pasid(pasid=%u, flags=0x%x)\n",
+		__func__, iommu_mm->pasid, flags);
 	ret = iommu_attach_device_pasid(domain, dev, iommu_mm->pasid,
 					&handle->handle, flags);
-	if (ret)
+	if (ret) {
+		dev_err(dev, "%s: iommu_attach_device_pasid() failed: %d\n",
+			__func__, ret);
 		goto out_free_domain;
+	}
 	domain->users = 1;
 
 	if (list_empty(&iommu_mm->sva_domains)) {

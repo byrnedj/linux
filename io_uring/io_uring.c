@@ -2900,11 +2900,15 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 	}
 
 	dev = ctx->dma.chan->device->dev;
+	dev_info(dev, "io_uring DMA: attempting SVA bind, dev=%s iommu_group=%p\n",
+		 dev_name(dev), dev->iommu_group);
 	ctx->dma.sva = iommu_sva_bind_device(dev, ctx->mm_account, flags);
 	if (IS_ERR(ctx->dma.sva)) {
 		rc = PTR_ERR(ctx->dma.sva);
                 dev_err(dev, "iommu_sva_bind_device() failed: %d (%pe)\n",
                         rc, ctx->dma.sva);
+		dev_err(dev, "  dev->iommu=%p, dev->iommu_group=%p\n",
+			dev->iommu, dev->iommu_group);
 		goto failed;
 	}
 
