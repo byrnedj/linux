@@ -3412,10 +3412,16 @@ static int __iommu_set_group_pasid(struct iommu_domain *domain,
 
 	for_each_group_device(group, device) {
 		if (device->dev->iommu->max_pasids > 0) {
+			dev_info(device->dev, "%s: calling set_dev_pasid for dev %s (max_pasids=%u, pasid=%u, flags=0x%x)\n",
+				 __func__, dev_name(device->dev),
+				 device->dev->iommu->max_pasids, pasid, flags);
 			ret = domain->ops->set_dev_pasid(domain, device->dev,
 							 pasid, old, flags);
-			if (ret)
+			if (ret) {
+				dev_err(device->dev, "%s: set_dev_pasid failed for %s: %d\n",
+					__func__, dev_name(device->dev), ret);
 				goto err_revert;
+			}
 		}
 	}
 
@@ -3477,19 +3483,26 @@ int iommu_attach_device_pasid(struct iommu_domain *domain,
 	void *entry;
 	int ret;
 
-	if (!group)
+	if (!group) {
+		dev_err(dev, "%s: no iommu_group\n", __func__);
 		return -ENODEV;
+	}
 
 	ops = dev_iommu_ops(dev);
 
 	if (!domain->ops->set_dev_pasid ||
 	    !ops->blocked_domain ||
-	    !ops->blocked_domain->ops->set_dev_pasid)
+	    !ops->blocked_domain->ops->set_dev_pasid) {
+		dev_err(dev, "%s: missing ops (set_dev_pasid=%d blocked_domain=%d)\n",
+			__func__, !!domain->ops->set_dev_pasid, !!ops->blocked_domain);
 		return -EOPNOTSUPP;
+	}
 
 	if (!domain_iommu_ops_compatible(ops, domain) ||
-	    pasid == IOMMU_NO_PASID)
+	    pasid == IOMMU_NO_PASID) {
+		dev_err(dev, "%s: ops incompatible or invalid pasid\n", __func__);
 		return -EINVAL;
+	}
 
 	mutex_lock(&group->mutex);
 	for_each_group_device(group, device) {
@@ -3500,6 +3513,9 @@ int iommu_attach_device_pasid(struct iommu_domain *domain,
 		 */
 		if ((device->dev->iommu->max_pasids > 0) &&
 		    (pasid >= device->dev->iommu->max_pasids)) {
+			dev_err(dev, "%s: pasid %u >= max_pasids %u for dev %s\n",
+				__func__, pasid, device->dev->iommu->max_pasids,
+				dev_name(device->dev));
 			ret = -EINVAL;
 			goto out_unlock;
 		}
@@ -3512,11 +3528,14 @@ int iommu_attach_device_pasid(struct iommu_domain *domain,
 	 * xa_reserve().
 	 */
 	ret = xa_insert(&group->pasid_array, pasid, XA_ZERO_ENTRY, GFP_KERNEL);
-	if (ret)
+	if (ret) {
+		dev_err(dev, "%s: xa_insert failed: %d\n", __func__, ret);
 		goto out_unlock;
+	}
 
 	ret = __iommu_set_group_pasid(domain, group, pasid, NULL, flags);
 	if (ret) {
+		dev_err(dev, "%s: __iommu_set_group_pasid failed: %d\n", __func__, ret);
 		xa_release(&group->pasid_array, pasid);
 		goto out_unlock;
 	}

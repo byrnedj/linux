@@ -889,20 +889,36 @@ static void iommu_disable_pci_ats(struct device_domain_info *info)
 static void iommu_enable_pci_pri(struct device_domain_info *info)
 {
 	struct pci_dev *pdev;
+	int ret;
 
-	if (!info->ats_enabled || !info->pri_supported)
+	if (!info->ats_enabled || !info->pri_supported) {
+		dev_err(info->dev, "%s: skipped (ats_enabled=%d, pri_supported=%d)\n",
+			__func__, info->ats_enabled, info->pri_supported);
 		return;
+	}
 
 	pdev = to_pci_dev(info->dev);
 	/* PASID is required in PRG Response Message. */
-	if (info->pasid_enabled && !pci_prg_resp_pasid_required(pdev))
+	if (info->pasid_enabled && !pci_prg_resp_pasid_required(pdev)) {
+		dev_err(info->dev, "%s: skipped - pasid_enabled=%d but prg_resp_pasid_required=0\n",
+			__func__, info->pasid_enabled);
 		return;
+	}
 
-	if (pci_reset_pri(pdev))
+	ret = pci_reset_pri(pdev);
+	if (ret) {
+		dev_err(info->dev, "%s: pci_reset_pri failed: %d\n", __func__, ret);
 		return;
+	}
 
-	if (!pci_enable_pri(pdev, PRQ_DEPTH))
-		info->pri_enabled = 1;
+	ret = pci_enable_pri(pdev, PRQ_DEPTH);
+	if (ret) {
+		dev_err(info->dev, "%s: pci_enable_pri failed: %d\n", __func__, ret);
+		return;
+	}
+
+	info->pri_enabled = 1;
+	dev_err(info->dev, "%s: PRI enabled successfully\n", __func__);
 }
 
 static void iommu_disable_pci_pri(struct device_domain_info *info)
@@ -3283,8 +3299,13 @@ static struct iommu_device *intel_iommu_probe_device(struct device *dev)
 			}
 
 			if (info->ats_supported && ecap_prs(iommu->ecap) &&
-			    ecap_pds(iommu->ecap) && pci_pri_supported(pdev))
+			    pci_pri_supported(pdev))
 				info->pri_supported = 1;
+
+			dev_err(dev, "iommu probe: ats_supported=%d pasid_supported=%d pri_supported=%d ecap_prs=%d ecap_pds=%d\n",
+				 info->ats_supported, info->pasid_supported,
+				 info->pri_supported,
+				 !!ecap_prs(iommu->ecap), !!ecap_pds(iommu->ecap));
 		}
 	}
 

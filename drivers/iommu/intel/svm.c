@@ -171,17 +171,30 @@ static int intel_svm_set_dev_pasid(struct iommu_domain *domain,
 	unsigned long sflags;
 	int ret = 0;
 
+	dev_info(dev, ">>> %s called: pasid=%u flags=0x%x\n", __func__, pasid, flags);
+
+	pr_err(">>> %s: about to call intel_iommu_sva_supported\n", __func__);
 	ret = intel_iommu_sva_supported(dev);
-	if (ret)
+	pr_err(">>> %s: intel_iommu_sva_supported returned %d\n", __func__, ret);
+	if (ret) {
 		return ret;
+	}
+	dev_info(dev, ">>> %s: sva_supported OK\n", __func__);
 
 	dev_pasid = domain_add_dev_pasid(domain, dev, pasid);
-	if (IS_ERR(dev_pasid))
+	if (IS_ERR(dev_pasid)) {
+		dev_err(dev, ">>> %s: domain_add_dev_pasid failed: %ld\n",
+			__func__, PTR_ERR(dev_pasid));
 		return PTR_ERR(dev_pasid);
+	}
+	dev_info(dev, ">>> %s: domain_add_dev_pasid OK\n", __func__);
 
 	ret = iopf_for_domain_replace(domain, old, dev);
-	if (ret)
+	if (ret) {
+		dev_err(dev, ">>> %s: iopf_for_domain_replace failed: %d\n", __func__, ret);
 		goto out_remove_dev_pasid;
+	}
+	dev_info(dev, ">>> %s: iopf_for_domain_replace OK\n", __func__);
 
 	/* Setup the pasid table: */
 	sflags = cpu_feature_enabled(X86_FEATURE_LA57) ? PASID_FLAG_FL5LP : 0;
@@ -191,8 +204,11 @@ static int intel_svm_set_dev_pasid(struct iommu_domain *domain,
 	ret = __domain_setup_first_level(iommu, dev, pasid,
 					 FLPT_DEFAULT_DID, __pa(mm->pgd),
 					 sflags, old);
-	if (ret)
+	if (ret) {
+		dev_err(dev, ">>> %s: __domain_setup_first_level failed: %d\n", __func__, ret);
 		goto out_unwind_iopf;
+	}
+	dev_info(dev, ">>> %s: __domain_setup_first_level OK\n", __func__);
 
 	domain_remove_dev_pasid(old, dev, pasid);
 
