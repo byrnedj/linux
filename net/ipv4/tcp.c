@@ -2661,7 +2661,7 @@ static int printkvec(struct sk_buff *skb, int off, int len, struct kvec *kvec)
 
 		if ((copy = end - off) > 0) {
 			struct page *page = skb_frag_page(frag);
-			u8 *vaddr = kmap(page);
+			u8 *vaddr = kmap_local_page(page);
 
 			if (copy > len)
 				copy = len;
@@ -2670,7 +2670,7 @@ static int printkvec(struct sk_buff *skb, int off, int len, struct kvec *kvec)
 			kvec[i].iov_len = copy;
 			ret++;
 			off += copy;
-			kunmap(page);
+			kunmap_local(vaddr);
 			len -= copy;
 		}
 		start = end;

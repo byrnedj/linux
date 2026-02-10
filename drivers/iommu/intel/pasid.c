@@ -384,6 +384,9 @@ static void pasid_pte_config_first_level(struct intel_iommu *iommu,
 	pasid_set_address_width(pte, iommu->agaw);
 	pasid_set_page_snoop(pte, flags & PASID_FLAG_PWSNP);
 
+	if (flags & PASID_FLAG_SUPERVISOR_MODE)
+		pasid_set_sre(pte);
+
 	/* Setup Present and PASID Granular Transfer Type: */
 	pasid_set_translation_type(pte, PASID_ENTRY_PGTT_FL_ONLY);
 	pasid_set_present(pte);
@@ -403,6 +406,12 @@ int intel_pasid_setup_first_level(struct intel_iommu *iommu, struct device *dev,
 
 	if ((flags & PASID_FLAG_FL5LP) && !cap_fl5lp_support(iommu->cap)) {
 		pr_err("No 5-level paging support for first-level on %s\n",
+		       iommu->name);
+		return -EINVAL;
+	}
+
+	if ((flags & PASID_FLAG_SUPERVISOR_MODE) && !ecap_srs(iommu->ecap)) {
+		pr_err("No supervisor request support on %s\n",
 		       iommu->name);
 		return -EINVAL;
 	}
