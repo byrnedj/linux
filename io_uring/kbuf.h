@@ -4,6 +4,7 @@
 
 #include <uapi/linux/io_uring.h>
 #include <linux/io_uring_types.h>
+#include <linux/dma-mapping.h>
 
 enum {
 	/* ring mapped provided buffers */
@@ -34,6 +35,13 @@ struct io_buffer_list {
 	__u16 flags;
 
 	struct io_mapped_region region;
+
+	/* DMA pre-mapped data buffer region (when IOU_PBUF_RING_DMA is set) */
+	dma_addr_t		*dma_addrs;	/* DMA addr per page */
+	struct page		**dma_pages;	/* pinned data buffer pages */
+	struct device		*dma_dev;	/* device used for mapping */
+	unsigned long		dma_data_base;	/* user VA base of data region */
+	int			dma_nr_pages;	/* number of mapped pages */
 };
 
 struct io_buffer {
@@ -87,6 +95,8 @@ bool io_kbuf_commit(struct io_kiocb *req,
 
 struct io_mapped_region *io_pbuf_get_region(struct io_ring_ctx *ctx,
 					    unsigned int bgid);
+
+dma_addr_t io_kbuf_dma_addr(struct io_buffer_list *bl, u64 user_addr);
 
 static inline bool io_kbuf_recycle_ring(struct io_kiocb *req,
 					struct io_buffer_list *bl)

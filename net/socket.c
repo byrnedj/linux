@@ -1155,7 +1155,8 @@ static ssize_t sock_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	struct file *file = iocb->ki_filp;
 	struct socket *sock = file->private_data;
 	struct msghdr msg = {.msg_iter = *to,
-			     .msg_iocb = iocb};
+			     .msg_iocb = iocb,
+			     .msg_io_iocb = iocb->private};
 	ssize_t res;
 
 	if (file->f_flags & O_NONBLOCK || (iocb->ki_flags & IOCB_NOWAIT))

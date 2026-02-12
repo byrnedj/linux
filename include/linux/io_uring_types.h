@@ -260,8 +260,6 @@ struct io_alloc_cache {
 
 struct io_dma_channel {
 	struct dma_chan		*chan;
-	struct iommu_sva	*sva;
-	unsigned int		pasid;
 
 	struct work_struct	poll_work;
 	atomic_t		poll_armed;
@@ -274,20 +272,24 @@ struct io_dma_channel {
 struct io_dma_kiocb {
 	unsigned int		dma_refcnt;
 	int			dma_result;
+	int			saved_res;	/* total recv bytes for CQE */
+	unsigned int		saved_cflags;	/* buffer flags for CQE */
 	size_t			remaining;
 	struct io_dma_task	*dma_tasks;
 	struct io_dma_task	*dma_tasks_tail;
+	unsigned short		buf_group;	/* for DMA addr lookup */
+	bool			dma_active;	/* DMA copy armed for this req */
+	u64			dst_user_addr;	/* user VA for reg buf DMA lookup */
 };
-
-#define IO_DMA_MAX_ELEMENTS 128
 
 struct io_dma_task {
 	struct io_kiocb		*req;
 	dma_cookie_t		cookie;
-	struct iovec		dst[IO_DMA_MAX_ELEMENTS];
-	struct kvec             src[IO_DMA_MAX_ELEMENTS];
-	unsigned long		flags;
+	dma_addr_t		src_dma;	/* DMA-mapped source address */
+	dma_addr_t		dst_dma;	/* pre-mapped dest DMA address */
 	u32			len;
+	dma_addr_t		src_map_addr;	/* for dma_unmap at completion */
+	u32			src_map_len;
 	void (*cb_fn)(struct kiocb *, void *, int);
 	void			*cb_arg;
 	struct io_dma_task	*next;

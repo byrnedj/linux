@@ -10,6 +10,7 @@
 #include <linux/compat.h>
 #include <linux/io_uring.h>
 #include <linux/io_uring/cmd.h>
+#include <linux/dma-mapping.h>
 
 #include <uapi/linux/io_uring.h>
 
@@ -144,6 +145,18 @@ static void io_buffer_unmap(struct io_ring_ctx *ctx, struct io_mapped_ubuf *imu)
 	if (unlikely(refcount_read(&imu->refs) > 1)) {
 		if (!refcount_dec_and_test(&imu->refs))
 			return;
+	}
+
+	/* Unmap DMA addresses if they were mapped */
+	if (imu->dma_addrs) {
+		int i;
+
+		for (i = 0; i < imu->nr_bvecs; i++)
+			dma_unmap_page(imu->dma_dev, imu->dma_addrs[i],
+				       1UL << imu->folio_shift,
+				       DMA_FROM_DEVICE);
+		kvfree(imu->dma_addrs);
+		imu->dma_addrs = NULL;
 	}
 
 	if (imu->acct_pages)
@@ -815,6 +828,8 @@ static struct io_rsrc_node *io_sqe_buffer_register(struct io_ring_ctx *ctx,
 	imu = io_alloc_imu(ctx, nr_pages);
 	if (!imu)
 		goto done;
+	imu->dma_addrs = NULL;
+	imu->dma_dev = NULL;
 
 	imu->nr_bvecs = nr_pages;
 	ret = io_buffer_account_pin(ctx, pages, nr_pages, imu, last_hpage);
@@ -848,6 +863,36 @@ static struct io_rsrc_node *io_sqe_buffer_register(struct io_ring_ctx *ctx,
 		bvec_set_page(&imu->bvec[i], pages[i], vec_len, off);
 		off = 0;
 		size -= vec_len;
+	}
+
+	/* DMA-map each bvec page if a DMA channel is available */
+	if (ctx->dma.chan) {
+		struct device *dev = ctx->dma.chan->device->dev;
+
+		imu->dma_addrs = kvmalloc_array(nr_pages, sizeof(dma_addr_t),
+						GFP_KERNEL);
+		if (!imu->dma_addrs) {
+			ret = -ENOMEM;
+			goto done;
+		}
+		imu->dma_dev = dev;
+		for (i = 0; i < nr_pages; i++) {
+			imu->dma_addrs[i] = dma_map_page(dev,
+					imu->bvec[i].bv_page, 0,
+					1UL << imu->folio_shift,
+					DMA_FROM_DEVICE);
+			if (dma_mapping_error(dev, imu->dma_addrs[i])) {
+				while (i-- > 0)
+					dma_unmap_page(dev, imu->dma_addrs[i],
+						       1UL << imu->folio_shift,
+						       DMA_FROM_DEVICE);
+				kvfree(imu->dma_addrs);
+				imu->dma_addrs = NULL;
+				imu->dma_dev = NULL;
+				ret = -ENOMEM;
+				goto done;
+			}
+		}
 	}
 done:
 	if (ret) {
@@ -1138,6 +1183,31 @@ inline struct io_rsrc_node *io_find_buf_node(struct io_kiocb *req,
 	req->flags &= ~REQ_F_BUF_NODE;
 	io_ring_submit_unlock(ctx, issue_flags);
 	return NULL;
+}
+
+dma_addr_t io_reg_buf_dma_addr(struct io_mapped_ubuf *imu, u64 buf_addr)
+{
+	size_t offset, folio_mask;
+	unsigned int seg_idx;
+	const struct bio_vec *bvec;
+
+	if (!imu || !imu->dma_addrs)
+		return 0;
+	if (buf_addr < imu->ubuf || buf_addr >= imu->ubuf + imu->len)
+		return 0;
+
+	offset = buf_addr - imu->ubuf;
+	bvec = imu->bvec;
+	folio_mask = (1UL << imu->folio_shift) - 1;
+
+	/* Same offset calculation as io_import_fixed() */
+	if (offset < bvec->bv_len)
+		return imu->dma_addrs[0] + bvec->bv_offset + offset;
+
+	offset -= bvec->bv_len;
+	seg_idx = 1 + (offset >> imu->folio_shift);
+	offset &= folio_mask;
+	return imu->dma_addrs[seg_idx] + offset;
 }
 
 int io_import_reg_buf(struct io_kiocb *req, struct iov_iter *iter,

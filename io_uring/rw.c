@@ -948,12 +948,19 @@ static int __io_read(struct io_kiocb *req, struct io_br_sel *sel,
 	if (unlikely(ret))
 		return ret;
 
-	/* Set up support for copy offload */
-	if (force_nonblock) {
+	/* Set up DMA copy offload for socket reads.
+	 * Pass io_kiocb via kiocb->private so sock_read_iter()
+	 * can forward it to msg.msg_io_iocb for tcp_recvmsg().
+	 */
+	if (force_nonblock && req->ctx->dma.chan) {
 		io_uring_dma_prep(req);
+		req->dma.dst_user_addr = rw->addr;
+		kiocb->private = req;
+	} else {
+		kiocb->private = NULL;
 	}
-	
-        ret = io_iter_do_read(rw, &io->iter);
+
+	ret = io_iter_do_read(rw, &io->iter);
 	
         /*
 	 * Some file systems like to return -EOPNOTSUPP for an IOCB_NOWAIT
@@ -965,6 +972,14 @@ static int __io_read(struct io_kiocb *req, struct io_br_sel *sel,
 
 
 	if (ret >= 0) {
+		/* Pre-compute CQE result for DMA completion path.
+		 * Must happen BEFORE io_dma_submit_queued_tasks() because
+		 * DMA can complete synchronously during submit.
+		 */
+		if (req->ctx->dma.chan && req->dma.dma_active) {
+			req->dma.saved_res = ret;
+			req->dma.saved_cflags = 0;
+		}
 		ret2 = io_dma_submit_queued_tasks(req);
 		if (ret2 < 0) {
 			ret = ret2;

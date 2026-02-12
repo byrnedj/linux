@@ -1815,6 +1815,10 @@ static int io_issue_sqe(struct io_kiocb *req, unsigned int issue_flags)
 
 	ret = __io_issue_sqe(req, issue_flags, def);
 
+	if (req->opcode == IORING_OP_RECV)
+		pr_info("io_issue_sqe: RECV ret=%d cqe.res=%d cqe.flags=0x%x\n",
+			ret, req->cqe.res, req->cqe.flags);
+
 	if (ret == IOU_COMPLETE) {
 		if (issue_flags & IO_URING_F_COMPLETE_DEFER)
 			io_req_complete_defer(req);
@@ -2870,8 +2874,6 @@ static void io_release_dma_chan(struct io_ring_ctx *ctx)
 		cancel_work_sync(&ctx->dma.poll_work);
 	}
 
-	if (ctx->dma.sva && !IS_ERR(ctx->dma.sva))
-		iommu_sva_unbind_device(ctx->dma.sva);
 	if (ctx->dma.chan && !IS_ERR(ctx->dma.chan))
 		dma_release_channel(ctx->dma.chan);
 	ctx->dma.chan = NULL;
@@ -2881,57 +2883,23 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 				struct io_uring_params *p)
 {
 	dma_cap_mask_t mask;
-	struct device *dev;
 	int rc = 0;
-	struct dma_chan_attr_params param;
-	int flags = IOMMU_SVA_BIND_KERNEL;
 
 	dma_cap_zero(mask);
 	dma_cap_set(DMA_MEMCPY, mask);
-	dma_cap_set(DMA_KERNEL_USER, mask);
 
 	ctx->dma.chan = dma_request_chan_by_mask(&mask);
 	if (IS_ERR(ctx->dma.chan)) {
 		rc = PTR_ERR(ctx->dma.chan);
-                pr_err("dma_request_chan_by_mask() failed: %d (%pe)\n",
-                       rc, ctx->dma.chan);
+		pr_err("dma_request_chan_by_mask() failed: %d (%pe)\n",
+		       rc, ctx->dma.chan);
 		ctx->dma.chan = NULL;
 		goto failed;
 	}
 
-	dev = ctx->dma.chan->device->dev;
-	dev_info(dev, "io_uring DMA: attempting SVA bind, dev=%s iommu_group=%p\n",
-		 dev_name(dev), dev->iommu_group);
-	ctx->dma.sva = iommu_sva_bind_device(dev, ctx->mm_account, flags);
-	if (IS_ERR(ctx->dma.sva)) {
-		rc = PTR_ERR(ctx->dma.sva);
-                dev_err(dev, "iommu_sva_bind_device() failed: %d (%pe)\n",
-                        rc, ctx->dma.sva);
-		dev_err(dev, "  dev->iommu=%p, dev->iommu_group=%p\n",
-			dev->iommu, dev->iommu_group);
-		goto failed;
-	}
-
-	ctx->dma.pasid = iommu_sva_get_pasid(ctx->dma.sva);
-	if (ctx->dma.pasid == IOMMU_PASID_INVALID) {
-		rc = -EINVAL;
-                dev_err(dev, "iommu_sva_get_pasid() returned IOMMU_PASID_INVALID\n");
-		goto failed;
-	}
-
-	param.p.pasid = ctx->dma.pasid;
-	param.p.priv = true;
-
-	rc = dmaengine_chan_set_attr(ctx->dma.chan, DMA_CHAN_SET_PASID, &param);
-	if (rc) {
-                if (rc == -EOPNOTSUPP) {
-                        dev_warn(dev, "DMA_CHAN_SET_PASID not supported; continuing without PASID\n");
-                } else {
-                        dev_err(dev, "dmaengine_chan_set_attr(DMA_CHAN_SET_PASID) failed: %d (%pe)\n",
-                                rc, ERR_PTR(rc));
-                        goto failed;
-                }		
-	}
+	dev_info(ctx->dma.chan->device->dev,
+		 "io_uring DMA: acquired channel %s (physical DMA mode)\n",
+		 dma_chan_name(ctx->dma.chan));
 
 	ctx->dma.head = NULL;
 	ctx->dma.tail = NULL;

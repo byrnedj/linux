@@ -2939,6 +2939,11 @@ found_ok_skb:
 
 					err = io_uring_copy_to_iter((struct kiocb *)msg->msg_io_iocb, &msg->msg_iter,
 							&src, cb_fn, skb, 0);
+					/* io_uring_copy_to_iter returns positive byte count
+					 * on success, but the error check below expects 0.
+					 */
+					if (err > 0)
+						err = 0;
 
 					pr_debug("tcp_recvmsg: io_uring_copy ret=%d avail_after=%zu\n",
 						 err, iov_iter_count(&msg->msg_iter));

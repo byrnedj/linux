@@ -867,6 +867,12 @@ struct io_uring_buf_ring {
 enum io_uring_register_pbuf_ring_flags {
 	IOU_PBUF_RING_MMAP	= 1,
 	IOU_PBUF_RING_INC	= 2,
+	/* Pre-map a data buffer region for DMA offload. When set, resv[0]
+	 * holds the base user VA and resv[1] holds the size of the
+	 * contiguous data buffer region. Pages are pinned and DMA-mapped
+	 * at registration time for use with dmaengine_prep_dma_memcpy().
+	 */
+	IOU_PBUF_RING_DMA	= 4,
 };
 
 /* argument for IORING_(UN)REGISTER_PBUF_RING */

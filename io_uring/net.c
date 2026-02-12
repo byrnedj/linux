@@ -912,6 +912,9 @@ static inline bool io_recv_finish(struct io_kiocb *req,
 
 	/* Finish the request / stop multishot. */
 finish:
+	pr_info("io_recv_finish: opcode=%d res=%d cflags=0x%x req_flags=0x%llx buf_index=%d\n",
+		req->opcode, sel->val, cflags,
+		(unsigned long long)req->flags, req->buf_index);
 	io_req_set_res(req, sel->val, cflags);
 	sel->val = IOU_COMPLETE;
 	io_req_msg_cleanup(req, issue_flags);
@@ -1202,6 +1205,7 @@ retry_multishot:
 	if (force_nonblock && req->ctx->dma.chan) {
 		kmsg->msg.msg_io_iocb = req;
 		io_uring_dma_prep(req);
+		req->dma.buf_group = sr->buf_group;
 	} else {
 		kmsg->msg.msg_io_iocb = NULL;
 	}
@@ -1211,14 +1215,42 @@ retry_multishot:
 
 	ret = sock_recvmsg(sock, &kmsg->msg, flags);
 	if (ret > 0) {
-		int ret2 = io_dma_submit_queued_tasks(req);
+		int ret2;
+		pr_info("io_recv: sock_recvmsg ret=%d dma_refcnt=%d dma_active=%d req_flags=0x%llx\n",
+			ret, req->ctx->dma.chan ? req->dma.dma_refcnt : -1,
+			req->ctx->dma.chan ? req->dma.dma_active : -1,
+			(unsigned long long)req->flags);
+		/* Pre-compute CQE values for DMA completion path.
+		 * Must happen BEFORE io_dma_submit_queued_tasks() because
+		 * DMA can complete synchronously during submit via __io_dma_poll().
+		 */
+		if (req->ctx->dma.chan && req->dma.dma_active) {
+			unsigned int cflags = 0;
+			if (kmsg->msg.msg_inq > 0)
+				cflags |= IORING_CQE_F_SOCK_NONEMPTY;
+			if (req->flags & (REQ_F_BUFFER_RING | REQ_F_BUFFER_SELECTED))
+				cflags |= IORING_CQE_F_BUFFER |
+					  (req->buf_index << IORING_CQE_BUFFER_SHIFT);
+			req->dma.saved_res = ret + sr->done_io;
+			req->dma.saved_cflags = cflags;
+		}
+		ret2 = io_dma_submit_queued_tasks(req);
 		//mutex_lock(&req->ctx->uring_lock);
 		//__io_dma_poll(req->ctx);
 		//mutex_unlock(&req->ctx->uring_lock);
+		pr_info("io_recv: dma_submit ret2=%d\n", ret2);
 		if (ret2 < 0) {
-			ret = ret2;
-			if (ret == -EIOCBQUEUED)
+			if (ret2 == -EIOCBQUEUED) {
+				pr_info("io_recv: SKIP_COMPLETE (DMA queued)\n");
+				io_put_kbuf(req, req->dma.saved_res, sel.buf_list);
+				/* Don't call io_req_msg_cleanup here:
+				 * the request is still in-flight (DMA pending).
+				 * async_data will be freed by io_clean_op when
+				 * the request completes after DMA finishes.
+				 */
 				return IOU_ISSUE_SKIP_COMPLETE;
+			}
+			ret = ret2;
 		}
 	}
 	if (ret < min_ret) {

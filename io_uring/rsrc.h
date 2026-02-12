@@ -39,6 +39,8 @@ struct io_mapped_ubuf {
 	void		*priv;
 	bool		is_kbuf;
 	u8		dir;
+	dma_addr_t	*dma_addrs;	/* DMA addr per bvec, or NULL */
+	struct device	*dma_dev;	/* device used for DMA mapping */
 	struct bio_vec	bvec[] __counted_by(nr_bvecs);
 };
 
@@ -69,6 +71,8 @@ int io_import_reg_vec(int ddir, struct iov_iter *iter,
 			unsigned nr_iovs, unsigned issue_flags);
 int io_prep_reg_iovec(struct io_kiocb *req, struct iou_vec *iv,
 			const struct iovec __user *uvec, size_t uvec_segs);
+
+dma_addr_t io_reg_buf_dma_addr(struct io_mapped_ubuf *imu, u64 buf_addr);
 
 int io_register_clone_buffers(struct io_ring_ctx *ctx, void __user *arg);
 int io_sqe_buffers_unregister(struct io_ring_ctx *ctx);
