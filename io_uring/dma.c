@@ -360,6 +360,12 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 	if (atomic_read(&req->ctx->dma.poll_armed) == 0)
 		__io_dma_poll(req->ctx);
 
+	/* If DMA tasks are still pending after the synchronous poll,
+	 * schedule the poll work to keep draining completions.
+	 */
+	if (ret == -EIOCBQUEUED && READ_ONCE(req->ctx->dma.head))
+		schedule_work(&req->ctx->dma.poll_work);
+
 	return ret;
 }
 
