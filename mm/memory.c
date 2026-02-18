@@ -64,6 +64,7 @@
 #include <linux/elf.h>
 #include <linux/gfp.h>
 #include <linux/migrate.h>
+#include <linux/migrate_offc.h>
 #include <linux/string.h>
 #include <linux/memory-tiers.h>
 #include <linux/debugfs.h>
@@ -7174,6 +7175,14 @@ void folio_zero_user(struct folio *folio, unsigned long addr_hint)
 {
 	unsigned int nr_pages = folio_nr_pages(folio);
 
+#ifdef CONFIG_HAVE_STATIC_CALL
+	/* Try DMA offload when a migrator is active. On success, return early;
+	 * on failure (-EOPNOTSUPP or DMA error) fall through to the CPU path.
+	 */
+	if (atomic_read(&dispatch_to_offc) && !static_call(_zero_folio)(folio))
+		return;
+#endif
+
 	if (unlikely(nr_pages > MAX_ORDER_NR_PAGES))
 		clear_gigantic_page(folio, addr_hint, nr_pages);
 	else
@@ -7228,6 +7237,15 @@ int copy_user_large_folio(struct folio *dst, struct folio *src,
 		.src = src,
 		.vma = vma,
 	};
+
+#ifdef CONFIG_HAVE_STATIC_CALL
+	/* Try DMA offload when a migrator is active. On success (ret == 0),
+	 * return immediately. On failure fall through to the CPU CoW path which
+	 * retains the addr_hint cache-warmth optimisation.
+	 */
+	if (atomic_read(&dispatch_to_offc) && !static_call(_copy_large_folio)(dst, src))
+		return 0;
+#endif
 
 	if (unlikely(nr_pages > MAX_ORDER_NR_PAGES))
 		return copy_user_gigantic_page(dst, src, addr_hint, vma, nr_pages);

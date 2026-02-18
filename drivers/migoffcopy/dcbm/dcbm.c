@@ -16,6 +16,10 @@
 
 static unsigned long long pages_migrated;
 static unsigned long long pages_failures;
+static unsigned long long folios_cow_copied;
+static unsigned long long folios_cow_failures;
+static unsigned long long folios_zeroed;
+static unsigned long long folios_zero_failures;
 
 static bool offloading_enabled;
 static unsigned int nr_dma_channels = 1;
@@ -302,6 +306,182 @@ fallback:
 	return 0;
 }
 
+/*
+ * folio_dma_completion - DMA completion callback for single-folio operations.
+ */
+static void folio_dma_completion(void *data)
+{
+	complete((struct completion *)data);
+}
+
+/**
+ * folio_copy_dma - DMA-offloaded copy of a single large/gigantic folio pair.
+ * @dst: Destination folio (newly allocated, not yet mapped to userspace)
+ * @src: Source folio (currently mapped; CPU cache must be flushed by DMA map)
+ *
+ * Used on the CoW (copy-on-write) fault path for huge/gigantic pages.
+ * Large folios are always physically contiguous, so a single DMA transfer
+ * covers the entire folio without scatter-gather splitting.
+ *
+ * Returns 0 on success, negative to signal the caller to use CPU copy.
+ */
+static int folio_copy_dma(struct folio *dst, struct folio *src)
+{
+	struct completion done;
+	struct dma_chan *chan;
+	struct device *dev;
+	dma_addr_t src_dma, dst_dma;
+	size_t size = folio_size(src);
+	struct dma_async_tx_descriptor *tx;
+	dma_cookie_t cookie;
+	dma_cap_mask_t mask;
+	int ret = 0;
+
+	dma_cap_zero(mask);
+	dma_cap_set(DMA_MEMCPY, mask);
+	chan = dma_request_chan_by_mask(&mask);
+	if (IS_ERR(chan))
+		return PTR_ERR(chan);
+
+	dev = dmaengine_get_dma_device(chan);
+	if (!dev) {
+		ret = -ENODEV;
+		goto release;
+	}
+
+	/*
+	 * Map without DMA_ATTR_SKIP_CPU_SYNC: the source page is actively used
+	 * by the CPU so we need the cache flush, and the destination needs
+	 * cache invalidation after DMA writes.
+	 */
+	src_dma = dma_map_page(dev, &src->page, 0, size, DMA_TO_DEVICE);
+	if (dma_mapping_error(dev, src_dma)) {
+		ret = -ENOMEM;
+		goto release;
+	}
+	dst_dma = dma_map_page(dev, &dst->page, 0, size, DMA_FROM_DEVICE);
+	if (dma_mapping_error(dev, dst_dma)) {
+		ret = -ENOMEM;
+		goto unmap_src;
+	}
+
+	init_completion(&done);
+
+	tx = dmaengine_prep_dma_memcpy(chan, dst_dma, src_dma, size,
+				       DMA_CTRL_ACK | DMA_PREP_INTERRUPT);
+	if (!tx) {
+		ret = -EIO;
+		goto unmap_dst;
+	}
+	tx->callback = folio_dma_completion;
+	tx->callback_param = &done;
+
+	cookie = dmaengine_submit(tx);
+	if (dma_submit_error(cookie)) {
+		ret = -EIO;
+		goto unmap_dst;
+	}
+
+	dma_async_issue_pending(chan);
+
+	if (!wait_for_completion_timeout(&done, msecs_to_jiffies(10000))) {
+		dmaengine_terminate_sync(chan);
+		ret = -ETIMEDOUT;
+	}
+
+unmap_dst:
+	dma_unmap_page(dev, dst_dma, size, DMA_FROM_DEVICE);
+unmap_src:
+	dma_unmap_page(dev, src_dma, size, DMA_TO_DEVICE);
+release:
+	dma_release_channel(chan);
+	mutex_lock(&dcbm_mutex);
+	if (ret)
+		folios_cow_failures++;
+	else
+		folios_cow_copied++;
+	mutex_unlock(&dcbm_mutex);
+	return ret;
+}
+
+/**
+ * folio_zero_dma - DMA-offloaded zero of a single large/gigantic folio.
+ * @folio: Folio to zero (newly allocated, about to be mapped to userspace)
+ *
+ * Used on the huge-page anonymous fault path to zero a freshly allocated
+ * large folio before mapping it.  Requires a DMA engine with DMA_MEMSET
+ * capability (e.g. Intel DSA/IDXD).
+ *
+ * Returns 0 on success, negative to signal the caller to use CPU zero.
+ */
+static int folio_zero_dma(struct folio *folio)
+{
+	struct completion done;
+	struct dma_chan *chan;
+	struct device *dev;
+	dma_addr_t dst_dma;
+	size_t size = folio_size(folio);
+	struct dma_async_tx_descriptor *tx;
+	dma_cookie_t cookie;
+	dma_cap_mask_t mask;
+	int ret = 0;
+
+	dma_cap_zero(mask);
+	dma_cap_set(DMA_MEMSET, mask);
+	chan = dma_request_chan_by_mask(&mask);
+	if (IS_ERR(chan))
+		return PTR_ERR(chan);
+
+	dev = dmaengine_get_dma_device(chan);
+	if (!dev) {
+		ret = -ENODEV;
+		goto release;
+	}
+
+	dst_dma = dma_map_page(dev, &folio->page, 0, size, DMA_FROM_DEVICE);
+	if (dma_mapping_error(dev, dst_dma)) {
+		ret = -ENOMEM;
+		goto release;
+	}
+
+	init_completion(&done);
+
+	/* value=0: DMA engine writes 0x00 across the entire folio */
+	tx = dmaengine_prep_dma_memset(chan, dst_dma, 0, size,
+				       DMA_CTRL_ACK | DMA_PREP_INTERRUPT);
+	if (!tx) {
+		ret = -EIO;
+		goto unmap;
+	}
+	tx->callback = folio_dma_completion;
+	tx->callback_param = &done;
+
+	cookie = dmaengine_submit(tx);
+	if (dma_submit_error(cookie)) {
+		ret = -EIO;
+		goto unmap;
+	}
+
+	dma_async_issue_pending(chan);
+
+	if (!wait_for_completion_timeout(&done, msecs_to_jiffies(10000))) {
+		dmaengine_terminate_sync(chan);
+		ret = -ETIMEDOUT;
+	}
+
+unmap:
+	dma_unmap_page(dev, dst_dma, size, DMA_FROM_DEVICE);
+release:
+	dma_release_channel(chan);
+	mutex_lock(&dcbm_mutex);
+	if (ret)
+		folios_zero_failures++;
+	else
+		folios_zeroed++;
+	mutex_unlock(&dcbm_mutex);
+	return ret;
+}
+
 /**
  * dma_should_handle - Determine if DMA backend should handle this batch
  * @src_list: Source folio list
@@ -331,6 +511,8 @@ static struct migrator dma_migrator = {
 	.name = "DCBM",
 	.should_handle = dma_should_handle,
 	.migrate_offload_copy = folios_copy_dma,
+	.copy_large_folio = folio_copy_dma,
+	.zero_folio = folio_zero_dma,
 	.owner = THIS_MODULE,
 };
 
@@ -437,16 +619,88 @@ static ssize_t nr_dma_chan_store(struct kobject *kobj,
 	return count;
 }
 
+static ssize_t folios_cow_copied_show(struct kobject *kobj,
+				      struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%llu\n", folios_cow_copied);
+}
+
+static ssize_t folios_cow_copied_store(struct kobject *kobj,
+				       struct kobj_attribute *attr,
+				       const char *buf, size_t count)
+{
+	mutex_lock(&dcbm_mutex);
+	folios_cow_copied = 0;
+	mutex_unlock(&dcbm_mutex);
+	return count;
+}
+
+static ssize_t folios_cow_failures_show(struct kobject *kobj,
+					struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%llu\n", folios_cow_failures);
+}
+
+static ssize_t folios_cow_failures_store(struct kobject *kobj,
+					 struct kobj_attribute *attr,
+					 const char *buf, size_t count)
+{
+	mutex_lock(&dcbm_mutex);
+	folios_cow_failures = 0;
+	mutex_unlock(&dcbm_mutex);
+	return count;
+}
+
+static ssize_t folios_zeroed_show(struct kobject *kobj,
+				  struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%llu\n", folios_zeroed);
+}
+
+static ssize_t folios_zeroed_store(struct kobject *kobj,
+				   struct kobj_attribute *attr,
+				   const char *buf, size_t count)
+{
+	mutex_lock(&dcbm_mutex);
+	folios_zeroed = 0;
+	mutex_unlock(&dcbm_mutex);
+	return count;
+}
+
+static ssize_t folios_zero_failures_show(struct kobject *kobj,
+					 struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%llu\n", folios_zero_failures);
+}
+
+static ssize_t folios_zero_failures_store(struct kobject *kobj,
+					  struct kobj_attribute *attr,
+					  const char *buf, size_t count)
+{
+	mutex_lock(&dcbm_mutex);
+	folios_zero_failures = 0;
+	mutex_unlock(&dcbm_mutex);
+	return count;
+}
+
 static struct kobj_attribute offloading_attr = __ATTR_RW(offloading);
 static struct kobj_attribute nr_dma_chan_attr = __ATTR_RW(nr_dma_chan);
 static struct kobj_attribute pages_migrated_attr = __ATTR_RW(pages_migrated);
 static struct kobj_attribute pages_failures_attr = __ATTR_RW(pages_failures);
+static struct kobj_attribute folios_cow_copied_attr = __ATTR_RW(folios_cow_copied);
+static struct kobj_attribute folios_cow_failures_attr = __ATTR_RW(folios_cow_failures);
+static struct kobj_attribute folios_zeroed_attr = __ATTR_RW(folios_zeroed);
+static struct kobj_attribute folios_zero_failures_attr = __ATTR_RW(folios_zero_failures);
 
 static struct attribute *dcbm_attrs[] = {
 	&offloading_attr.attr,
 	&nr_dma_chan_attr.attr,
 	&pages_migrated_attr.attr,
 	&pages_failures_attr.attr,
+	&folios_cow_copied_attr.attr,
+	&folios_cow_failures_attr.attr,
+	&folios_zeroed_attr.attr,
+	&folios_zero_failures_attr.attr,
 	NULL
 };
 ATTRIBUTE_GROUPS(dcbm);

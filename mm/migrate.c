@@ -850,6 +850,22 @@ static bool migrate_should_handle_offload_default(struct list_head *src_list,
 }
 DEFINE_STATIC_CALL(_should_handle, migrate_should_handle_offload_default);
 
+/*
+ * Default "not supported" stubs for the single-folio offload callbacks.
+ * Returning a negative value tells the caller to fall back to the CPU path.
+ */
+int copy_large_folio_notsupp(struct folio *dst, struct folio *src)
+{
+	return -EOPNOTSUPP;
+}
+DEFINE_STATIC_CALL(_copy_large_folio, copy_large_folio_notsupp);
+
+int zero_folio_notsupp(struct folio *folio)
+{
+	return -EOPNOTSUPP;
+}
+DEFINE_STATIC_CALL(_zero_folio, zero_folio_notsupp);
+
 #ifdef CONFIG_OFFC_MIGRATION
 void srcu_mig_cb(struct rcu_head *head)
 {
@@ -876,6 +892,10 @@ int offc_update_migrator(struct migrator *mig)
 	static_call_update(_folios_copy, mig ? mig->migrate_offload_copy : folios_mc_copy);
 	static_call_update(_should_handle,
 		mig && mig->should_handle ? mig->should_handle : migrate_should_handle_offload_default);
+	static_call_update(_copy_large_folio,
+		mig && mig->copy_large_folio ? mig->copy_large_folio : copy_large_folio_notsupp);
+	static_call_update(_zero_folio,
+		mig && mig->zero_folio ? mig->zero_folio : zero_folio_notsupp);
 	xchg(&migrator.owner, mig ? mig->owner : NULL);
 	if (old_owner)
 		module_put(old_owner);
