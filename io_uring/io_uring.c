@@ -145,6 +145,7 @@ static struct workqueue_struct *iou_wq __ro_after_init;
 
 static int __read_mostly sysctl_io_uring_disabled;
 static int __read_mostly sysctl_io_uring_group = -1;
+extern unsigned int io_dma_cpu_threshold;
 
 #ifdef CONFIG_SYSCTL
 static const struct ctl_table kernel_io_uring_disabled_table[] = {
@@ -163,6 +164,13 @@ static const struct ctl_table kernel_io_uring_disabled_table[] = {
 		.maxlen		= sizeof(gid_t),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec,
+	},
+	{
+		.procname	= "io_uring_dma_cpu_threshold",
+		.data		= &io_dma_cpu_threshold,
+		.maxlen		= sizeof(io_dma_cpu_threshold),
+		.mode		= 0644,
+		.proc_handler	= proc_douintvec,
 	},
 };
 #endif
@@ -1816,7 +1824,7 @@ static int io_issue_sqe(struct io_kiocb *req, unsigned int issue_flags)
 	ret = __io_issue_sqe(req, issue_flags, def);
 
 	if (req->opcode == IORING_OP_RECV)
-		pr_info("io_issue_sqe: RECV ret=%d cqe.res=%d cqe.flags=0x%x\n",
+		pr_debug("io_issue_sqe: RECV ret=%d cqe.res=%d cqe.flags=0x%x\n",
 			ret, req->cqe.res, req->cqe.flags);
 
 	if (ret == IOU_COMPLETE) {

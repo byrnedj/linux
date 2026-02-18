@@ -49,8 +49,9 @@ static int __io_dma_task_submit(struct dma_chan *chan, struct io_dma_task *dma)
 		return -EFAULT;
 	}
 
-	pr_debug("dma task submitted: cookie=%d len=%u\n",
-		 dma->cookie, dma->len);
+	pr_debug("dma task submitted: cookie=%d len=%u src=0x%llx dst=0x%llx\n",
+		 dma->cookie, dma->len,
+		 (u64)dma->src_dma, (u64)dma->dst_dma);
 	return 0;
 }
 
@@ -81,8 +82,9 @@ void io_uring_dma_prep(struct io_kiocb *req)
 /*
  * Threshold below which we fall back to CPU copy instead of DMA offload.
  * Set to 0 to always use DMA; tune based on DSA descriptor overhead.
+ * Configurable via /proc/sys/kernel/io_uring_dma_cpu_threshold.
  */
-#define IO_DMA_CPU_THRESHOLD 8192
+unsigned int io_dma_cpu_threshold __read_mostly = 16384;
 
 /*
  * CPU copy helper: copies from kvec source to user destination.
@@ -126,7 +128,8 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	struct io_dma_task *dma;
 	struct io_buffer_list *bl;
 	struct device *dev;
-	size_t len, cpu_bytes, dma_bytes;
+	size_t len, cpu_bytes, dma_bytes, first_seg_len;
+	unsigned int threshold;
 	ssize_t cpu_copied;
 	void *src_kaddr;
 	dma_addr_t src_dma, dst_dma;
@@ -138,43 +141,47 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	ctx = req->ctx;
 
 	len = min(iov_iter_count(src_iter), iov_iter_count(dst_iter));
+	threshold = READ_ONCE(io_dma_cpu_threshold);
 
 	/* Full CPU copy for small transfers or non-kvec sources */
-	if (!len || len < IO_DMA_CPU_THRESHOLD || !iov_iter_is_kvec(src_iter))
+	if (!len || len < threshold * 2 || !iov_iter_is_kvec(src_iter))
 		return io_dma_cpu_copy(dst_iter, src_iter, len);
 
 	dev = ctx->dma.chan->device->dev;
 
-	/*
-	 * Split copy: CPU handles the first portion synchronously,
-	 * DMA handles the remainder asynchronously.
-	 */
-	cpu_bytes = min_t(size_t, len, IO_DMA_CPU_THRESHOLD);
-	if (cpu_bytes > 0) {
-		cpu_copied = io_dma_cpu_copy(dst_iter, src_iter, cpu_bytes);
-		if (cpu_copied <= 0)
-			return cpu_copied;
-		cpu_bytes = cpu_copied;
-	}
-
+	cpu_bytes = min_t(size_t, len, threshold);
 	dma_bytes = len - cpu_bytes;
 	if (dma_bytes == 0)
-		return cpu_bytes;
+		return io_dma_cpu_copy(dst_iter, src_iter, len);
 
-	/* Get source kernel address for DMA portion */
-	if (!iov_iter_count(src_iter))
-		return cpu_bytes;
-	src_kaddr = (void *)iter_iov_addr(src_iter);
+	/*
+	 * The first source kvec segment must be large enough to cover
+	 * both the CPU and DMA portions so we can compute the DMA
+	 * source address as a simple offset from the segment start.
+	 */
+	first_seg_len = iter_iov_len(src_iter);
+	if (first_seg_len <= cpu_bytes) {
+		pr_debug("dma fallback: first_seg_len=%zu <= cpu_bytes=%zu len=%zu\n",
+			 first_seg_len, cpu_bytes, len);
+		return io_dma_cpu_copy(dst_iter, src_iter, len);
+	}
 
-	/* Determine DMA destination address based on iter type.
-	 * After cpu_copy, dst_iter has advanced past cpu_bytes.
+	/* Clamp DMA to what's available after the CPU portion in this segment */
+	dma_bytes = min_t(size_t, dma_bytes, first_seg_len - cpu_bytes);
+
+	/* DMA source: offset cpu_bytes into the current segment */
+	src_kaddr = (void *)iter_iov_addr(src_iter) + cpu_bytes;
+
+	/*
+	 * DMA destination: offset by cpu_bytes since the iterators
+	 * haven't been advanced yet.
 	 */
 	if (iov_iter_is_bvec(dst_iter)) {
 		/* Registered buffer path */
 		struct io_mapped_ubuf *imu;
 
 		if (!(req->flags & REQ_F_BUF_NODE) || !req->buf_node)
-			goto cpu_fallback_rest;
+			goto cpu_fallback;
 		imu = req->buf_node->buf;
 		dst_dma = io_reg_buf_dma_addr(imu,
 				req->dma.dst_user_addr + cpu_bytes);
@@ -182,36 +189,39 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 		/* Provided buffer path */
 		bl = xa_load(&ctx->io_bl_xa, req->dma.buf_group);
 		if (!bl || !bl->dma_addrs)
-			goto cpu_fallback_rest;
+			goto cpu_fallback;
 
 		if (iter_is_ubuf(dst_iter))
-			dst_user_addr = (u64)dst_iter->ubuf + dst_iter->iov_offset;
+			dst_user_addr = (u64)dst_iter->ubuf +
+					dst_iter->iov_offset + cpu_bytes;
 		else if (iter_is_iovec(dst_iter))
-			dst_user_addr = (u64)iter_iov_addr(dst_iter);
+			dst_user_addr = (u64)iter_iov_addr(dst_iter) +
+					cpu_bytes;
 		else
-			goto cpu_fallback_rest;
+			goto cpu_fallback;
 
 		dst_dma = io_kbuf_dma_addr(bl, dst_user_addr);
 	}
 	if (!dst_dma)
-		goto cpu_fallback_rest;
+		goto cpu_fallback;
 
-	/* Clamp dma_bytes to what's available in this source segment */
-	dma_bytes = min_t(size_t, dma_bytes, iter_iov_len(src_iter));
+	pr_debug("dma dest: opcode=%d iter=%s dst_dma=0x%llx\n",
+		 req->opcode,
+		 iov_iter_is_bvec(dst_iter)  ? "bvec/reg" :
+		 iter_is_ubuf(dst_iter)      ? "ubuf/provided" :
+					       "iovec/provided",
+		 (u64)dst_dma);
 
 	/* Map source kernel memory for DMA */
 	src_dma = dma_map_single(dev, src_kaddr, dma_bytes, DMA_TO_DEVICE);
-	if (dma_mapping_error(dev, src_dma)) {
-		pr_debug("dma_map_single failed for src %p len %zu\n",
-			 src_kaddr, dma_bytes);
-		goto cpu_fallback_rest;
-	}
+	if (dma_mapping_error(dev, src_dma))
+		goto cpu_fallback;
 
 	/* Allocate and populate DMA task */
 	dma = kmem_cache_zalloc(dma_cachep, GFP_KERNEL);
 	if (!dma) {
 		dma_unmap_single(dev, src_dma, dma_bytes, DMA_TO_DEVICE);
-		goto cpu_fallback_rest;
+		goto cpu_fallback;
 	}
 
 	dma->req = req;
@@ -230,12 +240,12 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	} else if (rc != 0) {
 		dma_unmap_single(dev, src_dma, dma_bytes, DMA_TO_DEVICE);
 		kmem_cache_free(dma_cachep, dma);
-		goto cpu_fallback_rest;
+		goto cpu_fallback;
 	}
 
 	/*
-	 * Issue DMA immediately so hardware starts reading source data
-	 * before the skb is freed after sock_recvmsg returns.
+	 * Kick the hardware BEFORE the CPU copy so the DMA engine
+	 * works on the tail while the CPU handles the head.
 	 */
 	dma_async_issue_pending(ctx->dma.chan);
 
@@ -250,17 +260,23 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 		req->dma.dma_tasks_tail = dma;
 	}
 
+	/*
+	 * CPU copy of the head portion, overlapping with DMA in-flight.
+	 * Iterators still point at the beginning of the data.
+	 */
+	cpu_copied = io_dma_cpu_copy(dst_iter, src_iter, cpu_bytes);
+	if (cpu_copied <= 0)
+		cpu_copied = 0;
+
 	/* Advance iterators past the DMA portion */
 	iov_iter_advance(src_iter, dma_bytes);
 	iov_iter_advance(dst_iter, dma_bytes);
 
-	return cpu_bytes + dma_bytes;
+	return cpu_copied + dma_bytes;
 
-cpu_fallback_rest:
-	{
-		ssize_t more = io_dma_cpu_copy(dst_iter, src_iter, dma_bytes);
-		return cpu_bytes + (more > 0 ? more : 0);
-	}
+cpu_fallback:
+	/* Nothing has been modified yet — iterators are pristine */
+	return io_dma_cpu_copy(dst_iter, src_iter, len);
 }
 EXPORT_SYMBOL_GPL(io_uring_copy_to_iter);
 
@@ -303,17 +319,32 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
 	if (req->dma.dma_refcnt == 0) {
 		pr_debug("dma req done: opcode=%d result=%d\n",
 			 req->opcode, req->dma.dma_result);
-		io_req_set_res(req, req->dma.saved_res,
-			       req->dma.saved_cflags);
-		io_req_complete_defer(req);
+		if (req->dma.dma_result < 0) {
+			req_set_fail(req);
+			io_req_set_res(req, req->dma.dma_result,
+				       req->dma.saved_cflags);
+		} else {
+			io_req_set_res(req, req->dma.saved_res,
+				       req->dma.saved_cflags);
+		}
+		/*
+		 * Complete via task_work rather than io_req_complete_defer(),
+		 * because __io_dma_poll() runs from a work queue without
+		 * ctx->uring_lock held.  io_req_task_complete() will call
+		 * io_req_complete_defer() once the lock is acquired in the
+		 * task_work run loop.
+		 */
+		req->io_task_work.func = io_req_task_complete;
+		io_req_task_work_add(req);
 	}
 }
 
 int io_dma_submit_queued_tasks(struct io_kiocb *req)
 {
+	struct io_ring_ctx *ctx = req->ctx;
 	int ret = 0;
 
-	if (!req->ctx->dma.chan)
+	if (!ctx->dma.chan)
 		return 0;
 
 	if (req->dma.dma_active) {
@@ -323,31 +354,31 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 			struct io_dma_task *next;
 			unsigned long flags;
 
-			spin_lock_irqsave(&req->ctx->dma.lock, flags);
+			spin_lock_irqsave(&ctx->dma.lock, flags);
 			while (t) {
 				next = t->next;
 
-				if (t->cookie == 0 && req->ctx->dma.head == NULL) {
-					spin_unlock_irqrestore(&req->ctx->dma.lock, flags);
+				if (t->cookie == 0 && ctx->dma.head == NULL) {
+					spin_unlock_irqrestore(&ctx->dma.lock, flags);
 					pr_err("dma_prep failed unexpectedly\n");
 					__io_dma_task_complete(
-						req->ctx->dma.chan->device->dev,
+						ctx->dma.chan->device->dev,
 						t, DMA_ERROR);
-					spin_lock_irqsave(&req->ctx->dma.lock, flags);
+					spin_lock_irqsave(&ctx->dma.lock, flags);
 					t = next;
 					continue;
 				}
 
 				t->next = NULL;
-				if (req->ctx->dma.tail == NULL)
-					req->ctx->dma.head = t;
+				if (ctx->dma.tail == NULL)
+					ctx->dma.head = t;
 				else
-					req->ctx->dma.tail->next = t;
-				req->ctx->dma.tail = t;
+					ctx->dma.tail->next = t;
+				ctx->dma.tail = t;
 
 				t = next;
 			}
-			spin_unlock_irqrestore(&req->ctx->dma.lock, flags);
+			spin_unlock_irqrestore(&ctx->dma.lock, flags);
 
 			req->dma.dma_tasks = NULL;
 			req->dma.dma_tasks_tail = NULL;
@@ -357,14 +388,18 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 		req->dma.dma_active = false;
 	}
 
-	if (atomic_read(&req->ctx->dma.poll_armed) == 0)
-		__io_dma_poll(req->ctx);
+	/*
+	 * Use ctx (not req) below — __io_dma_poll may complete the
+	 * request and free it, so req must not be dereferenced after.
+	 */
+	if (atomic_read(&ctx->dma.poll_armed) == 0)
+		__io_dma_poll(ctx);
 
 	/* If DMA tasks are still pending after the synchronous poll,
 	 * schedule the poll work to keep draining completions.
 	 */
-	if (ret == -EIOCBQUEUED && READ_ONCE(req->ctx->dma.head))
-		schedule_work(&req->ctx->dma.poll_work);
+	if (ret == -EIOCBQUEUED && READ_ONCE(ctx->dma.head))
+		schedule_work(&ctx->dma.poll_work);
 
 	return ret;
 }
@@ -450,8 +485,6 @@ int __io_dma_poll(struct io_ring_ctx *ctx)
 
 	pr_debug("poll: completed=%d remaining=%s\n",
 		 count, ctx->dma.head ? "yes" : "no");
-
-	io_submit_flush_completions(ctx);
 
 out_disarm:
 	atomic_set(&ctx->dma.poll_armed, 0);

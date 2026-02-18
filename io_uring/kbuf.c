@@ -603,15 +603,21 @@ int io_manage_buffers_legacy(struct io_kiocb *req, unsigned int issue_flags)
 
 static void io_pbuf_dma_unmap(struct io_buffer_list *bl)
 {
-	int i;
+	unsigned int folio_order;
+	size_t folio_size;
+	int nr_folios, i;
 
 	if (!bl->dma_addrs)
 		return;
 
-	for (i = 0; i < bl->dma_nr_pages; i++) {
+	folio_order = bl->dma_folio_shift - PAGE_SHIFT;
+	folio_size = 1UL << bl->dma_folio_shift;
+	nr_folios = bl->dma_nr_pages >> folio_order;
+
+	for (i = 0; i < nr_folios; i++) {
 		if (!dma_mapping_error(bl->dma_dev, bl->dma_addrs[i]))
 			dma_unmap_page(bl->dma_dev, bl->dma_addrs[i],
-				       PAGE_SIZE, DMA_FROM_DEVICE);
+				       folio_size, DMA_FROM_DEVICE);
 	}
 	kvfree(bl->dma_addrs);
 	bl->dma_addrs = NULL;
@@ -623,6 +629,7 @@ static void io_pbuf_dma_unmap(struct io_buffer_list *bl)
 	}
 
 	bl->dma_nr_pages = 0;
+	bl->dma_folio_shift = 0;
 	bl->dma_dev = NULL;
 	bl->dma_data_base = 0;
 }
@@ -630,17 +637,17 @@ static void io_pbuf_dma_unmap(struct io_buffer_list *bl)
 static int io_pbuf_dma_map(struct io_buffer_list *bl, struct device *dev,
 			   u64 data_addr, u64 data_size)
 {
-	unsigned long start, end;
-	int nr_pages, i, ret;
+	unsigned int folio_shift, pages_per_folio, nr_folios;
+	unsigned long nr_pages;
+	size_t folio_size;
+	int i, ret;
 
 	if (data_addr & ~PAGE_MASK)
 		return -EINVAL;
 	if (!data_size || (data_size & ~PAGE_MASK))
 		return -EINVAL;
 
-	start = data_addr >> PAGE_SHIFT;
-	end = (data_addr + data_size) >> PAGE_SHIFT;
-	nr_pages = end - start;
+	nr_pages = data_size >> PAGE_SHIFT;
 
 	bl->dma_pages = kvmalloc_array(nr_pages, sizeof(struct page *),
 				       GFP_KERNEL);
@@ -658,7 +665,22 @@ static int io_pbuf_dma_map(struct io_buffer_list *bl, struct device *dev,
 		return ret < 0 ? ret : -EFAULT;
 	}
 
-	bl->dma_addrs = kvmalloc_array(nr_pages, sizeof(dma_addr_t),
+	/* Detect folio size from the first pinned page. */
+	folio_shift = compound_order(compound_head(bl->dma_pages[0])) + PAGE_SHIFT;
+	folio_size = 1UL << folio_shift;
+	pages_per_folio = folio_size >> PAGE_SHIFT;
+
+	/* Region must be aligned to and a multiple of the folio size. */
+	if ((data_addr | data_size) & (folio_size - 1)) {
+		unpin_user_pages(bl->dma_pages, nr_pages);
+		kvfree(bl->dma_pages);
+		bl->dma_pages = NULL;
+		return -EINVAL;
+	}
+
+	nr_folios = nr_pages >> (folio_shift - PAGE_SHIFT);
+
+	bl->dma_addrs = kvmalloc_array(nr_folios, sizeof(dma_addr_t),
 				       GFP_KERNEL);
 	if (!bl->dma_addrs) {
 		unpin_user_pages(bl->dma_pages, nr_pages);
@@ -670,12 +692,15 @@ static int io_pbuf_dma_map(struct io_buffer_list *bl, struct device *dev,
 	bl->dma_dev = dev;
 	bl->dma_data_base = data_addr;
 	bl->dma_nr_pages = nr_pages;
+	bl->dma_folio_shift = folio_shift;
 
-	for (i = 0; i < nr_pages; i++) {
-		bl->dma_addrs[i] = dma_map_page(dev, bl->dma_pages[i],
-						 0, PAGE_SIZE, DMA_FROM_DEVICE);
+	for (i = 0; i < nr_folios; i++) {
+		struct page *head = compound_head(bl->dma_pages[i * pages_per_folio]);
+
+		bl->dma_addrs[i] = dma_map_page(dev, head, 0, folio_size,
+						 DMA_FROM_DEVICE);
 		if (dma_mapping_error(dev, bl->dma_addrs[i])) {
-			bl->dma_nr_pages = i;
+			bl->dma_nr_pages = i * pages_per_folio;
 			io_pbuf_dma_unmap(bl);
 			return -ENOMEM;
 		}
@@ -693,9 +718,8 @@ static int io_pbuf_dma_map(struct io_buffer_list *bl, struct device *dev,
  */
 dma_addr_t io_kbuf_dma_addr(struct io_buffer_list *bl, u64 user_addr)
 {
-	unsigned long offset;
-	unsigned long page_idx;
-	unsigned long page_off;
+	unsigned long offset, folio_idx, folio_off;
+	unsigned int folio_order;
 
 	if (!bl || !bl->dma_addrs)
 		return 0;
@@ -704,13 +728,14 @@ dma_addr_t io_kbuf_dma_addr(struct io_buffer_list *bl, u64 user_addr)
 		return 0;
 
 	offset = user_addr - bl->dma_data_base;
-	page_idx = offset >> PAGE_SHIFT;
-	page_off = offset & ~PAGE_MASK;
+	folio_order = bl->dma_folio_shift - PAGE_SHIFT;
+	folio_idx = offset >> bl->dma_folio_shift;
+	folio_off = offset & ((1UL << bl->dma_folio_shift) - 1);
 
-	if (page_idx >= bl->dma_nr_pages)
+	if (folio_idx >= (bl->dma_nr_pages >> folio_order))
 		return 0;
 
-	return bl->dma_addrs[page_idx] + page_off;
+	return bl->dma_addrs[folio_idx] + folio_off;
 }
 
 int io_register_pbuf_ring(struct io_ring_ctx *ctx, void __user *arg)

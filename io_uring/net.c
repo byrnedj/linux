@@ -912,7 +912,7 @@ static inline bool io_recv_finish(struct io_kiocb *req,
 
 	/* Finish the request / stop multishot. */
 finish:
-	pr_info("io_recv_finish: opcode=%d res=%d cflags=0x%x req_flags=0x%llx buf_index=%d\n",
+	pr_debug("io_recv_finish: opcode=%d res=%d cflags=0x%x req_flags=0x%llx buf_index=%d\n",
 		req->opcode, sel->val, cflags,
 		(unsigned long long)req->flags, req->buf_index);
 	io_req_set_res(req, sel->val, cflags);
@@ -1216,7 +1216,7 @@ retry_multishot:
 	ret = sock_recvmsg(sock, &kmsg->msg, flags);
 	if (ret > 0) {
 		int ret2;
-		pr_info("io_recv: sock_recvmsg ret=%d dma_refcnt=%d dma_active=%d req_flags=0x%llx\n",
+		pr_debug("io_recv: sock_recvmsg ret=%d dma_refcnt=%d dma_active=%d req_flags=0x%llx\n",
 			ret, req->ctx->dma.chan ? req->dma.dma_refcnt : -1,
 			req->ctx->dma.chan ? req->dma.dma_active : -1,
 			(unsigned long long)req->flags);
@@ -1238,10 +1238,10 @@ retry_multishot:
 		//mutex_lock(&req->ctx->uring_lock);
 		//__io_dma_poll(req->ctx);
 		//mutex_unlock(&req->ctx->uring_lock);
-		pr_info("io_recv: dma_submit ret2=%d\n", ret2);
+		pr_debug("io_recv: dma_submit ret2=%d\n", ret2);
 		if (ret2 < 0) {
 			if (ret2 == -EIOCBQUEUED) {
-				pr_info("io_recv: SKIP_COMPLETE (DMA queued)\n");
+				pr_debug("io_recv: SKIP_COMPLETE (DMA queued)\n");
 				io_put_kbuf(req, req->dma.saved_res, sel.buf_list);
 				/* Don't call io_req_msg_cleanup here:
 				 * the request is still in-flight (DMA pending).

@@ -37,11 +37,12 @@ struct io_buffer_list {
 	struct io_mapped_region region;
 
 	/* DMA pre-mapped data buffer region (when IOU_PBUF_RING_DMA is set) */
-	dma_addr_t		*dma_addrs;	/* DMA addr per page */
-	struct page		**dma_pages;	/* pinned data buffer pages */
+	dma_addr_t		*dma_addrs;	/* DMA addr per folio */
+	struct page		**dma_pages;	/* pinned pages (4KB units, for unpin) */
 	struct device		*dma_dev;	/* device used for mapping */
 	unsigned long		dma_data_base;	/* user VA base of data region */
-	int			dma_nr_pages;	/* number of mapped pages */
+	int			dma_nr_pages;	/* pinned page count (4KB units) */
+	unsigned int		dma_folio_shift;/* log2 of DMA mapping granularity */
 };
 
 struct io_buffer {

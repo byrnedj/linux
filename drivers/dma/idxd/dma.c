@@ -533,6 +533,7 @@ static enum dma_status idxd_dma_tx_status(struct dma_chan *dma_chan,
 {
 	u8 status;
 	struct idxd_wq *wq;
+	struct idxd_dma_chan *ichan;
 	struct idxd_desc *desc;
 	u32 idx;
 
@@ -542,6 +543,7 @@ static enum dma_status idxd_dma_tx_status(struct dma_chan *dma_chan,
 		return DMA_ERROR;
 
 	wq = to_idxd_wq(dma_chan);
+	ichan = container_of(dma_chan, struct idxd_dma_chan, chan);
 
 	idx = cookie & DESC_ID_MASK;
 	if (idx >= wq->num_descs)
@@ -571,6 +573,10 @@ static enum dma_status idxd_dma_tx_status(struct dma_chan *dma_chan,
 	status = desc->completion->status & DSA_COMP_STATUS_MASK;
 
 	if (status) {
+		/* Capture completion record fields before desc is freed below. */
+		u8 fault_info = desc->completion->fault_info;
+		u64 fault_addr = desc->completion->fault_addr;
+
 		/*
 		 * Check against the original status as ABORT is software defined
 		 * and 0xff, which DSA_COMP_STATUS_MASK can mask out.
@@ -580,7 +586,12 @@ static enum dma_status idxd_dma_tx_status(struct dma_chan *dma_chan,
 		else
 			idxd_dma_complete_txd(desc, IDXD_COMPLETE_NORMAL, true, NULL, NULL);
 
-		//pr_info("dsa completion status %x\n", status);
+		pr_debug("dsa completion: status=0x%02x fault_info=0x%02x fault_addr=0x%llx "
+			 "pasid_valid=%d pasid=%d priv=%d wq_pasid_en=%d\n",
+			 status, fault_info, fault_addr,
+			 ichan->pasid_valid, ichan->pasid, (int)ichan->priv,
+			 (int)wq_pasid_enabled(wq));
+
 		if (status == DSA_COMP_SUCCESS)
 			return DMA_COMPLETE;
 		else
