@@ -77,6 +77,8 @@ void io_uring_dma_prep(struct io_kiocb *req)
 	req->dma.dst_user_addr = 0;
 	req->dma.saved_res = 0;
 	req->dma.saved_cflags = 0;
+	req->dma.cb_fn = NULL;
+	req->dma.cb_arg = NULL;
 }
 
 /*
@@ -117,137 +119,85 @@ static ssize_t io_dma_cpu_copy(struct iov_iter *dst_iter,
 	return copied_total;
 }
 
-ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
-			struct iov_iter *src_iter,
-			void (*cb_fn)(struct kiocb *, void *, int), void *cb_arg,
-			unsigned long flags)
+/*
+ * Resolve destination DMA address for a given offset from the base.
+ * Returns the DMA address, or 0 on failure.
+ * Sets *folio_remain to bytes remaining in the folio from that address.
+ */
+static dma_addr_t io_dma_dst_addr(struct io_kiocb *req,
+				  struct iov_iter *dst_iter,
+				  u64 dst_base_addr, size_t offset,
+				  size_t *folio_remain)
 {
-	struct io_dma *cmd;
-	struct io_kiocb *req;
-	struct io_ring_ctx *ctx;
-	struct io_dma_task *dma;
-	struct io_buffer_list *bl;
-	struct device *dev;
-	size_t len, cpu_bytes, dma_bytes, first_seg_len;
-	unsigned int threshold;
-	ssize_t cpu_copied;
-	void *src_kaddr;
-	dma_addr_t src_dma, dst_dma;
-	u64 dst_user_addr;
-	int rc;
+	struct io_ring_ctx *ctx = req->ctx;
+	dma_addr_t dst_dma;
+	unsigned int folio_shift;
 
-	cmd = container_of(kiocb, struct io_dma, kiocb);
-	req = cmd_to_io_kiocb(cmd);
-	ctx = req->ctx;
-
-	len = min(iov_iter_count(src_iter), iov_iter_count(dst_iter));
-	threshold = READ_ONCE(io_dma_cpu_threshold);
-
-	/* Full CPU copy for small transfers or non-kvec sources */
-	if (!len || len < threshold * 2 || !iov_iter_is_kvec(src_iter))
-		return io_dma_cpu_copy(dst_iter, src_iter, len);
-
-	dev = ctx->dma.chan->device->dev;
-
-	cpu_bytes = min_t(size_t, len, threshold);
-	dma_bytes = len - cpu_bytes;
-	if (dma_bytes == 0)
-		return io_dma_cpu_copy(dst_iter, src_iter, len);
-
-	/*
-	 * The first source kvec segment must be large enough to cover
-	 * both the CPU and DMA portions so we can compute the DMA
-	 * source address as a simple offset from the segment start.
-	 */
-	first_seg_len = iter_iov_len(src_iter);
-	if (first_seg_len <= cpu_bytes) {
-		pr_debug("dma fallback: first_seg_len=%zu <= cpu_bytes=%zu len=%zu\n",
-			 first_seg_len, cpu_bytes, len);
-		return io_dma_cpu_copy(dst_iter, src_iter, len);
-	}
-
-	/* Clamp DMA to what's available after the CPU portion in this segment */
-	dma_bytes = min_t(size_t, dma_bytes, first_seg_len - cpu_bytes);
-
-	/* DMA source: offset cpu_bytes into the current segment */
-	src_kaddr = (void *)iter_iov_addr(src_iter) + cpu_bytes;
-
-	/*
-	 * DMA destination: offset by cpu_bytes since the iterators
-	 * haven't been advanced yet.
-	 */
 	if (iov_iter_is_bvec(dst_iter)) {
-		/* Registered buffer path */
 		struct io_mapped_ubuf *imu;
 
 		if (!(req->flags & REQ_F_BUF_NODE) || !req->buf_node)
-			goto cpu_fallback;
+			return 0;
 		imu = req->buf_node->buf;
-		dst_dma = io_reg_buf_dma_addr(imu,
-				req->dma.dst_user_addr + cpu_bytes);
+		dst_dma = io_reg_buf_dma_addr(imu, dst_base_addr + offset);
+		folio_shift = imu->folio_shift;
 	} else {
-		/* Provided buffer path */
+		struct io_buffer_list *bl;
+
 		bl = xa_load(&ctx->io_bl_xa, req->dma.buf_group);
 		if (!bl || !bl->dma_addrs)
-			goto cpu_fallback;
-
-		if (iter_is_ubuf(dst_iter))
-			dst_user_addr = (u64)dst_iter->ubuf +
-					dst_iter->iov_offset + cpu_bytes;
-		else if (iter_is_iovec(dst_iter))
-			dst_user_addr = (u64)iter_iov_addr(dst_iter) +
-					cpu_bytes;
-		else
-			goto cpu_fallback;
-
-		dst_dma = io_kbuf_dma_addr(bl, dst_user_addr);
+			return 0;
+		dst_dma = io_kbuf_dma_addr(bl, dst_base_addr + offset);
+		folio_shift = bl->dma_folio_shift;
 	}
+
 	if (!dst_dma)
-		goto cpu_fallback;
+		return 0;
 
-	pr_debug("dma dest: opcode=%d iter=%s dst_dma=0x%llx\n",
-		 req->opcode,
-		 iov_iter_is_bvec(dst_iter)  ? "bvec/reg" :
-		 iter_is_ubuf(dst_iter)      ? "ubuf/provided" :
-					       "iovec/provided",
-		 (u64)dst_dma);
+	*folio_remain = (1UL << folio_shift) -
+			(dst_dma & ((1UL << folio_shift) - 1));
+	return dst_dma;
+}
 
-	/* Map source kernel memory for DMA */
-	src_dma = dma_map_single(dev, src_kaddr, dma_bytes, DMA_TO_DEVICE);
+/*
+ * Submit a single DMA chunk: map source, allocate task, submit descriptor.
+ * Returns bytes submitted (>0), or 0 on failure (caller should CPU-copy).
+ */
+static size_t io_dma_submit_chunk(struct io_kiocb *req,
+				  struct device *dev, struct dma_chan *chan,
+				  void *src_kaddr, dma_addr_t dst_dma,
+				  size_t chunk_len)
+{
+	struct io_dma_task *dma;
+	dma_addr_t src_dma;
+	int rc;
+
+	src_dma = dma_map_single(dev, src_kaddr, chunk_len, DMA_TO_DEVICE);
 	if (dma_mapping_error(dev, src_dma))
-		goto cpu_fallback;
+		return 0;
 
-	/* Allocate and populate DMA task */
 	dma = kmem_cache_zalloc(dma_cachep, GFP_KERNEL);
 	if (!dma) {
-		dma_unmap_single(dev, src_dma, dma_bytes, DMA_TO_DEVICE);
-		goto cpu_fallback;
+		dma_unmap_single(dev, src_dma, chunk_len, DMA_TO_DEVICE);
+		return 0;
 	}
 
 	dma->req = req;
 	dma->next = NULL;
 	dma->src_dma = src_dma;
 	dma->dst_dma = dst_dma;
-	dma->len = dma_bytes;
+	dma->len = chunk_len;
 	dma->src_map_addr = src_dma;
-	dma->src_map_len = dma_bytes;
-	dma->cb_fn = cb_fn;
-	dma->cb_arg = cb_arg;
+	dma->src_map_len = chunk_len;
 
-	rc = __io_dma_task_submit(ctx->dma.chan, dma);
+	rc = __io_dma_task_submit(chan, dma);
 	if (rc == -EAGAIN) {
 		dma->cookie = 0;
 	} else if (rc != 0) {
-		dma_unmap_single(dev, src_dma, dma_bytes, DMA_TO_DEVICE);
+		dma_unmap_single(dev, src_dma, chunk_len, DMA_TO_DEVICE);
 		kmem_cache_free(dma_cachep, dma);
-		goto cpu_fallback;
+		return 0;
 	}
-
-	/*
-	 * Kick the hardware BEFORE the CPU copy so the DMA engine
-	 * works on the tail while the CPU handles the head.
-	 */
-	dma_async_issue_pending(ctx->dma.chan);
 
 	req->dma.dma_refcnt++;
 
@@ -260,22 +210,147 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 		req->dma.dma_tasks_tail = dma;
 	}
 
+	return chunk_len;
+}
+
+ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
+			struct iov_iter *src_iter,
+			void (*cb_fn)(struct kiocb *, void *, int), void *cb_arg,
+			unsigned long flags)
+{
+	struct io_dma *cmd;
+	struct io_kiocb *req;
+	struct io_ring_ctx *ctx;
+	struct device *dev;
+	size_t len, total_dma;
+	unsigned int threshold;
+	u64 dst_base_addr;
+
+	cmd = container_of(kiocb, struct io_dma, kiocb);
+	req = cmd_to_io_kiocb(cmd);
+	ctx = req->ctx;
+
+	len = min(iov_iter_count(src_iter), iov_iter_count(dst_iter));
+	threshold = READ_ONCE(io_dma_cpu_threshold);
+
 	/*
-	 * CPU copy of the head portion, overlapping with DMA in-flight.
-	 * Iterators still point at the beginning of the data.
+	 * Full CPU copy for small transfers or non-kvec sources.
+	 * Still store cb_fn on the request so io_dma_submit_queued_tasks
+	 * can release the source data after TCP has unlinked the SKB.
 	 */
-	cpu_copied = io_dma_cpu_copy(dst_iter, src_iter, cpu_bytes);
-	if (cpu_copied <= 0)
-		cpu_copied = 0;
+	if (!len || len < threshold || !iov_iter_is_kvec(src_iter)) {
+		req->dma.cb_fn = cb_fn;
+		req->dma.cb_arg = cb_arg;
+		return io_dma_cpu_copy(dst_iter, src_iter, len);
+	}
 
-	/* Advance iterators past the DMA portion */
-	iov_iter_advance(src_iter, dma_bytes);
-	iov_iter_advance(dst_iter, dma_bytes);
+	/*
+	 * Compute destination base address once.  DMA addresses are
+	 * resolved arithmetically as dst_base_addr + offset, independent
+	 * of iterator state, so the inner loop doesn't need to track
+	 * iterator positions.
+	 */
+	if (iov_iter_is_bvec(dst_iter)) {
+		if (!(req->flags & REQ_F_BUF_NODE) || !req->buf_node)
+			goto cpu_fallback;
+		dst_base_addr = req->dma.dst_user_addr;
+	} else if (iter_is_ubuf(dst_iter)) {
+		dst_base_addr = (u64)dst_iter->ubuf + dst_iter->iov_offset;
+	} else if (iter_is_iovec(dst_iter)) {
+		dst_base_addr = (u64)iter_iov_addr(dst_iter);
+	} else {
+		goto cpu_fallback;
+	}
 
-	return cpu_copied + dma_bytes;
+	dev = ctx->dma.chan->device->dev;
+
+	/* Store cb_fn/cb_arg at request level — called once when all DMA done */
+	req->dma.cb_fn = cb_fn;
+	req->dma.cb_arg = cb_arg;
+
+	total_dma = 0;
+
+	/*
+	 * Walk all source kvec segments.  For each segment, split into
+	 * DMA tasks at destination folio boundaries so no single transfer
+	 * crosses an IOMMU mapping.
+	 */
+	while (total_dma < len) {
+		void *seg_base;
+		size_t seg_avail, seg_remaining, seg_off;
+
+		seg_avail = iter_iov_len(src_iter);
+		if (!seg_avail)
+			break;
+
+		seg_base = (void *)iter_iov_addr(src_iter);
+		seg_remaining = min_t(size_t, seg_avail, len - total_dma);
+		seg_off = 0;
+
+		/* Inner loop: split this source segment at folio boundaries */
+		while (seg_off < seg_remaining) {
+			size_t folio_remain, chunk_len, submitted;
+			dma_addr_t dst_dma;
+
+			dst_dma = io_dma_dst_addr(req, dst_iter,
+						  dst_base_addr, total_dma,
+						  &folio_remain);
+			if (!dst_dma)
+				goto cpu_fallback_rest;
+
+			chunk_len = min_t(size_t, seg_remaining - seg_off,
+					  folio_remain);
+
+			submitted = io_dma_submit_chunk(req, dev,
+							ctx->dma.chan,
+							seg_base + seg_off,
+							dst_dma, chunk_len);
+			if (!submitted)
+				goto cpu_fallback_rest;
+
+			seg_off += submitted;
+			total_dma += submitted;
+		}
+
+		/* Advance source iterator past this segment */
+		iov_iter_advance(src_iter, seg_off);
+	}
+
+	/* Advance destination iterator past all DMA'd bytes */
+	iov_iter_advance(dst_iter, total_dma);
+
+	/* Kick the DMA engine once after all tasks are submitted */
+	dma_async_issue_pending(ctx->dma.chan);
+
+	return total_dma;
+
+cpu_fallback_rest:
+	/*
+	 * DMA submission failed mid-way.  Advance iterators past
+	 * already-DMA'd bytes, then CPU-copy the rest.
+	 */
+	if (total_dma > 0) {
+		iov_iter_advance(src_iter, total_dma);
+		iov_iter_advance(dst_iter, total_dma);
+	}
+	{
+		size_t remain = len - total_dma;
+		ssize_t cpu_ret = io_dma_cpu_copy(dst_iter, src_iter, remain);
+
+		if (cpu_ret > 0)
+			total_dma += cpu_ret;
+	}
+	if (req->dma.dma_refcnt > 0)
+		dma_async_issue_pending(ctx->dma.chan);
+	return total_dma;
 
 cpu_fallback:
-	/* Nothing has been modified yet — iterators are pristine */
+	/*
+	 * Store cb_fn so io_dma_submit_queued_tasks can release the
+	 * source data after TCP has unlinked the SKB from the recv queue.
+	 */
+	req->dma.cb_fn = cb_fn;
+	req->dma.cb_arg = cb_arg;
 	return io_dma_cpu_copy(dst_iter, src_iter, len);
 }
 EXPORT_SYMBOL_GPL(io_uring_copy_to_iter);
@@ -304,14 +379,6 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
 		req->dma.dma_result = -EFAULT;
 	}
 
-	if (dma->cb_fn) {
-		struct io_dma *iod = io_kiocb_to_cmd(req, struct io_dma);
-
-		dma->cb_fn(&iod->kiocb, dma->cb_arg,
-			   req->dma.dma_result >= 0 ?
-			   task_len : req->dma.dma_result);
-	}
-
 	/* Free the task before touching refcnt -- task_len saved above */
 	kmem_cache_free(dma_cachep, dma);
 	req->dma.dma_refcnt--;
@@ -319,6 +386,15 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
 	if (req->dma.dma_refcnt == 0) {
 		pr_debug("dma req done: opcode=%d result=%d\n",
 			 req->opcode, req->dma.dma_result);
+
+		/* Release source data (e.g. SKB) now that all DMA is done */
+		if (req->dma.cb_fn) {
+			struct io_dma *iod = io_kiocb_to_cmd(req, struct io_dma);
+
+			req->dma.cb_fn(&iod->kiocb, req->dma.cb_arg,
+				       req->dma.dma_result);
+		}
+
 		if (req->dma.dma_result < 0) {
 			req_set_fail(req);
 			io_req_set_res(req, req->dma.dma_result,
@@ -383,6 +459,16 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 			req->dma.dma_tasks = NULL;
 			req->dma.dma_tasks_tail = NULL;
 			ret = -EIOCBQUEUED;
+		} else if (req->dma.cb_fn) {
+			/*
+			 * CPU fallback path: no DMA tasks were submitted but
+			 * TCP already unlinked the SKB from the receive queue
+			 * (tcp_eat_recv_skb with free=false).  Release it now.
+			 */
+			struct io_dma *iod = io_kiocb_to_cmd(req, struct io_dma);
+
+			req->dma.cb_fn(&iod->kiocb, req->dma.cb_arg, 0);
+			req->dma.cb_fn = NULL;
 		}
 
 		req->dma.dma_active = false;
