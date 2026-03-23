@@ -12,6 +12,8 @@
 #include <linux/atomic.h>
 #include <uapi/linux/io_uring.h>
 
+struct folio;
+
 enum {
 	/*
 	 * A hint to not wake right away but delay until there are enough of
@@ -292,6 +294,8 @@ struct io_dma_task {
 	u32			len;
 	dma_addr_t		src_map_addr;	/* for dma_unmap at completion */
 	u32			src_map_len;
+	struct folio		*src_folio;	/* page cache folio ref to put on completion */
+	bool			src_is_page;	/* true → dma_unmap_page, false → dma_unmap_single */
 	struct io_dma_task	*next;
 };
 

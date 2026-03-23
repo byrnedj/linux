@@ -866,7 +866,7 @@ static struct io_rsrc_node *io_sqe_buffer_register(struct io_ring_ctx *ctx,
 	}
 
 	/* DMA-map each bvec page if a DMA channel is available */
-	if (ctx->dma.chan) {
+	if (!IS_ERR_OR_NULL(ctx->dma.chan)) {
 		struct device *dev = ctx->dma.chan->device->dev;
 
 		imu->dma_addrs = kvmalloc_array(nr_pages, sizeof(dma_addr_t),

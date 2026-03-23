@@ -6,6 +6,10 @@
 #include <linux/dma-mapping.h>
 #include <linux/spinlock.h>
 #include <linux/xarray.h>
+#include <linux/pagemap.h>
+#include <linux/pagevec.h>
+#include <linux/swap.h>
+#include <linux/fs.h>
 #include "io_uring.h"
 #include "kbuf.h"
 #include "rsrc.h"
@@ -66,7 +70,7 @@ struct io_dma {
 
 void io_uring_dma_prep(struct io_kiocb *req)
 {
-	if (req->ctx->dma.chan == NULL)
+	if (IS_ERR_OR_NULL(req->ctx->dma.chan))
 		return;
 
 	req->dma.dma_active = true;
@@ -202,6 +206,71 @@ static size_t io_dma_submit_chunk(struct io_kiocb *req,
 	req->dma.dma_refcnt++;
 
 	/* O(1) append using tail pointer */
+	if (!req->dma.dma_tasks) {
+		req->dma.dma_tasks = dma;
+		req->dma.dma_tasks_tail = dma;
+	} else {
+		req->dma.dma_tasks_tail->next = dma;
+		req->dma.dma_tasks_tail = dma;
+	}
+
+	return chunk_len;
+}
+
+/*
+ * Submit a single DMA chunk from a page cache folio.
+ * Uses dma_map_page() for the source and takes an extra folio reference
+ * so the folio stays pinned until DMA completes.
+ * Returns bytes submitted (>0), or 0 on failure.
+ */
+static size_t io_dma_submit_folio_chunk(struct io_kiocb *req,
+					struct device *dev,
+					struct dma_chan *chan,
+					struct folio *folio,
+					size_t folio_offset,
+					dma_addr_t dst_dma,
+					size_t chunk_len)
+{
+	struct io_dma_task *dma;
+	dma_addr_t src_dma;
+	int rc;
+
+	src_dma = dma_map_page(dev, &folio->page, folio_offset,
+			       chunk_len, DMA_TO_DEVICE);
+	if (dma_mapping_error(dev, src_dma))
+		return 0;
+
+	dma = kmem_cache_zalloc(dma_cachep, GFP_KERNEL);
+	if (!dma) {
+		dma_unmap_page(dev, src_dma, chunk_len, DMA_TO_DEVICE);
+		return 0;
+	}
+
+	/* Take an extra folio ref for the DMA task lifetime */
+	folio_get(folio);
+
+	dma->req = req;
+	dma->next = NULL;
+	dma->src_dma = src_dma;
+	dma->dst_dma = dst_dma;
+	dma->len = chunk_len;
+	dma->src_map_addr = src_dma;
+	dma->src_map_len = chunk_len;
+	dma->src_folio = folio;
+	dma->src_is_page = true;
+
+	rc = __io_dma_task_submit(chan, dma);
+	if (rc == -EAGAIN) {
+		dma->cookie = 0;
+	} else if (rc != 0) {
+		dma_unmap_page(dev, src_dma, chunk_len, DMA_TO_DEVICE);
+		folio_put(folio);
+		kmem_cache_free(dma_cachep, dma);
+		return 0;
+	}
+
+	req->dma.dma_refcnt++;
+
 	if (!req->dma.dma_tasks) {
 		req->dma.dma_tasks = dma;
 		req->dma.dma_tasks_tail = dma;
@@ -355,6 +424,144 @@ cpu_fallback:
 }
 EXPORT_SYMBOL_GPL(io_uring_copy_to_iter);
 
+/*
+ * DMA-offloaded page cache read for io_uring registered buffers.
+ * Mirrors filemap_read() but replaces copy_folio_to_iter() with DMA
+ * submissions from page cache folios to pre-mapped registered buffer pages.
+ *
+ * Returns bytes read (>0), 0 at EOF, or negative error.
+ * Caller must call io_dma_submit_queued_tasks() after this returns >0
+ * with dma_refcnt > 0 to drain the queued DMA tasks.
+ */
+ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
+			    u64 dst_user_addr)
+{
+	struct io_ring_ctx *ctx = req->ctx;
+	struct file *filp = iocb->ki_filp;
+	struct address_space *mapping = filp->f_mapping;
+	struct inode *inode = mapping->host;
+	struct io_mapped_ubuf *imu = req->buf_node->buf;
+	struct device *dev = ctx->dma.chan->device->dev;
+	struct dma_chan *chan = ctx->dma.chan;
+	struct folio_batch fbatch;
+	ssize_t total_read = 0;
+	size_t dst_offset = 0;
+	loff_t isize;
+	int i, error = 0;
+	bool writably_mapped;
+
+	if (unlikely(iocb->ki_pos < 0))
+		return -EINVAL;
+	if (unlikely(iocb->ki_pos >= inode->i_sb->s_maxbytes))
+		return 0;
+
+	isize = i_size_read(inode);
+	if (unlikely(iocb->ki_pos >= isize))
+		return 0;
+
+	folio_batch_init(&fbatch);
+
+	do {
+		size_t count;
+		loff_t end_offset;
+
+		cond_resched();
+
+		if (unlikely(iocb->ki_pos >= i_size_read(inode)))
+			break;
+
+		/* How many bytes remain in the destination buffer */
+		count = imu->len - dst_offset;
+		if (!count)
+			break;
+
+		error = filemap_get_pages(iocb, count, &fbatch, false);
+		if (error < 0)
+			break;
+
+		isize = i_size_read(inode);
+		if (unlikely(iocb->ki_pos >= isize))
+			goto put_folios;
+		end_offset = min_t(loff_t, isize, iocb->ki_pos + count);
+
+		writably_mapped = mapping_writably_mapped(mapping);
+
+		if (folio_batch_count(&fbatch))
+			folio_mark_accessed(fbatch.folios[0]);
+
+		for (i = 0; i < folio_batch_count(&fbatch); i++) {
+			struct folio *folio = fbatch.folios[i];
+			size_t fsize = folio_size(folio);
+			size_t offset = iocb->ki_pos & (fsize - 1);
+			size_t bytes = min_t(loff_t, end_offset - iocb->ki_pos,
+					     fsize - offset);
+			size_t copied = 0;
+
+			if (end_offset < folio_pos(folio))
+				break;
+			if (i > 0)
+				folio_mark_accessed(folio);
+			if (writably_mapped)
+				flush_dcache_folio(folio);
+
+			/* Submit DMA tasks for this folio, splitting at
+			 * destination registered buffer folio boundaries.
+			 */
+			while (copied < bytes) {
+				dma_addr_t dst_dma;
+				size_t dst_folio_remain;
+				size_t chunk;
+				size_t submitted;
+
+				dst_dma = io_reg_buf_dma_addr(imu,
+						dst_user_addr + dst_offset);
+				if (!dst_dma) {
+					error = -EFAULT;
+					goto put_folios;
+				}
+
+				/* Remaining bytes in dst folio from this addr */
+				dst_folio_remain = (1UL << imu->folio_shift) -
+					((dst_user_addr + dst_offset) &
+					 ((1UL << imu->folio_shift) - 1));
+
+				chunk = min_t(size_t, bytes - copied,
+					      dst_folio_remain);
+
+				submitted = io_dma_submit_folio_chunk(
+					req, dev, chan, folio,
+					offset + copied, dst_dma, chunk);
+				if (!submitted) {
+					error = -EFAULT;
+					goto put_folios;
+				}
+
+				copied += submitted;
+				dst_offset += submitted;
+			}
+
+			total_read += copied;
+			iocb->ki_pos += copied;
+
+			if (copied < bytes) {
+				error = -EFAULT;
+				break;
+			}
+		}
+put_folios:
+		for (i = 0; i < folio_batch_count(&fbatch); i++)
+			folio_put(fbatch.folios[i]);
+		folio_batch_init(&fbatch);
+	} while (dst_offset < imu->len && iocb->ki_pos < isize && !error);
+
+	file_accessed(filp);
+
+	if (req->dma.dma_refcnt > 0)
+		dma_async_issue_pending(chan);
+
+	return total_read ? total_read : error;
+}
+
 static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
 				   int ret)
 {
@@ -365,9 +572,18 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
 	task_len = dma->len;
 
 	/* Unmap the source DMA mapping */
-	if (dma->src_map_len)
-		dma_unmap_single(dev, dma->src_map_addr,
-				 dma->src_map_len, DMA_TO_DEVICE);
+	if (dma->src_map_len) {
+		if (dma->src_is_page)
+			dma_unmap_page(dev, dma->src_map_addr,
+				       dma->src_map_len, DMA_TO_DEVICE);
+		else
+			dma_unmap_single(dev, dma->src_map_addr,
+					 dma->src_map_len, DMA_TO_DEVICE);
+	}
+
+	/* Release page cache folio reference held for DMA duration */
+	if (dma->src_folio)
+		folio_put(dma->src_folio);
 
 	if (ret == DMA_COMPLETE) {
 		pr_debug("dma task complete: len=%u result=%d\n",
@@ -420,7 +636,7 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 	struct io_ring_ctx *ctx = req->ctx;
 	int ret = 0;
 
-	if (!ctx->dma.chan)
+	if (IS_ERR_OR_NULL(ctx->dma.chan))
 		return 0;
 
 	if (req->dma.dma_active) {
@@ -502,7 +718,7 @@ int __io_dma_poll(struct io_ring_ctx *ctx)
 	if (atomic_cmpxchg(&ctx->dma.poll_armed, 0, 1) != 0)
 		return 0;
 
-	if (!ctx->dma.chan)
+	if (IS_ERR_OR_NULL(ctx->dma.chan))
 		goto out_disarm;
 
 	dma_async_issue_pending(ctx->dma.chan);

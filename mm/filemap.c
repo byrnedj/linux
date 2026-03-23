@@ -2659,7 +2659,7 @@ static int filemap_readahead(struct kiocb *iocb, struct file *file,
 	return 0;
 }
 
-static int filemap_get_pages(struct kiocb *iocb, size_t count,
+int filemap_get_pages(struct kiocb *iocb, size_t count,
 		struct folio_batch *fbatch, bool need_uptodate)
 {
 	struct file *filp = iocb->ki_filp;
@@ -2727,6 +2727,7 @@ err:
 		goto retry;
 	return err;
 }
+EXPORT_SYMBOL_GPL(filemap_get_pages);
 
 static inline bool pos_same_folio(loff_t pos1, loff_t pos2, struct folio *folio)
 {

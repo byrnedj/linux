@@ -1202,7 +1202,7 @@ retry_multishot:
 	kmsg->msg.msg_flags = 0;
 	kmsg->msg.msg_inq = -1;
 
-	if (force_nonblock && req->ctx->dma.chan) {
+	if (force_nonblock && !IS_ERR_OR_NULL(req->ctx->dma.chan)) {
 		kmsg->msg.msg_io_iocb = req;
 		io_uring_dma_prep(req);
 		req->dma.buf_group = sr->buf_group;
@@ -1217,14 +1217,14 @@ retry_multishot:
 	if (ret > 0) {
 		int ret2;
 		pr_debug("io_recv: sock_recvmsg ret=%d dma_refcnt=%d dma_active=%d req_flags=0x%llx\n",
-			ret, req->ctx->dma.chan ? req->dma.dma_refcnt : -1,
-			req->ctx->dma.chan ? req->dma.dma_active : -1,
+			ret, !IS_ERR_OR_NULL(req->ctx->dma.chan) ? req->dma.dma_refcnt : -1,
+			!IS_ERR_OR_NULL(req->ctx->dma.chan) ? req->dma.dma_active : -1,
 			(unsigned long long)req->flags);
 		/* Pre-compute CQE values for DMA completion path.
 		 * Must happen BEFORE io_dma_submit_queued_tasks() because
 		 * DMA can complete synchronously during submit via __io_dma_poll().
 		 */
-		if (req->ctx->dma.chan && req->dma.dma_active) {
+		if (!IS_ERR_OR_NULL(req->ctx->dma.chan) && req->dma.dma_active) {
 			unsigned int cflags = 0;
 			if (kmsg->msg.msg_inq > 0)
 				cflags |= IORING_CQE_F_SOCK_NONEMPTY;

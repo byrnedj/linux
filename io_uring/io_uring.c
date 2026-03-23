@@ -2857,7 +2857,7 @@ static void io_release_dma_chan(struct io_ring_ctx *ctx)
 	struct io_dma_task *dma, *next;
 	int ret;
 
-	if (ctx->dma.chan != NULL) {
+	if (!IS_ERR_OR_NULL(ctx->dma.chan)) {
 		dma = ctx->dma.head;
 		while (dma) {
 			next = dma->next;

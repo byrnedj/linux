@@ -618,6 +618,8 @@ static inline bool io_has_work(struct io_ring_ctx *ctx)
 
 void io_uring_dma_prep(struct io_kiocb *req);
 int io_dma_submit_queued_tasks(struct io_kiocb *req);
+ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
+			    u64 dst_user_addr);
 extern struct kmem_cache *dma_cachep;
 int __io_dma_poll(struct io_ring_ctx *ctx);
 int kiocb_done(struct io_kiocb *req, ssize_t ret, struct io_br_sel *sel, unsigned int issue_flags);

@@ -948,11 +948,39 @@ static int __io_read(struct io_kiocb *req, struct io_br_sel *sel,
 	if (unlikely(ret))
 		return ret;
 
+	/* DMA-offloaded page cache read for registered buffers.
+	 * Bypass generic_file_read_iter() and read directly from the
+	 * page cache, submitting DMA copies to the registered buffer.
+	 */
+	if (!IS_ERR_OR_NULL(req->ctx->dma.chan) &&
+	    (req->flags & REQ_F_ISREG) &&
+	    (req->flags & REQ_F_BUF_NODE) && req->buf_node &&
+	    req->buf_node->buf->dma_addrs &&
+	    iov_iter_is_bvec(&io->iter) &&
+	    !(kiocb->ki_flags & IOCB_DIRECT)) {
+		io_uring_dma_prep(req);
+		req->dma.dst_user_addr = rw->addr;
+
+		ret = io_dma_filemap_read(req, kiocb, rw->addr);
+
+		if (ret > 0 && req->dma.dma_refcnt > 0) {
+			req->dma.saved_res = ret;
+			req->dma.saved_cflags = 0;
+			ret2 = io_dma_submit_queued_tasks(req);
+			if (ret2 == -EIOCBQUEUED)
+				return IOU_ISSUE_SKIP_COMPLETE;
+		}
+		if (ret > 0)
+			goto done;
+		/* On failure, fall through to normal read path */
+		req->dma.dma_active = false;
+	}
+
 	/* Set up DMA copy offload for socket reads.
 	 * Pass io_kiocb via kiocb->private so sock_read_iter()
 	 * can forward it to msg.msg_io_iocb for tcp_recvmsg().
 	 */
-	if (force_nonblock && req->ctx->dma.chan) {
+	if (force_nonblock && !IS_ERR_OR_NULL(req->ctx->dma.chan)) {
 		io_uring_dma_prep(req);
 		req->dma.dst_user_addr = rw->addr;
 		kiocb->private = req;
@@ -976,7 +1004,7 @@ static int __io_read(struct io_kiocb *req, struct io_br_sel *sel,
 		 * Must happen BEFORE io_dma_submit_queued_tasks() because
 		 * DMA can complete synchronously during submit.
 		 */
-		if (req->ctx->dma.chan && req->dma.dma_active) {
+		if (!IS_ERR_OR_NULL(req->ctx->dma.chan) && req->dma.dma_active) {
 			req->dma.saved_res = ret;
 			req->dma.saved_cflags = 0;
 		}

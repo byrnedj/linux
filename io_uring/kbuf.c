@@ -824,7 +824,7 @@ int io_register_pbuf_ring(struct io_ring_ctx *ctx, void __user *arg)
 		u64 data_addr = reg.resv[0];
 		u64 data_size = reg.resv[1];
 
-		if (!data_addr || !data_size || !ctx->dma.chan) {
+		if (!data_addr || !data_size || IS_ERR_OR_NULL(ctx->dma.chan)) {
 			ret = -EINVAL;
 			goto fail;
 		}
