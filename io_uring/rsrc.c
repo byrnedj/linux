@@ -1210,6 +1210,35 @@ dma_addr_t io_reg_buf_dma_addr(struct io_mapped_ubuf *imu, u64 buf_addr)
 	return imu->dma_addrs[seg_idx] + offset;
 }
 
+/*
+ * Resolve the physical (host) address for a given offset within a
+ * registered buffer.  Used for dedicated DSA work queues that operate
+ * on physical addresses directly, bypassing IOMMU translation.
+ */
+phys_addr_t io_reg_buf_phys_addr(struct io_mapped_ubuf *imu, u64 buf_addr)
+{
+	size_t offset, folio_mask;
+	unsigned int seg_idx;
+	const struct bio_vec *bvec;
+
+	if (!imu)
+		return 0;
+	if (buf_addr < imu->ubuf || buf_addr >= imu->ubuf + imu->len)
+		return 0;
+
+	offset = buf_addr - imu->ubuf;
+	bvec = imu->bvec;
+	folio_mask = (1UL << imu->folio_shift) - 1;
+
+	if (offset < bvec->bv_len)
+		return page_to_phys(bvec->bv_page) + bvec->bv_offset + offset;
+
+	offset -= bvec->bv_len;
+	seg_idx = 1 + (offset >> imu->folio_shift);
+	offset &= folio_mask;
+	return page_to_phys(imu->bvec[seg_idx].bv_page) + offset;
+}
+
 int io_import_reg_buf(struct io_kiocb *req, struct iov_iter *iter,
 			u64 buf_addr, size_t len, int ddir,
 			unsigned issue_flags)
