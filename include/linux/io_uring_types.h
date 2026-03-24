@@ -286,6 +286,15 @@ struct io_dma_kiocb {
 	void			*cb_arg;
 };
 
+struct io_dma_batch_entry {
+	dma_addr_t		src_dma;	/* DMA-mapped source address */
+	dma_addr_t		dst_dma;	/* pre-mapped dest DMA address */
+	u32			src_len;	/* source mapping length */
+	struct folio		*folio;		/* page cache folio ref */
+};
+
+#define IO_DMA_BATCH_MAX	32
+
 struct io_dma_task {
 	struct io_kiocb		*req;
 	dma_cookie_t		cookie;
@@ -296,6 +305,9 @@ struct io_dma_task {
 	u32			src_map_len;
 	struct folio		*src_folio;	/* page cache folio ref to put on completion */
 	bool			src_is_page;	/* true → dma_unmap_page, false → dma_unmap_single */
+	bool			is_batch;	/* true → batch task with batch_entries */
+	u8			batch_nr;	/* number of batch entries */
+	struct io_dma_batch_entry *batch_entries; /* heap-allocated cleanup array */
 	struct io_dma_task	*next;
 };
 
