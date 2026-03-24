@@ -106,7 +106,7 @@ dmachan_alloc_desc(struct dma_chan *chan, enum idxd_op_type optype)
 	struct idxd_desc *desc;
 
 	desc = idxd_alloc_desc(wq, optype);
-	if (!desc)
+	if (IS_ERR_OR_NULL(desc))
 		return NULL;
 	dma_async_tx_descriptor_init(&desc->txd, chan);
 
@@ -429,8 +429,9 @@ idxd_dma_prep_memcpy_sg(struct dma_chan *chan,
 	}
 
 	desc = idxd_alloc_desc(wq, IDXD_OP_NONBLOCK);
-	if (IS_ERR(desc))
+	if (IS_ERR_OR_NULL(desc))
 		return NULL;
+	dma_async_tx_descriptor_init(&desc->txd, chan);
 
 	/*
 	 * DSA Batch descriptor has a set of descriptors in array
