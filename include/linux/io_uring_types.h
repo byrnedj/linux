@@ -262,6 +262,7 @@ struct io_alloc_cache {
 
 struct io_dma_channel {
 	struct dma_chan		*chan;
+	bool			use_phys_addrs;
 
 	struct work_struct	poll_work;
 	atomic_t		poll_armed;

@@ -70,6 +70,7 @@
 #include <linux/audit.h>
 #include <linux/security.h>
 #include <linux/jump_label.h>
+#include <linux/iommu.h>
 #include <asm/shmparam.h>
 
 #define CREATE_TRACE_POINTS
@@ -2905,9 +2906,19 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 		goto failed;
 	}
 
+	{
+		struct device *dma_dev = ctx->dma.chan->device->dev;
+		struct iommu_domain *domain = iommu_get_domain_for_dev(dma_dev);
+
+		/* Physical addresses only work in IOMMU passthrough mode */
+		ctx->dma.use_phys_addrs = !domain ||
+					  (domain->type == IOMMU_DOMAIN_IDENTITY);
+	}
+
 	dev_info(ctx->dma.chan->device->dev,
-		 "io_uring DMA: acquired channel %s (physical DMA mode)\n",
-		 dma_chan_name(ctx->dma.chan));
+		 "io_uring DMA: acquired channel %s (%s addressing)\n",
+		 dma_chan_name(ctx->dma.chan),
+		 ctx->dma.use_phys_addrs ? "physical" : "IOMMU-mapped");
 
 	ctx->dma.head = NULL;
 	ctx->dma.tail = NULL;

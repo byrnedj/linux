@@ -576,11 +576,15 @@ static ssize_t io_dma_submit_single_entry(struct io_kiocb *req,
 /*
  * Unmap source DMA mappings for batch entries on error paths.
  */
-static void io_dma_unmap_batch_entries(struct device *dev,
+static void io_dma_unmap_batch_entries(struct io_kiocb *req,
+				       struct device *dev,
 				       struct io_dma_batch_entry *entries,
 				       unsigned int nr)
 {
 	unsigned int i;
+
+	if (req->ctx->dma.use_phys_addrs)
+		return;
 
 	for (i = 0; i < nr; i++)
 		dma_unmap_page(dev, entries[i].src_dma,
@@ -609,7 +613,8 @@ static ssize_t io_dma_flush_batch(struct io_kiocb *req,
 			ret = io_dma_submit_single_entry(req, chan, &entries[i]);
 			if (ret < 0) {
 				/* Unmap remaining entries */
-				io_dma_unmap_batch_entries(dev, entries + i + 1,
+				io_dma_unmap_batch_entries(req, dev,
+							  entries + i + 1,
 							  nr_entries - i - 1);
 				return total > 0 ? total : ret;
 			}
@@ -620,7 +625,7 @@ static ssize_t io_dma_flush_batch(struct io_kiocb *req,
 
 	ret = io_dma_submit_batch(req, dev, chan, entries, nr_entries);
 	if (ret < 0)
-		io_dma_unmap_batch_entries(dev, entries, nr_entries);
+		io_dma_unmap_batch_entries(req, dev, entries, nr_entries);
 	return ret;
 }
 
@@ -720,8 +725,13 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 				size_t dst_folio_remain;
 				size_t chunk;
 
-				dst_dma = io_reg_buf_dma_addr(imu,
-						dst_user_addr + dst_offset);
+				if (ctx->dma.use_phys_addrs) {
+					dst_dma = io_reg_buf_phys_addr(imu,
+							dst_user_addr + dst_offset);
+				} else {
+					dst_dma = io_reg_buf_dma_addr(imu,
+							dst_user_addr + dst_offset);
+				}
 				if (!dst_dma) {
 					error = -EFAULT;
 					goto flush_and_put;
@@ -734,13 +744,17 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 				chunk = min_t(size_t, bytes - copied,
 					      dst_folio_remain);
 
-				/* Map source folio page for DMA */
-				src_dma = dma_map_page(dev, &folio->page,
-						       offset + copied,
-						       chunk, DMA_TO_DEVICE);
-				if (dma_mapping_error(dev, src_dma)) {
-					error = -EFAULT;
-					goto flush_and_put;
+				if (ctx->dma.use_phys_addrs) {
+					src_dma = page_to_phys(folio_page(folio, 0)) +
+						  offset + copied;
+				} else {
+					src_dma = dma_map_page(dev, &folio->page,
+							       offset + copied,
+							       chunk, DMA_TO_DEVICE);
+					if (dma_mapping_error(dev, src_dma)) {
+						error = -EFAULT;
+						goto flush_and_put;
+					}
 				}
 
 				/* Collect entry for batch submission */
@@ -815,14 +829,16 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
 		int i;
 
 		for (i = 0; i < dma->batch_nr; i++) {
-			dma_unmap_page(dev, dma->batch_entries[i].src_dma,
-				       dma->batch_entries[i].src_len,
-				       DMA_TO_DEVICE);
+			if (!req->ctx->dma.use_phys_addrs)
+				dma_unmap_page(dev,
+					       dma->batch_entries[i].src_dma,
+					       dma->batch_entries[i].src_len,
+					       DMA_TO_DEVICE);
 			folio_put(dma->batch_entries[i].folio);
 		}
 		kfree(dma->batch_entries);
 	} else {
-		if (dma->src_map_len) {
+		if (dma->src_map_len && !req->ctx->dma.use_phys_addrs) {
 			if (dma->src_is_page)
 				dma_unmap_page(dev, dma->src_map_addr,
 					       dma->src_map_len,
