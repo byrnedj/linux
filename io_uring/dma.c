@@ -14,6 +14,8 @@
 #include "io_uring.h"
 #include "kbuf.h"
 #include "rsrc.h"
+#include "net.h"
+#include "poll.h"
 
 #ifndef pr_fmt
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -84,6 +86,13 @@ void io_uring_dma_prep(struct io_kiocb *req)
 	req->dma.saved_cflags = 0;
 	req->dma.cb_fn = NULL;
 	req->dma.cb_arg = NULL;
+	/*
+	 * io_recv guards on mshot_in_flight BEFORE calling dma_prep, so by
+	 * the time we get here it must already be false. Reset anyway to
+	 * cover fresh requests pulled from the slab cache whose prior user
+	 * may have set it.
+	 */
+	req->dma.mshot_in_flight = false;
 }
 
 /*
@@ -815,6 +824,57 @@ put_folios:
 	return total_read ? total_read : error;
 }
 
+/*
+ * Task_work fired when a DMA-offloaded multishot recv completes.
+ * Posts an intermediate CQE with IORING_CQE_F_MORE and resets the
+ * multishot bookkeeping so the next poll wakeup can dispatch another
+ * recv into the same request. If posting the aux CQE fails (CQ full),
+ * fall back to a terminal completion and let userspace re-arm.
+ */
+static void io_dma_mshot_retry_tw(struct io_tw_req tw_req, io_tw_token_t tw)
+{
+	struct io_kiocb *req = tw_req.req;
+	s32 res = req->dma.saved_res;
+	u32 cflags = req->dma.saved_cflags;
+	bool posted;
+
+	io_tw_lock(req->ctx, tw);
+
+	pr_debug("mshot_retry_tw: opcode=%d res=%d cflags=0x%x user_data=0x%llx flags=0x%llx\n",
+		 req->opcode, res, cflags,
+		 (unsigned long long)req->cqe.user_data,
+		 (unsigned long long)req->flags);
+
+	posted = io_req_post_cqe(req, res, cflags | IORING_CQE_F_MORE);
+	if (!posted) {
+		/* CQ ring is full — terminate multishot with a final CQE. */
+		pr_debug("mshot_retry_tw: io_req_post_cqe FAILED, terminating multishot\n");
+		io_req_set_res(req, res, cflags);
+		io_req_complete_defer(req);
+		return;
+	}
+
+	io_recv_mshot_dma_retry(req);
+
+	/* Clear per-recv DMA scratch so the next io_recv starts clean. */
+	req->dma.saved_res = 0;
+	req->dma.saved_cflags = 0;
+	req->dma.mshot_in_flight = false;
+	pr_debug("mshot_retry_tw: posted aux CQE F_MORE, mshot_in_flight cleared\n");
+
+	/*
+	 * If the socket still had data buffered when the recv returned
+	 * (F_SOCK_NONEMPTY), no new waker will fire for that already-
+	 * queued data. Kick the poll state machine to re-issue io_recv
+	 * and drain it — mirrors the goto retry_multishot path in
+	 * io_recv_finish.
+	 */
+	if (cflags & IORING_CQE_F_SOCK_NONEMPTY) {
+		pr_debug("mshot_retry_tw: F_SOCK_NONEMPTY set, kicking poll\n");
+		io_poll_kick(req);
+	}
+}
+
 static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
 				   int ret)
 {
@@ -876,15 +936,27 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
 
 			req->dma.cb_fn(&iod->kiocb, req->dma.cb_arg,
 				       req->dma.dma_result);
+			req->dma.cb_fn = NULL;
+			req->dma.cb_arg = NULL;
 		}
 
 		if (req->dma.dma_result < 0) {
 			req_set_fail(req);
 			io_req_set_res(req, req->dma.dma_result,
 				       req->dma.saved_cflags);
+			req->io_task_work.func = io_req_task_complete;
+		} else if (req->flags & REQ_F_APOLL_MULTISHOT) {
+			/*
+			 * Multishot recv via DMA: post an intermediate CQE
+			 * with IORING_CQE_F_MORE and leave the request in
+			 * flight under the poll machinery. The saved res/cflags
+			 * are consumed by io_dma_mshot_retry_tw.
+			 */
+			req->io_task_work.func = io_dma_mshot_retry_tw;
 		} else {
 			io_req_set_res(req, req->dma.saved_res,
 				       req->dma.saved_cflags);
+			req->io_task_work.func = io_req_task_complete;
 		}
 		/*
 		 * Complete via task_work rather than io_req_complete_defer(),
@@ -893,7 +965,6 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
 		 * io_req_complete_defer() once the lock is acquired in the
 		 * task_work run loop.
 		 */
-		req->io_task_work.func = io_req_task_complete;
 		io_req_task_work_add(req);
 	}
 }

@@ -825,13 +825,18 @@ int io_register_pbuf_ring(struct io_ring_ctx *ctx, void __user *arg)
 		u64 data_size = reg.resv[1];
 
 		if (!data_addr || !data_size || IS_ERR_OR_NULL(ctx->dma.chan)) {
+			pr_err("io_uring DMA: bad register args addr=%llx size=%llx chan=%p\n",
+			       data_addr, data_size, ctx->dma.chan);
 			ret = -EINVAL;
 			goto fail;
 		}
 		ret = io_pbuf_dma_map(bl, ctx->dma.chan->device->dev,
 				      data_addr, data_size);
-		if (ret)
+		if (ret) {
+			pr_err("io_uring DMA: io_pbuf_dma_map failed ret=%d addr=%llx size=%llx\n",
+			       ret, data_addr, data_size);
 			goto fail;
+		}
 	}
 
 	io_buffer_add_list(ctx, bl, reg.bgid);

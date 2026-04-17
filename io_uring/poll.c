@@ -228,6 +228,11 @@ static inline void io_poll_execute(struct io_kiocb *req, int res)
 		__io_poll_execute(req, res);
 }
 
+void io_poll_kick(struct io_kiocb *req)
+{
+	io_poll_execute(req, 0);
+}
+
 /*
  * All poll tw should go through this. Checks for poll events, manages
  * references, does rewait, etc.
@@ -245,6 +250,9 @@ static int io_poll_check_events(struct io_kiocb *req, io_tw_token_t tw)
 	if (unlikely(tw.cancel))
 		return -ECANCELED;
 
+	pr_debug("io_poll_check_events: entered opcode=%d user_data=0x%llx mshot_if=%d\n",
+		 req->opcode, (unsigned long long)req->cqe.user_data,
+		 req->dma.mshot_in_flight);
 	do {
 		v = atomic_read(&req->poll_refs);
 
@@ -310,7 +318,15 @@ static int io_poll_check_events(struct io_kiocb *req, io_tw_token_t tw)
 				return IOU_POLL_REMOVE_POLL_USE_RES;
 			else if (ret == IOU_REQUEUE)
 				return IOU_POLL_REQUEUE;
-			if (ret != IOU_RETRY && ret < 0)
+			/*
+			 * IOU_ISSUE_SKIP_COMPLETE means the opcode handed the
+			 * request to an async engine (e.g. DMA offload). Fall
+			 * through like IOU_RETRY so the poll_refs are dropped
+			 * and the poll stays armed for the next wakeup; the
+			 * DMA completion is responsible for posting the CQE.
+			 */
+			if (ret != IOU_RETRY && ret != IOU_ISSUE_SKIP_COMPLETE &&
+			    ret < 0)
 				return ret;
 		}
 

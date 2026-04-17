@@ -208,6 +208,14 @@ static inline void io_mshot_prep_retry(struct io_kiocb *req,
 	sr->len = sr->mshot_len;
 }
 
+void io_recv_mshot_dma_retry(struct io_kiocb *req)
+{
+	struct io_async_msghdr *kmsg = req->async_data;
+
+	if (kmsg)
+		io_mshot_prep_retry(req, kmsg);
+}
+
 static int io_net_import_vec(struct io_kiocb *req, struct io_async_msghdr *iomsg,
 			     const struct iovec __user *uiov, unsigned uvec_seg,
 			     int ddir)
@@ -1179,6 +1187,18 @@ int io_recv(struct io_kiocb *req, unsigned int issue_flags)
 	    (sr->flags & IORING_RECVSEND_POLL_FIRST))
 		return -EAGAIN;
 
+	/*
+	 * If a previous multishot DMA recv on this req is still queued in
+	 * the DMA engine, defer: io_uring_dma_prep() would clobber its
+	 * per-request bookkeeping. The DMA completion task_work (which
+	 * clears mshot_in_flight) runs after this one returns, so the
+	 * poll machinery will naturally pick up again on the next wakeup.
+	 */
+	if (req->dma.mshot_in_flight) {
+		pr_debug("io_recv: mshot_in_flight guard hit, deferring\n");
+		return IOU_RETRY;
+	}
+
 	sock = sock_from_file(req->file);
 	if (unlikely(!sock))
 		return -ENOTSOCK;
@@ -1241,8 +1261,19 @@ retry_multishot:
 		pr_debug("io_recv: dma_submit ret2=%d\n", ret2);
 		if (ret2 < 0) {
 			if (ret2 == -EIOCBQUEUED) {
-				pr_debug("io_recv: SKIP_COMPLETE (DMA queued)\n");
+				pr_debug("io_recv: SKIP_COMPLETE (DMA queued) res=%d mshot=%d cflags=0x%x inq=%d\n",
+					 req->dma.saved_res,
+					 !!(req->flags & REQ_F_APOLL_MULTISHOT),
+					 req->dma.saved_cflags,
+					 kmsg->msg.msg_inq);
 				io_put_kbuf(req, req->dma.saved_res, sel.buf_list);
+				/* For multishot recv, the completion task_work
+				 * needs to know this request has an in-flight
+				 * DMA so subsequent poll wakeups defer instead
+				 * of clobbering dma bookkeeping.
+				 */
+				if (req->flags & REQ_F_APOLL_MULTISHOT)
+					req->dma.mshot_in_flight = true;
 				/* Don't call io_req_msg_cleanup here:
 				 * the request is still in-flight (DMA pending).
 				 * async_data will be freed by io_clean_op when

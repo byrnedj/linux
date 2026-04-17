@@ -37,6 +37,12 @@ int io_recvmsg_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe);
 int io_recvmsg(struct io_kiocb *req, unsigned int issue_flags);
 int io_recv(struct io_kiocb *req, unsigned int issue_flags);
 
+/* Reset multishot recv bookkeeping after the DMA path posts an
+ * intermediate CQE with IORING_CQE_F_MORE. Must be called with
+ * ctx->uring_lock held.
+ */
+void io_recv_mshot_dma_retry(struct io_kiocb *req);
+
 void io_sendrecv_fail(struct io_kiocb *req);
 
 int io_accept_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe);

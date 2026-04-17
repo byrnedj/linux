@@ -2920,7 +2920,18 @@ found_ok_skb:
 				break;
 
 			if (skb_frags_readable(skb)) {
-				if (msg->msg_io_iocb) {
+				/*
+				 * Only take the DMA-iocb path when we will fully
+				 * consume this skb (used + offset == skb->len).
+				 * The DMA path transfers skb ownership from TCP
+				 * to the DMA engine via tcp_eat_recv_skb(free=false)
+				 * — that assumes the remaining skb data won't be
+				 * needed later. For a partial read (user iov
+				 * smaller than remaining skb bytes), fall back to
+				 * a plain CPU copy so the skb stays on the receive
+				 * queue for the next recvmsg to continue from.
+				 */
+				if (msg->msg_io_iocb && used + offset == skb->len) {
 					struct iov_iter src;
 					struct kvec *kv;
 					int kvec_len;
@@ -2949,6 +2960,9 @@ found_ok_skb:
 						 err, iov_iter_count(&msg->msg_iter));
 
 				} else {
+					/* Pure CPU copy: either no iocb, or a partial
+					 * skb read that must keep the skb on the queue.
+					 */
 					err = skb_copy_datagram_msg(skb, offset, msg, used);
 				}
 				if (err) {
@@ -3003,14 +3017,13 @@ skip_copy:
 		}
 
 		/*
-		 * if the (used + offset < skb->len) is true then we hit the
-		 * if (before(*seq, TCP_SKB_CB(skb)->seq)) {
-		 * error condition - to avoid this the user buffer has to be sized large
-		 * e.g., 2MB
+		 * If we only consumed part of the skb, leave it on the queue
+		 * so the next loop iteration (or the next recvmsg call) can
+		 * pick up where we left off. The DMA-iocb branch is only
+		 * entered when used + offset == skb->len (see above), so we
+		 * never transfer a partially-read skb to the DMA engine.
 		 */
-		if (msg->msg_io_iocb && (used + offset < skb->len))
-			printk(KERN_ERR "used %d offset %d skblen %d\n", used, offset, skb->len);
-		if (used + offset < skb->len && !msg->msg_io_iocb)
+		if (used + offset < skb->len)
 			continue;
 
 		if (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN)
