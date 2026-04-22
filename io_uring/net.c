@@ -208,12 +208,31 @@ static inline void io_mshot_prep_retry(struct io_kiocb *req,
 	sr->len = sr->mshot_len;
 }
 
-void io_recv_mshot_dma_retry(struct io_kiocb *req)
+/*
+ * Flush the pending aux CQE left by a multishot DMA recv completion.
+ * Called at the top of io_recv when req->dma.pending_aux_cqe is set.
+ * Posts the CQE, resets multishot bookkeeping, and clears the flag so
+ * io_recv can proceed with a fresh recv on the next burst of data.
+ * Returns true if the CQE was posted; false on CQ overflow (caller
+ * should terminate the multishot).
+ */
+static bool io_dma_flush_pending_aux_cqe(struct io_kiocb *req)
 {
 	struct io_async_msghdr *kmsg = req->async_data;
+	s32 res = req->dma.saved_res;
+	u32 cflags = req->dma.saved_cflags;
+
+	if (!io_req_post_cqe(req, res, cflags | IORING_CQE_F_MORE))
+		return false;
 
 	if (kmsg)
 		io_mshot_prep_retry(req, kmsg);
+
+	req->dma.saved_res = 0;
+	req->dma.saved_cflags = 0;
+	req->dma.pending_aux_cqe = false;
+	req->dma.mshot_in_flight = false;
+	return true;
 }
 
 static int io_net_import_vec(struct io_kiocb *req, struct io_async_msghdr *iomsg,
@@ -1188,11 +1207,41 @@ int io_recv(struct io_kiocb *req, unsigned int issue_flags)
 		return -EAGAIN;
 
 	/*
+	 * A multishot DMA recv that completed since our last run left an
+	 * aux CQE waiting to be posted (saved_res/saved_cflags). Flush it
+	 * before starting a new recv on this same req — done here (rather
+	 * than in the DMA completion task_work) so that CQE posting and
+	 * subsequent recv state changes happen in one well-defined place
+	 * under the poll state machine's ownership, avoiding the races
+	 * that an out-of-band poll_refs bump would introduce.
+	 */
+	if (req->dma.pending_aux_cqe) {
+		if (!io_dma_flush_pending_aux_cqe(req)) {
+			/*
+			 * CQ ring is full. Transition multishot to a terminal
+			 * completion: set the saved result on the req and
+			 * return IOU_COMPLETE so the poll state machine tears
+			 * the poll down and posts a final CQE (no F_MORE).
+			 */
+			s32 res = req->dma.saved_res;
+			u32 cflags = req->dma.saved_cflags;
+
+			pr_debug("io_recv: aux CQE flush failed (CQ full), terminating mshot\n");
+			req->dma.pending_aux_cqe = false;
+			req->dma.mshot_in_flight = false;
+			req->dma.saved_res = 0;
+			req->dma.saved_cflags = 0;
+			io_req_set_res(req, res, cflags);
+			return IOU_COMPLETE;
+		}
+		pr_debug("io_recv: flushed pending aux CQE\n");
+	}
+
+	/*
 	 * If a previous multishot DMA recv on this req is still queued in
-	 * the DMA engine, defer: io_uring_dma_prep() would clobber its
-	 * per-request bookkeeping. The DMA completion task_work (which
-	 * clears mshot_in_flight) runs after this one returns, so the
-	 * poll machinery will naturally pick up again on the next wakeup.
+	 * the DMA engine (e.g., poll fired for a second-chunk before the
+	 * first chunk's DMA callback ran), defer: io_uring_dma_prep() would
+	 * clobber its per-request bookkeeping.
 	 */
 	if (req->dma.mshot_in_flight) {
 		pr_debug("io_recv: mshot_in_flight guard hit, deferring\n");

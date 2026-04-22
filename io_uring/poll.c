@@ -230,6 +230,13 @@ static inline void io_poll_execute(struct io_kiocb *req, int res)
 
 void io_poll_kick(struct io_kiocb *req)
 {
+	/*
+	 * The req is expected to carry REQ_F_POLL_NO_LAZY (set durably in
+	 * io_uring_dma_prep for multishot DMA recv). That flag ensures any
+	 * task_work queued via io_poll_execute force-wakes the task rather
+	 * than deferring, which would deadlock waiting for an aux CQE that
+	 * only gets posted once this task_work actually runs.
+	 */
 	io_poll_execute(req, 0);
 }
 
@@ -282,6 +289,23 @@ static int io_poll_check_events(struct io_kiocb *req, io_tw_token_t tw)
 			}
 		}
 
+		/*
+		 * A DMA-offloaded multishot recv that completed since our last
+		 * pass left an aux CQE pending on the request. vfs_poll() below
+		 * would legitimately return 0 events (the socket was drained by
+		 * the prior sock_recvmsg, and new data may not have arrived
+		 * yet), which would cause us to exit without calling io_recv —
+		 * leaving pending_aux_cqe set and the user task stuck waiting
+		 * for a CQE that never gets posted. Bypass vfs_poll when there
+		 * is a pending aux CQE so io_poll_issue runs, io_recv's prelude
+		 * flushes the CQE, and the next recv is dispatched.
+		 */
+		if ((req->flags & REQ_F_APOLL_MULTISHOT) &&
+		    req->dma.pending_aux_cqe) {
+			req->cqe.res = req->apoll_events;
+			goto issue;
+		}
+
 		/* the mask was stashed in __io_poll_execute */
 		if (!req->cqe.res) {
 			struct poll_table_struct pt = { ._key = req->apoll_events };
@@ -299,6 +323,7 @@ static int io_poll_check_events(struct io_kiocb *req, io_tw_token_t tw)
 				return IOU_POLL_REISSUE;
 			}
 		}
+issue:
 		if (req->apoll_events & EPOLLONESHOT)
 			return IOU_POLL_DONE;
 

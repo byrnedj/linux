@@ -2859,9 +2859,11 @@ static void io_release_dma_chan(struct io_ring_ctx *ctx)
 {
 	unsigned long dma_sync_wait_timeout = jiffies + msecs_to_jiffies(5000);
 	struct io_dma_task *dma, *next;
+	struct device *dev;
 	int ret;
 
 	if (!IS_ERR_OR_NULL(ctx->dma.chan)) {
+		dev = ctx->dma.chan->device->dev;
 		dma = ctx->dma.head;
 		while (dma) {
 			next = dma->next;
@@ -2877,6 +2879,42 @@ static void io_release_dma_chan(struct io_ring_ctx *ctx)
 			if (ret == DMA_IN_PROGRESS)
 				pr_warn("Hung DMA offload task %p\n", dma);
 
+			/*
+			 * Release per-task resources (unmap, folio refs)
+			 * without dereferencing dma->req: the req may already
+			 * have been freed by cancel since ctx teardown runs
+			 * after refs drop. Mirrors __io_dma_task_complete's
+			 * cleanup minus the req-scope work.
+			 */
+			if (dma->is_batch) {
+				u8 i;
+
+				for (i = 0; i < dma->batch_nr; i++) {
+					if (!ctx->dma.use_phys_addrs)
+						dma_unmap_page(dev,
+							dma->batch_entries[i].src_dma,
+							dma->batch_entries[i].src_len,
+							DMA_TO_DEVICE);
+					folio_put(dma->batch_entries[i].folio);
+				}
+				kfree(dma->batch_entries);
+			} else {
+				if (dma->src_map_len && !ctx->dma.use_phys_addrs) {
+					if (dma->src_is_page)
+						dma_unmap_page(dev,
+							dma->src_map_addr,
+							dma->src_map_len,
+							DMA_TO_DEVICE);
+					else
+						dma_unmap_single(dev,
+							dma->src_map_addr,
+							dma->src_map_len,
+							DMA_TO_DEVICE);
+				}
+				if (dma->src_folio)
+					folio_put(dma->src_folio);
+			}
+
 			kmem_cache_free(dma_cachep, dma);
 			dma = next;
 		}
@@ -2886,8 +2924,12 @@ static void io_release_dma_chan(struct io_ring_ctx *ctx)
 		cancel_work_sync(&ctx->dma.poll_work);
 	}
 
-	if (ctx->dma.chan && !IS_ERR(ctx->dma.chan))
+	if (ctx->dma.chan && !IS_ERR(ctx->dma.chan)) {
+		pr_info("io_uring DMA: releasing channel %s requester=%s[%d] tgid=%d ctx=%p\n",
+			dma_chan_name(ctx->dma.chan), current->comm,
+			task_pid_nr(current), task_tgid_nr(current), ctx);
 		dma_release_channel(ctx->dma.chan);
+	}
 	ctx->dma.chan = NULL;
 }
 
@@ -2903,8 +2945,9 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 	ctx->dma.chan = dma_request_chan_by_mask(&mask);
 	if (IS_ERR(ctx->dma.chan)) {
 		rc = PTR_ERR(ctx->dma.chan);
-		pr_err("dma_request_chan_by_mask() failed: %d (%pe)\n",
-		       rc, ctx->dma.chan);
+		pr_err("dma_request_chan_by_mask() failed: %d (%pe) requester=%s[%d] tgid=%d\n",
+		       rc, ctx->dma.chan, current->comm,
+		       task_pid_nr(current), task_tgid_nr(current));
 		ctx->dma.chan = NULL;
 		goto failed;
 	}
@@ -2919,9 +2962,10 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 	}
 
 	dev_info(ctx->dma.chan->device->dev,
-		 "io_uring DMA: acquired channel %s (%s addressing)\n",
+		 "io_uring DMA: acquired channel %s (%s addressing) requester=%s[%d] tgid=%d ctx=%p\n",
 		 dma_chan_name(ctx->dma.chan),
-		 ctx->dma.use_phys_addrs ? "physical" : "IOMMU-mapped");
+		 ctx->dma.use_phys_addrs ? "physical" : "IOMMU-mapped",
+		 current->comm, task_pid_nr(current), task_tgid_nr(current), ctx);
 
 	ctx->dma.head = NULL;
 	ctx->dma.tail = NULL;
@@ -3105,6 +3149,17 @@ static __cold void io_ring_exit_work(struct work_struct *work)
 		do {
 			if (ctx->flags & IORING_SETUP_DEFER_TASKRUN)
 				io_move_task_work_from_local(ctx);
+			/*
+			 * Drain any DMA tasks whose hardware has completed so
+			 * their completion callbacks run (unmap, folio_put,
+			 * dma_refcnt--), and their reqs either post an aux CQE
+			 * or queue completion task_work. Without this, DMA-
+			 * offloaded multishot recv reqs hold refs to ctx
+			 * indefinitely during teardown.
+			 */
+			if (!IS_ERR_OR_NULL(ctx->dma.chan) &&
+			    READ_ONCE(ctx->dma.head))
+				__io_dma_poll(ctx);
 			cond_resched();
 		} while (io_uring_try_cancel_requests(ctx, NULL, true, false));
 

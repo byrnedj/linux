@@ -2065,24 +2065,30 @@ static int printkvec(struct sk_buff *skb, int off, int len, struct kvec *kvec)
 	int start = skb_headlen(skb);
 	int copy = start - off;
 	int i;
-	int ret;
 	int n = 0;
 	struct sk_buff *frag_iter;
 	struct kvec *saved_kvec = kvec;
 
-	ret = 0;
+	/*
+	 * Advance kvec only when we actually write a slot. Previous version
+	 * indexed frags as kvec[i] and did "kvec += i" after the loop, which
+	 * left uninitialized slots whenever the linear region was bypassed
+	 * (off >= headlen) or leading frags were skipped (end <= off). The
+	 * per-CPU backing kvec then delivered stale iov_base pointers that
+	 * could land inside a recycled slab object (e.g., task_struct),
+	 * tripping usercopy hardening during copy_to_iter.
+	 */
 	if (copy > 0) {
 		if (copy > len)
 			copy = len;
 
-		kvec[0].iov_base = skb->data + off;
-		kvec[0].iov_len = copy;
+		kvec->iov_base = skb->data + off;
+		kvec->iov_len = copy;
 
 		if ((len -= copy) == 0)
 			return 1;
 		off += copy;
 		kvec++;
-		ret++;
 	}
 
 
@@ -2100,9 +2106,9 @@ static int printkvec(struct sk_buff *skb, int off, int len, struct kvec *kvec)
 			if (copy > len)
 				copy = len;
 
-			kvec[i].iov_base = vaddr + skb_frag_off(frag) + off - start;
-			kvec[i].iov_len = copy;
-			ret++;
+			kvec->iov_base = vaddr + skb_frag_off(frag) + off - start;
+			kvec->iov_len = copy;
+			kvec++;
 			off += copy;
 			kunmap_local(vaddr);
 			len -= copy;
@@ -2110,7 +2116,6 @@ static int printkvec(struct sk_buff *skb, int off, int len, struct kvec *kvec)
 		start = end;
 	}
 
-	kvec += i;
 	skb_walk_frags(skb, frag_iter) {
 		int end;
 

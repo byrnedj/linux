@@ -14,7 +14,6 @@
 #include "io_uring.h"
 #include "kbuf.h"
 #include "rsrc.h"
-#include "net.h"
 #include "poll.h"
 
 #ifndef pr_fmt
@@ -76,6 +75,21 @@ void io_uring_dma_prep(struct io_kiocb *req)
 	if (IS_ERR_OR_NULL(req->ctx->dma.chan))
 		return;
 
+	/*
+	 * Mark this request as non-lazy for poll task_work. When a DMA
+	 * completion from an IRQ/workqueue kicks the poll, the task_work it
+	 * adds MUST force-wake the owning user task — the aux CQE that would
+	 * otherwise wake the task is produced by io_recv's prelude AFTER that
+	 * task_work runs (classic deferred-wake deadlock if lazy).
+	 *
+	 * It's not sufficient to set this flag inside io_poll_kick: an earlier
+	 * task_work may already be queued (from the initial poll wake / inline
+	 * issue) with LAZY_WAKE baked into its nr_tw. Setting the flag here,
+	 * before any task_work is queued for the multishot-DMA recv, ensures
+	 * every subsequent __io_poll_execute for this req uses non-lazy wake.
+	 */
+	req->flags |= REQ_F_POLL_NO_LAZY;
+
 	req->dma.dma_active = true;
 	req->dma.dma_refcnt = 0;
 	req->dma.dma_result = 0;
@@ -87,12 +101,14 @@ void io_uring_dma_prep(struct io_kiocb *req)
 	req->dma.cb_fn = NULL;
 	req->dma.cb_arg = NULL;
 	/*
-	 * io_recv guards on mshot_in_flight BEFORE calling dma_prep, so by
-	 * the time we get here it must already be false. Reset anyway to
-	 * cover fresh requests pulled from the slab cache whose prior user
-	 * may have set it.
+	 * mshot_in_flight and pending_aux_cqe are multishot-DMA lifecycle
+	 * flags. io_recv clears them at its prelude / after dispatch, so
+	 * by the time dma_prep is called again for the same req they must
+	 * already be false. Reset defensively in case a fresh io_kiocb
+	 * comes from the slab cache with stale bytes.
 	 */
 	req->dma.mshot_in_flight = false;
+	req->dma.pending_aux_cqe = false;
 }
 
 /*
@@ -105,6 +121,14 @@ unsigned int io_dma_cpu_threshold __read_mostly = 16384;
 /*
  * CPU copy helper: copies from kvec source to user destination.
  * Returns bytes copied, or negative error.
+ *
+ * Each copy_to_iter() is capped to stay within a single page so that
+ * __check_object_size() / check_heap_object() in usercopy hardening
+ * does not abort: for a compound source page, the check rejects any
+ * copy whose length exceeds page_size(compound_head) - offset. Skb
+ * linear segments (e.g., GRO-aggregated frames) can legitimately be
+ * larger than a single compound's page_size, so we slice at page
+ * boundaries rather than hand the full kvec segment to copy_to_iter.
  */
 static ssize_t io_dma_cpu_copy(struct iov_iter *dst_iter,
 			       struct iov_iter *src_iter, size_t len)
@@ -113,21 +137,35 @@ static ssize_t io_dma_cpu_copy(struct iov_iter *dst_iter,
 	ssize_t copied_total = 0;
 
 	while (left > 0) {
-		const size_t seg_avail = min_t(size_t, left,
+		size_t seg_avail = min_t(size_t, left,
 			iter_iov_len(src_iter));
-		size_t copied;
 		const void *base;
+		size_t seg_off = 0;
 
 		if (!seg_avail)
 			break;
 		base = iter_iov_addr(src_iter);
-		copied = copy_to_iter(base, seg_avail, dst_iter);
-		if (!copied)
-			return copied_total ? copied_total : -EFAULT;
-		iov_iter_advance(src_iter, copied);
-		copied_total += copied;
-		left -= copied;
-		if (copied < seg_avail)
+
+		while (seg_off < seg_avail) {
+			size_t page_off = offset_in_page(base + seg_off);
+			size_t chunk = min_t(size_t, seg_avail - seg_off,
+					     PAGE_SIZE - page_off);
+			size_t copied = copy_to_iter(base + seg_off, chunk,
+						     dst_iter);
+
+			if (!copied) {
+				if (seg_off)
+					iov_iter_advance(src_iter, seg_off);
+				return copied_total ? copied_total : -EFAULT;
+			}
+			seg_off += copied;
+			copied_total += copied;
+			left -= copied;
+			if (copied < chunk)
+				break;
+		}
+		iov_iter_advance(src_iter, seg_off);
+		if (seg_off < seg_avail)
 			break;
 	}
 	return copied_total;
@@ -442,9 +480,26 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	total_dma = 0;
 
 	/*
-	 * Walk all source kvec segments.  For each segment, split into
+	 * Defer small src segments (< threshold) to a CPU-copy pass after
+	 * all DMA has been submitted. Per-descriptor DMA overhead
+	 * (map/prep/submit/complete) loses to a cache-hot memcpy for
+	 * small segments. Submitting DMA first then copying small segments
+	 * overlaps the CPU work with in-flight DMA.
+	 */
+#define IO_DMA_CPU_DEFER_MAX	8
+	struct {
+		void *src;
+		size_t len;
+		size_t dst_off;
+	} cpu_segs[IO_DMA_CPU_DEFER_MAX];
+	unsigned int nr_cpu_segs = 0;
+	unsigned int i;
+
+	/*
+	 * Walk all source kvec segments. For each large segment, split into
 	 * DMA tasks at destination folio boundaries so no single transfer
-	 * crosses an IOMMU mapping.
+	 * crosses an IOMMU mapping. Small segments are queued for the
+	 * CPU-copy pass below.
 	 */
 	while (total_dma < len) {
 		void *seg_base;
@@ -456,6 +511,18 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 
 		seg_base = (void *)iter_iov_addr(src_iter);
 		seg_remaining = min_t(size_t, seg_avail, len - total_dma);
+
+		if (seg_remaining < threshold &&
+		    nr_cpu_segs < IO_DMA_CPU_DEFER_MAX) {
+			cpu_segs[nr_cpu_segs].src = seg_base;
+			cpu_segs[nr_cpu_segs].len = seg_remaining;
+			cpu_segs[nr_cpu_segs].dst_off = total_dma;
+			nr_cpu_segs++;
+			total_dma += seg_remaining;
+			iov_iter_advance(src_iter, seg_remaining);
+			continue;
+		}
+
 		seg_off = 0;
 
 		/* Inner loop: split this source segment at folio boundaries */
@@ -487,11 +554,24 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 		iov_iter_advance(src_iter, seg_off);
 	}
 
-	/* Advance destination iterator past all DMA'd bytes */
+	/* Advance destination iterator past all processed bytes */
 	iov_iter_advance(dst_iter, total_dma);
 
-	/* Kick the DMA engine once after all tasks are submitted */
-	dma_async_issue_pending(ctx->dma.chan);
+	/*
+	 * Kick the DMA engine before the CPU pass so hardware starts
+	 * immediately; the CPU copies land in disjoint byte ranges of the
+	 * user buffer and overlap with the in-flight DMA writes.
+	 */
+	if (req->dma.dma_refcnt > 0)
+		dma_async_issue_pending(ctx->dma.chan);
+
+	for (i = 0; i < nr_cpu_segs; i++) {
+		void __user *dst_ua =
+			(void __user *)(dst_base_addr + cpu_segs[i].dst_off);
+
+		WARN_ON_ONCE(copy_to_user(dst_ua, cpu_segs[i].src,
+					  cpu_segs[i].len));
+	}
 
 	return total_dma;
 
@@ -824,57 +904,6 @@ put_folios:
 	return total_read ? total_read : error;
 }
 
-/*
- * Task_work fired when a DMA-offloaded multishot recv completes.
- * Posts an intermediate CQE with IORING_CQE_F_MORE and resets the
- * multishot bookkeeping so the next poll wakeup can dispatch another
- * recv into the same request. If posting the aux CQE fails (CQ full),
- * fall back to a terminal completion and let userspace re-arm.
- */
-static void io_dma_mshot_retry_tw(struct io_tw_req tw_req, io_tw_token_t tw)
-{
-	struct io_kiocb *req = tw_req.req;
-	s32 res = req->dma.saved_res;
-	u32 cflags = req->dma.saved_cflags;
-	bool posted;
-
-	io_tw_lock(req->ctx, tw);
-
-	pr_debug("mshot_retry_tw: opcode=%d res=%d cflags=0x%x user_data=0x%llx flags=0x%llx\n",
-		 req->opcode, res, cflags,
-		 (unsigned long long)req->cqe.user_data,
-		 (unsigned long long)req->flags);
-
-	posted = io_req_post_cqe(req, res, cflags | IORING_CQE_F_MORE);
-	if (!posted) {
-		/* CQ ring is full — terminate multishot with a final CQE. */
-		pr_debug("mshot_retry_tw: io_req_post_cqe FAILED, terminating multishot\n");
-		io_req_set_res(req, res, cflags);
-		io_req_complete_defer(req);
-		return;
-	}
-
-	io_recv_mshot_dma_retry(req);
-
-	/* Clear per-recv DMA scratch so the next io_recv starts clean. */
-	req->dma.saved_res = 0;
-	req->dma.saved_cflags = 0;
-	req->dma.mshot_in_flight = false;
-	pr_debug("mshot_retry_tw: posted aux CQE F_MORE, mshot_in_flight cleared\n");
-
-	/*
-	 * If the socket still had data buffered when the recv returned
-	 * (F_SOCK_NONEMPTY), no new waker will fire for that already-
-	 * queued data. Kick the poll state machine to re-issue io_recv
-	 * and drain it — mirrors the goto retry_multishot path in
-	 * io_recv_finish.
-	 */
-	if (cflags & IORING_CQE_F_SOCK_NONEMPTY) {
-		pr_debug("mshot_retry_tw: F_SOCK_NONEMPTY set, kicking poll\n");
-		io_poll_kick(req);
-	}
-}
-
 static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
 				   int ret)
 {
@@ -945,27 +974,33 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
 			io_req_set_res(req, req->dma.dma_result,
 				       req->dma.saved_cflags);
 			req->io_task_work.func = io_req_task_complete;
+			io_req_task_work_add(req);
 		} else if (req->flags & REQ_F_APOLL_MULTISHOT) {
 			/*
-			 * Multishot recv via DMA: post an intermediate CQE
-			 * with IORING_CQE_F_MORE and leave the request in
-			 * flight under the poll machinery. The saved res/cflags
-			 * are consumed by io_dma_mshot_retry_tw.
+			 * Multishot recv via DMA: mark the request as needing
+			 * an aux CQE flush on next io_recv entry, then drive
+			 * re-entry through the canonical poll state machine.
+			 * io_poll_kick() takes poll ownership and schedules
+			 * io_poll_task_func, which will call io_recv; the
+			 * prelude in io_recv flushes the aux CQE before the
+			 * next sock_recvmsg. This keeps DMA completion inside
+			 * the same lifecycle dance as a real socket wake and
+			 * avoids a separate retry task_work racing with poll.
 			 */
-			req->io_task_work.func = io_dma_mshot_retry_tw;
+			req->dma.pending_aux_cqe = true;
+			io_poll_kick(req);
 		} else {
+			/*
+			 * One-shot recv: terminal completion via task_work.
+			 * __io_dma_poll() may run from a workqueue without
+			 * ctx->uring_lock, so io_req_task_complete() defers
+			 * the CQE post until the task_work loop acquires it.
+			 */
 			io_req_set_res(req, req->dma.saved_res,
 				       req->dma.saved_cflags);
 			req->io_task_work.func = io_req_task_complete;
+			io_req_task_work_add(req);
 		}
-		/*
-		 * Complete via task_work rather than io_req_complete_defer(),
-		 * because __io_dma_poll() runs from a work queue without
-		 * ctx->uring_lock held.  io_req_task_complete() will call
-		 * io_req_complete_defer() once the lock is acquired in the
-		 * task_work run loop.
-		 */
-		io_req_task_work_add(req);
 	}
 }
 

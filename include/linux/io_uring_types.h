@@ -283,6 +283,7 @@ struct io_dma_kiocb {
 	unsigned short		buf_group;	/* for DMA addr lookup */
 	bool			dma_active;	/* DMA copy armed for this req */
 	bool			mshot_in_flight; /* multishot recv awaiting DMA completion */
+	bool			pending_aux_cqe; /* DMA done, io_recv must post aux CQE */
 	u64			dst_user_addr;	/* user VA for reg buf DMA lookup */
 	void (*cb_fn)(struct kiocb *, void *, int);
 	void			*cb_arg;
