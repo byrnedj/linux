@@ -229,7 +229,7 @@ idxd_dma_prep_memcpy_sg(struct dma_chan *chan,
 
 	dst_avail = sg_dma_len(dst_sg);
 	src_avail = sg_dma_len(src_sg);
-	char*       devname = dev_name(chan->device->dev);
+	const char *devname = dev_name(chan->device->dev);
 	pr_debug("prep_memcpy_sg: src_nent %d, dst_nents %d\n", src_nents, dst_nents);
 	   pr_debug("prep_memcpy_sg: chan=%p client_count=%u dev=%s cookie=%d\n",
 			             chan, chan->client_count, devname, chan->cookie);
