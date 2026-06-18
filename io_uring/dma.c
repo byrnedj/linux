@@ -22,6 +22,84 @@
 
 struct kmem_cache *dma_cachep;
 
+/* Datapath alloc: pool first, then non-blocking slab, never sleeps. */
+static struct io_dma_task *io_dma_task_alloc(struct io_ring_ctx *ctx)
+{
+	struct io_dma_channel *d = &ctx->dma;
+	struct io_dma_task *t;
+	unsigned long flags;
+
+	spin_lock_irqsave(&d->free_lock, flags);
+	t = d->free_list;
+	if (t) {
+		d->free_list = t->next;
+		d->free_count--;
+	}
+	spin_unlock_irqrestore(&d->free_lock, flags);
+
+	if (t) {
+		memset(t, 0, sizeof(*t));	/* match old kmem_cache_zalloc */
+		return t;
+	}
+
+	/*
+	 * Pool exhausted: NOWAIT so we never enter reclaim on the datapath.
+	 * NOWARN because failure is expected and handled (CPU-copy fallback).
+	 */
+	return kmem_cache_zalloc(dma_cachep, GFP_NOWAIT | __GFP_NOWARN);
+}
+
+/* Datapath free: park back into the pool up to the cap, else slab. */
+static void io_dma_task_free(struct io_ring_ctx *ctx, struct io_dma_task *t)
+{
+	struct io_dma_channel *d = &ctx->dma;
+	unsigned long flags;
+
+	spin_lock_irqsave(&d->free_lock, flags);
+	if (d->free_count < d->free_max) {
+		t->next = d->free_list;
+		d->free_list = t;
+		d->free_count++;
+		t = NULL;
+	}
+	spin_unlock_irqrestore(&d->free_lock, flags);
+
+	if (t)
+		kmem_cache_free(dma_cachep, t);
+}
+
+/*
+ * Prefill the per-ctx io_dma_task pool, sized to the ring's CQ depth.
+ * Called from io_allocate_dma_chan() at ring setup (process context, no
+ * locks held), so GFP_KERNEL is fine here.
+ */
+void io_dma_init_freelist(struct io_ring_ctx *ctx, struct io_uring_params *p)
+{
+	struct io_dma_channel *d = &ctx->dma;
+	unsigned int n, i;
+
+	spin_lock_init(&d->free_lock);
+	d->free_list = NULL;
+	d->free_count = 0;
+
+	/*
+	 * Cover roughly the in-flight CQ depth; clamp to a sane range.
+	 * io_dma_task is tiny (~96B), so even 8192 is ~768KB worst case.
+	 */
+	n = clamp(p->cq_entries * 2u, 256u, 8192u);
+	d->free_max = n;
+
+	for (i = 0; i < n; i++) {
+		struct io_dma_task *t = kmem_cache_alloc(dma_cachep, GFP_KERNEL);
+
+		if (!t)
+			break;		/* partial prefill OK -- NOWAIT covers rest */
+		t->next = d->free_list;
+		d->free_list = t;
+		d->free_count++;
+	}
+}
+
 void io_dma_poll_workfn(struct work_struct *w)
 {
 	/* work_struct is embedded in ctx->dma (struct io_dma_channel) */
@@ -228,7 +306,7 @@ static size_t io_dma_submit_chunk(struct io_kiocb *req,
 	if (dma_mapping_error(dev, src_dma))
 		return 0;
 
-	dma = kmem_cache_zalloc(dma_cachep, GFP_KERNEL);
+	dma = io_dma_task_alloc(req->ctx);
 	if (!dma) {
 		dma_unmap_single(dev, src_dma, chunk_len, DMA_TO_DEVICE);
 		return 0;
@@ -247,7 +325,7 @@ static size_t io_dma_submit_chunk(struct io_kiocb *req,
 		dma->cookie = 0;
 	} else if (rc != 0) {
 		dma_unmap_single(dev, src_dma, chunk_len, DMA_TO_DEVICE);
-		kmem_cache_free(dma_cachep, dma);
+		io_dma_task_free(req->ctx, dma);
 		return 0;
 	}
 
@@ -288,7 +366,7 @@ static size_t __maybe_unused io_dma_submit_folio_chunk(struct io_kiocb *req,
 	if (dma_mapping_error(dev, src_dma))
 		return 0;
 
-	dma = kmem_cache_zalloc(dma_cachep, GFP_KERNEL);
+	dma = io_dma_task_alloc(req->ctx);
 	if (!dma) {
 		dma_unmap_page(dev, src_dma, chunk_len, DMA_TO_DEVICE);
 		return 0;
@@ -313,7 +391,7 @@ static size_t __maybe_unused io_dma_submit_folio_chunk(struct io_kiocb *req,
 	} else if (rc != 0) {
 		dma_unmap_page(dev, src_dma, chunk_len, DMA_TO_DEVICE);
 		folio_put(folio);
-		kmem_cache_free(dma_cachep, dma);
+		io_dma_task_free(req->ctx, dma);
 		return 0;
 	}
 
@@ -351,7 +429,8 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 	 * Initialize SG tables so sg_next()/sg_is_last() work correctly,
 	 * then populate DMA addresses from the entries array.
 	 */
-	sgls = kmalloc_array(nr_entries * 2, sizeof(*sgls), GFP_KERNEL);
+	sgls = kmalloc_array(nr_entries * 2, sizeof(*sgls),
+			     GFP_NOWAIT | __GFP_NOWARN);
 	if (!sgls)
 		return -ENOMEM;
 	src_sgl = sgls;
@@ -380,12 +459,12 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 	kfree(sgls);
 
 	heap_entries = kmalloc_array(nr_entries, sizeof(*heap_entries),
-				     GFP_KERNEL);
+				     GFP_NOWAIT | __GFP_NOWARN);
 	if (!heap_entries)
 		return -ENOMEM;
 	memcpy(heap_entries, entries, nr_entries * sizeof(*heap_entries));
 
-	dma = kmem_cache_zalloc(dma_cachep, GFP_KERNEL);
+	dma = io_dma_task_alloc(req->ctx);
 	if (!dma) {
 		kfree(heap_entries);
 		return -ENOMEM;
@@ -401,7 +480,7 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 	dma->cookie = dmaengine_submit(tx);
 	if (dma_submit_error(dma->cookie)) {
 		kfree(heap_entries);
-		kmem_cache_free(dma_cachep, dma);
+		io_dma_task_free(req->ctx, dma);
 		return -EFAULT;
 	}
 
@@ -625,7 +704,7 @@ static ssize_t io_dma_submit_single_entry(struct io_kiocb *req,
 	if (!tx)
 		return -EAGAIN;
 
-	dma = kmem_cache_zalloc(dma_cachep, GFP_KERNEL);
+	dma = io_dma_task_alloc(req->ctx);
 	if (!dma)
 		return -ENOMEM;
 
@@ -645,7 +724,7 @@ static ssize_t io_dma_submit_single_entry(struct io_kiocb *req,
 	dma->cookie = dmaengine_submit(tx);
 	if (dma_submit_error(dma->cookie)) {
 		folio_put(entry->folio);
-		kmem_cache_free(dma_cachep, dma);
+		io_dma_task_free(req->ctx, dma);
 		return -EFAULT;
 	}
 
@@ -753,7 +832,12 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 	if (unlikely(iocb->ki_pos >= inode->i_sb->s_maxbytes))
 		return 0;
 
-	entries = kmalloc_array(IO_DMA_BATCH_MAX, sizeof(*entries), GFP_KERNEL);
+	/*
+	 * NOWAIT: never block on the read datapath. On failure the caller
+	 * (io_read) falls through to the normal buffered-read path.
+	 */
+	entries = kmalloc_array(IO_DMA_BATCH_MAX, sizeof(*entries),
+				GFP_NOWAIT | __GFP_NOWARN);
 	if (!entries)
 		return -ENOMEM;
 
@@ -952,7 +1036,7 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
 	}
 
 	/* Free the task before touching refcnt -- task_len saved above */
-	kmem_cache_free(dma_cachep, dma);
+	io_dma_task_free(req->ctx, dma);
 	req->dma.dma_refcnt--;
 
 	if (req->dma.dma_refcnt == 0) {

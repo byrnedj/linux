@@ -270,6 +270,15 @@ struct io_dma_channel {
 	spinlock_t		lock;
 	struct io_dma_task	*head;
 	struct io_dma_task	*tail;
+
+	/* Preallocated io_dma_task freelist, sized to ring depth.
+	 * Separate lock: __io_dma_task_complete() runs both under and
+	 * outside ->lock, so the pool must not reuse ->lock.
+	 */
+	spinlock_t		free_lock;
+	struct io_dma_task	*free_list;	/* chained via ->next */
+	unsigned int		free_count;	/* parked objects */
+	unsigned int		free_max;	/* pool cap == target size */
 };
 
 struct io_dma_kiocb {
