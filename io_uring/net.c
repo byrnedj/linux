@@ -939,7 +939,7 @@ static inline bool io_recv_finish(struct io_kiocb *req,
 
 	/* Finish the request / stop multishot. */
 finish:
-	pr_debug("io_recv_finish: opcode=%d res=%d cflags=0x%x req_flags=0x%llx buf_index=%d\n",
+	pr_debug("io_recv_finish: opcode=%d res=%zd cflags=0x%x req_flags=0x%llx buf_index=%d\n",
 		req->opcode, sel->val, cflags,
 		(unsigned long long)req->flags, req->buf_index);
 	io_req_set_res(req, sel->val, cflags);
