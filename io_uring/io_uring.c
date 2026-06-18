@@ -2246,6 +2246,15 @@ static void io_release_dma_chan(struct io_ring_ctx *ctx)
 		ctx->dma.head = NULL;
 		ctx->dma.tail = NULL;
 		cancel_work_sync(&ctx->dma.poll_work);
+
+		/* Free the parked io_dma_task pool back to slab. */
+		while (ctx->dma.free_list) {
+			struct io_dma_task *t = ctx->dma.free_list;
+
+			ctx->dma.free_list = t->next;
+			kmem_cache_free(dma_cachep, t);
+		}
+		ctx->dma.free_count = 0;
 	}
 
 	if (ctx->dma.chan && !IS_ERR(ctx->dma.chan)) {
@@ -2296,6 +2305,7 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 	spin_lock_init(&ctx->dma.lock);
 	INIT_WORK(&ctx->dma.poll_work, io_dma_poll_workfn);
 	atomic_set(&ctx->dma.poll_armed, 0);
+	io_dma_init_freelist(ctx, p);
 
 	return 0;
 failed:
