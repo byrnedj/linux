@@ -2796,6 +2796,88 @@ DEFINE_DEBUGFS_ATTRIBUTE(io_dma_fmw_wait_ms_fops, io_dma_fmw_wait_ms_get,
 			 io_dma_fmw_wait_ms_set, "%llu\n");
 
 /*
+ * Per-transaction DMA latency tracking, binned by transfer size. A
+ * transaction is one io_dma_task, either a descriptor or a batch. It
+ * is stamped at hardware submit and sampled when the poller observes
+ * completion, so the bins measure detection-inclusive latency.
+ *
+ * Sampling costs two clock reads per transaction, which is noise
+ * against a multi-kilobyte transfer but is unconditional on the
+ * datapath. Setting io_uring_dma/stats to 0 skips both reads and
+ * leaves the histogram frozen.
+ */
+static unsigned int io_dma_stats_enabled __read_mostly = 1;
+
+static const struct {
+	size_t		max;	/* exclusive upper bound in bytes; 0 == catch-all */
+	const char	*label;
+} io_dma_lat_bins[] = {
+	{    4096, "<4KB"       },
+	{    8192, "4-8KB"      },
+	{   16384, "8-16KB"     },
+	{   32768, "16-32KB"    },
+	{   65536, "32-64KB"    },
+	{  131072, "64-128KB"   },
+	{  262144, "128-256KB"  },
+	{  524288, "256-512KB"  },
+	{ 1048576, "512KB-1MB"  },
+	{       0, ">=1MB"      },
+};
+#define IO_DMA_LAT_NBINS	ARRAY_SIZE(io_dma_lat_bins)
+
+struct io_dma_lat_stats {
+	atomic64_t	count[IO_DMA_LAT_NBINS];
+	atomic64_t	sum_ns[IO_DMA_LAT_NBINS];
+};
+
+static struct io_dma_lat_stats io_dma_lat_dma;	/* DSA transactions (per task) */
+
+static unsigned int io_dma_lat_bin(size_t len)
+{
+	unsigned int i;
+
+	for (i = 0; i < IO_DMA_LAT_NBINS - 1; i++)
+		if (len < io_dma_lat_bins[i].max)
+			return i;
+	return IO_DMA_LAT_NBINS - 1;	/* catch-all */
+}
+
+static void io_dma_lat_record(struct io_dma_lat_stats *s, size_t len, u64 ns)
+{
+	unsigned int b = io_dma_lat_bin(len);
+
+	atomic64_inc(&s->count[b]);
+	atomic64_add(ns, &s->sum_ns[b]);
+}
+
+static void io_dma_lat_show_one(struct seq_file *m, const char *name,
+				struct io_dma_lat_stats *s)
+{
+	unsigned int i;
+
+	seq_printf(m, "%s:\n", name);
+	seq_printf(m, "  %-12s %12s %16s\n", "bin", "count", "avg_ns");
+	for (i = 0; i < IO_DMA_LAT_NBINS; i++) {
+		u64 count = atomic64_read(&s->count[i]);
+		u64 sum = atomic64_read(&s->sum_ns[i]);
+		u64 avg = count ? div64_u64(sum, count) : 0;
+
+		seq_printf(m, "  %-12s %12llu %16llu\n",
+			   io_dma_lat_bins[i].label, count, avg);
+	}
+}
+
+static void io_dma_lat_reset(struct io_dma_lat_stats *s)
+{
+	unsigned int i;
+
+	for (i = 0; i < IO_DMA_LAT_NBINS; i++) {
+		atomic64_set(&s->count[i], 0);
+		atomic64_set(&s->sum_ns[i], 0);
+	}
+}
+
+/*
  * Filemap DMA-write gate and result counters. These are surfaced
  * through the io_uring_dma/latency debugfs stats file and zeroed by
  * its _reset companion.
@@ -2822,6 +2904,7 @@ static int io_dma_lat_show(struct seq_file *m, void *v)
 {
 	unsigned int i;
 
+	io_dma_lat_show_one(m, "dma", &io_dma_lat_dma);
 	seq_puts(m, "filemap_write:\n");
 	for (i = 0; i < IO_DMA_FMW_NR; i++)
 		seq_printf(m, "  %-12s %12llu\n", io_dma_fmw_names[i],
@@ -2836,6 +2919,7 @@ static ssize_t io_dma_lat_reset_write(struct file *file,
 {
 	unsigned int i;
 
+	io_dma_lat_reset(&io_dma_lat_dma);
 	for (i = 0; i < IO_DMA_FMW_NR; i++)
 		atomic64_set(&io_dma_fmw[i], 0);
 	return count;
@@ -2873,6 +2957,7 @@ void io_dma_debugfs_init(void)
 	debugfs_create_file_unsafe("fmw_wait_ms", 0644, dir, NULL,
 				   &io_dma_fmw_wait_ms_fops);
 	debugfs_create_u32("stripe_chans", 0644, dir, &io_dma_stripe_chans);
+	debugfs_create_u32("stats", 0644, dir, &io_dma_stats_enabled);
 	debugfs_create_file("latency", 0444, dir, NULL, &io_dma_lat_fops);
 	debugfs_create_file("latency_reset", 0200, dir, NULL,
 			    &io_dma_lat_reset_fops);
@@ -3110,6 +3195,10 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 	dma->batch_nr = nr_entries;
 	dma->batch_entries = heap_entries;
 
+	/* Stamp before the doorbell so the sample covers the whole
+	 * hardware transfer. A zero stamp means sampling is off.
+	 */
+	dma->submit_ns = READ_ONCE(io_dma_stats_enabled) ? ktime_get_ns() : 0;
 	dma->cookie = dmaengine_submit(tx);
 	if (dma_submit_error(dma->cookie)) {
 		kfree(heap_entries);
@@ -3180,6 +3269,10 @@ static ssize_t io_dma_submit_single_entry(struct io_kiocb *req,
 	dma->src_is_page = true;
 	dma->is_batch = false;
 
+	/* Stamp before the doorbell so the sample covers the whole
+	 * hardware transfer. A zero stamp means sampling is off.
+	 */
+	dma->submit_ns = READ_ONCE(io_dma_stats_enabled) ? ktime_get_ns() : 0;
 	dma->cookie = dmaengine_submit(tx);
 	if (dma_submit_error(dma->cookie)) {
 		folio_put(entry->folio);
@@ -4893,7 +4986,7 @@ static void io_dma_task_release_res(struct io_ring_ctx *ctx, struct device *dev,
  * source resources via io_dma_task_release_res().
  */
 static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
-				   int ret)
+				   int ret, u64 done_ns)
 {
 	struct io_kiocb *req;
 	u32 task_len;
@@ -4902,6 +4995,9 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
 	task_len = dma->len;
 
 	if (ret == DMA_COMPLETE) {
+		if (dma->submit_ns)
+			io_dma_lat_record(&io_dma_lat_dma, task_len,
+					  done_ns - dma->submit_ns);
 		pr_debug("dma task complete: len=%u result=%d\n",
 			 task_len, req->dma.dma_result);
 		if (req->dma.dma_result >= 0)
@@ -5159,6 +5255,8 @@ int __io_dma_poll(struct io_ring_ctx *ctx)
 		count = 0;
 		pr_debug("poll: head=%p\n", dma);
 		while (dma != NULL) {
+			u64 done_ns;
+
 			next = dma->next;
 
 			/* There is no lock around the hardware poll. The
@@ -5191,6 +5289,12 @@ int __io_dma_poll(struct io_ring_ctx *ctx)
 			if (!next)
 				ctx->dma.poll_list_tail = prev;
 
+			/* Sample the completion time here, before the
+			 * unmaps and the lock wait below, or the latency
+			 * histograms measure those as well.
+			 */
+			done_ns = dma->submit_ns ? ktime_get_ns() : 0;
+
 			/* The heavy resource release of IOMMU unmaps and
 			 * folio puts runs unlocked. ctx->dma.lock then
 			 * covers only the refcount handshake with the
@@ -5199,7 +5303,7 @@ int __io_dma_poll(struct io_ring_ctx *ctx)
 			io_dma_task_release_res(ctx,
 					dma->chan->device->dev, dma);
 			spin_lock_irqsave(&ctx->dma.lock, flags);
-			__io_dma_task_complete(dev, dma, ret);
+			__io_dma_task_complete(dev, dma, ret, done_ns);
 			spin_unlock_irqrestore(&ctx->dma.lock, flags);
 
 			count++;
