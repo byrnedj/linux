@@ -11,6 +11,9 @@
 #include <linux/swap.h>
 #include <linux/fs.h>
 #include <linux/scatterlist.h>
+#include <linux/timekeeping.h>
+#include <linux/debugfs.h>
+#include <linux/seq_file.h>
 #include "io_uring.h"
 #include "kbuf.h"
 #include "rsrc.h"
@@ -21,6 +24,117 @@
 #endif
 
 struct kmem_cache *dma_cachep;
+
+/*
+ * Per-transaction latency tracking, split by copy engine (DMA vs CPU) and
+ * binned by transfer size. A "transaction" is one io_dma_task for the DMA
+ * side (descriptor or batch) and one io_dma_cpu_copy() call for the CPU side.
+ *
+ * Bins are contiguous so no transaction is uncounted -- this fills in the
+ * <4KB and 32-64KB bins that complete the requested set
+ * (4-8/8-16/16-32/64-128/128-256/256-512/512-1024KB and 1024KB+).
+ */
+static const struct {
+	size_t		max;	/* exclusive upper bound in bytes; 0 == catch-all */
+	const char	*label;
+} io_dma_lat_bins[] = {
+	{    4096, "<4KB"        },
+	{    8192, "4-8KB"      },
+	{   16384, "8-16KB"     },
+	{   32768, "16-32KB"    },
+	{   65536, "32-64KB"    },
+	{  131072, "64-128KB"   },
+	{  262144, "128-256KB"  },
+	{  524288, "256-512KB"  },
+	{ 1048576, "512KB-1MB"  },
+	{       0, ">=1MB"      },
+};
+#define IO_DMA_LAT_NBINS	ARRAY_SIZE(io_dma_lat_bins)
+
+struct io_dma_lat_stats {
+	atomic64_t	count[IO_DMA_LAT_NBINS];
+	atomic64_t	sum_ns[IO_DMA_LAT_NBINS];
+};
+
+static struct io_dma_lat_stats io_dma_lat_dma;	/* DSA transactions */
+static struct io_dma_lat_stats io_dma_lat_cpu;	/* CPU-copy transactions */
+
+static unsigned int io_dma_lat_bin(size_t len)
+{
+	unsigned int i;
+
+	for (i = 0; i < IO_DMA_LAT_NBINS - 1; i++)
+		if (len < io_dma_lat_bins[i].max)
+			return i;
+	return IO_DMA_LAT_NBINS - 1;	/* catch-all */
+}
+
+static void io_dma_lat_record(struct io_dma_lat_stats *s, size_t len, u64 ns)
+{
+	unsigned int b = io_dma_lat_bin(len);
+
+	atomic64_inc(&s->count[b]);
+	atomic64_add(ns, &s->sum_ns[b]);
+}
+
+static void io_dma_lat_show_one(struct seq_file *m, const char *name,
+				struct io_dma_lat_stats *s)
+{
+	unsigned int i;
+
+	seq_printf(m, "%s:\n", name);
+	seq_printf(m, "  %-12s %12s %16s\n", "bin", "count", "avg_ns");
+	for (i = 0; i < IO_DMA_LAT_NBINS; i++) {
+		u64 count = atomic64_read(&s->count[i]);
+		u64 sum = atomic64_read(&s->sum_ns[i]);
+		u64 avg = count ? div64_u64(sum, count) : 0;
+
+		seq_printf(m, "  %-12s %12llu %16llu\n",
+			   io_dma_lat_bins[i].label, count, avg);
+	}
+}
+
+static int io_dma_lat_show(struct seq_file *m, void *v)
+{
+	io_dma_lat_show_one(m, "dma", &io_dma_lat_dma);
+	io_dma_lat_show_one(m, "cpu", &io_dma_lat_cpu);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(io_dma_lat);
+
+static void io_dma_lat_reset(struct io_dma_lat_stats *s)
+{
+	unsigned int i;
+
+	for (i = 0; i < IO_DMA_LAT_NBINS; i++) {
+		atomic64_set(&s->count[i], 0);
+		atomic64_set(&s->sum_ns[i], 0);
+	}
+}
+
+static ssize_t io_dma_lat_reset_write(struct file *file,
+				      const char __user *ubuf,
+				      size_t count, loff_t *ppos)
+{
+	io_dma_lat_reset(&io_dma_lat_dma);
+	io_dma_lat_reset(&io_dma_lat_cpu);
+	return count;
+}
+
+static const struct file_operations io_dma_lat_reset_fops = {
+	.owner		= THIS_MODULE,
+	.open		= simple_open,
+	.write		= io_dma_lat_reset_write,
+	.llseek		= noop_llseek,
+};
+
+void io_dma_debugfs_init(void)
+{
+	debugfs_create_file("io_uring_dma_latency", 0444, NULL, NULL,
+			    &io_dma_lat_fops);
+	debugfs_create_file("io_uring_dma_latency_reset", 0200, NULL, NULL,
+			    &io_dma_lat_reset_fops);
+}
 
 /* Datapath alloc: pool first, then non-blocking slab, never sleeps. */
 static struct io_dma_task *io_dma_task_alloc(struct io_ring_ctx *ctx)
@@ -126,6 +240,7 @@ static int __io_dma_task_submit(struct dma_chan *chan, struct io_dma_task *dma)
 		return -EAGAIN;
 	}
 
+	dma->submit_ns = ktime_get_ns();
 	dma->cookie = dmaengine_submit(tx);
 	if (dma_submit_error(dma->cookie)) {
 		pr_debug("dma submit error: cookie=%d len=%u\n",
@@ -213,6 +328,7 @@ static ssize_t io_dma_cpu_copy(struct iov_iter *dst_iter,
 {
 	size_t left = len;
 	ssize_t copied_total = 0;
+	u64 t0 = ktime_get_ns();
 
 	while (left > 0) {
 		size_t seg_avail = min_t(size_t, left,
@@ -246,6 +362,9 @@ static ssize_t io_dma_cpu_copy(struct iov_iter *dst_iter,
 		if (seg_off < seg_avail)
 			break;
 	}
+	if (copied_total > 0)
+		io_dma_lat_record(&io_dma_lat_cpu, copied_total,
+				  ktime_get_ns() - t0);
 	return copied_total;
 }
 
@@ -477,6 +596,7 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 	dma->batch_nr = nr_entries;
 	dma->batch_entries = heap_entries;
 
+	dma->submit_ns = ktime_get_ns();
 	dma->cookie = dmaengine_submit(tx);
 	if (dma_submit_error(dma->cookie)) {
 		kfree(heap_entries);
@@ -721,6 +841,7 @@ static ssize_t io_dma_submit_single_entry(struct io_kiocb *req,
 	dma->src_is_page = true;
 	dma->is_batch = false;
 
+	dma->submit_ns = ktime_get_ns();
 	dma->cookie = dmaengine_submit(tx);
 	if (dma_submit_error(dma->cookie)) {
 		folio_put(entry->folio);
@@ -1026,6 +1147,9 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
 	}
 
 	if (ret == DMA_COMPLETE) {
+		if (dma->submit_ns)
+			io_dma_lat_record(&io_dma_lat_dma, task_len,
+					  ktime_get_ns() - dma->submit_ns);
 		pr_debug("dma task complete: len=%u result=%d\n",
 			 task_len, req->dma.dma_result);
 		if (req->dma.dma_result >= 0)
