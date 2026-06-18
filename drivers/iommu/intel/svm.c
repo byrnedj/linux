@@ -132,7 +132,7 @@ static int intel_iommu_sva_supported(struct device *dev)
 	}
 
 	if (!(iommu->flags & VTD_FLAG_SVM_CAPABLE)) {
-		dev_err(dev, "%s: IOMMU %s not SVM capable (flags=0x%lx)\n",
+		dev_err(dev, "%s: IOMMU %s not SVM capable (flags=0x%x)\n",
 			__func__, iommu->name, iommu->flags);
 		return -ENODEV;
 	}
