@@ -78,6 +78,8 @@ static void op_flag_setup(unsigned long flags, u32 *desc_flags)
 	*desc_flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
 	if (flags & DMA_PREP_INTERRUPT)
 		*desc_flags |= IDXD_OP_FLAG_RCI;
+	if (flags & DMA_PREP_CACHE_CONTROL)
+		*desc_flags |= IDXD_OP_FLAG_CC;
 }
 
 static inline void idxd_prep_desc_common(struct idxd_wq *wq,
@@ -451,7 +453,9 @@ idxd_dma_prep_memcpy_sg(struct dma_chan *chan,
 
 		memset(batch->descs + i, 0, sizeof(struct dsa_hw_desc));
 		idxd_prep_desc_common(wq, batch->descs + i, DSA_OPCODE_MEMMOVE,
-				dma_src, dma_dst, len, 0, IDXD_OP_FLAG_CC);
+				dma_src, dma_dst, len, 0,
+				(flags & DMA_PREP_CACHE_CONTROL) ?
+					IDXD_OP_FLAG_CC : 0);
 		const struct dsa_hw_desc *hw;
 	    hw = (const struct dsa_hw_desc *)batch->descs+i;
 	    pr_debug("idxd prep_memcpy_sg: hw opcode=0x%x flags=0x%x xfer=%u src=0x%llx dst=0x%llx comp=0x%llx\n",

@@ -147,6 +147,7 @@ static struct workqueue_struct *iou_wq __ro_after_init;
 static int __read_mostly sysctl_io_uring_disabled;
 static int __read_mostly sysctl_io_uring_group = -1;
 extern unsigned int io_dma_cpu_threshold;
+extern unsigned int io_dma_cache_control;
 
 #ifdef CONFIG_SYSCTL
 static const struct ctl_table kernel_io_uring_disabled_table[] = {
@@ -172,6 +173,15 @@ static const struct ctl_table kernel_io_uring_disabled_table[] = {
 		.maxlen		= sizeof(io_dma_cpu_threshold),
 		.mode		= 0644,
 		.proc_handler	= proc_douintvec,
+	},
+	{
+		.procname	= "io_uring_dma_cache_control",
+		.data		= &io_dma_cache_control,
+		.maxlen		= sizeof(io_dma_cache_control),
+		.mode		= 0644,
+		.proc_handler	= proc_douintvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
 	},
 };
 #endif
