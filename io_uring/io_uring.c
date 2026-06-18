@@ -3685,6 +3685,8 @@ static int __init io_uring_init(void)
 
 	io_dma_cache_init();
 
+	io_dma_debugfs_init();
+
 	iou_wq = alloc_workqueue("iou_exit", WQ_UNBOUND, 64);
 	BUG_ON(!iou_wq);
 

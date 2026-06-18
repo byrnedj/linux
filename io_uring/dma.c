@@ -1606,6 +1606,7 @@ static ssize_t io_dma_cpu_copy(struct iov_iter *dst_iter,
 {
 	size_t left = len;
 	ssize_t copied_total = 0;
+	u64 t0 = ktime_get_ns();
 
 	while (left > 0) {
 		size_t seg_avail = min_t(size_t, left,
@@ -1639,6 +1640,9 @@ static ssize_t io_dma_cpu_copy(struct iov_iter *dst_iter,
 		if (seg_off < seg_avail)
 			break;
 	}
+	if (copied_total > 0)
+		io_dma_lat_record(&io_dma_lat_cpu, copied_total,
+				  ktime_get_ns() - t0);
 	return copied_total;
 }
 
@@ -1813,6 +1817,7 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 	/* Capture before the doorbell: dmaengine_submit() makes the descriptor
 	 * eligible for a concurrent reap-and-recycle. */
 	dma->compl_status = io_dma_tx_compl_status(req->ctx->dma.chan, tx);
+	dma->submit_ns = ktime_get_ns();
 	dma->cookie = dmaengine_submit(tx);
 	if (dma_submit_error(dma->cookie)) {
 		kfree(heap_entries);
@@ -1872,6 +1877,22 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	ctx = req->ctx;
 
 	len = min(iov_iter_count(src_iter), iov_iter_count(dst_iter));
+
+	/*
+	 * No DSA channel: do a pure CPU copy so a CPU-copy latency baseline
+	 * is still recorded (io_dma_cpu_copy() bins it) for comparison against
+	 * the DSA path. Store cb_fn so io_dma_submit_queued_tasks() can release
+	 * the source skb — it must run AFTER tcp_eat_recv_skb() unlinks the skb
+	 * from the receive queue (TCP ate it with free=false because
+	 * msg_io_iocb was set), so releasing it synchronously here would free a
+	 * still-linked skb and corrupt the queue.
+	 */
+	if (IS_ERR_OR_NULL(ctx->dma.chan)) {
+		req->dma.cb_fn = cb_fn;
+		req->dma.cb_arg = cb_arg;
+		return io_dma_cpu_copy(dst_iter, src_iter, len);
+	}
+
 	threshold = READ_ONCE(io_dma_cpu_threshold);
 
 	/*
@@ -2048,6 +2069,12 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	if (req->dma.dma_refcnt > 0 && !req->dma.irq_mode)
 		dma_async_issue_pending(ctx->dma.chan);
 
+	/* Diagnostic: per-call DSA descriptor count + aggregate transfer size. */
+	if (call_chunks) {
+		io_dma_chunks_record(call_chunks);
+		io_dma_lat_record(&io_dma_lat_call, total_dma,
+				  ktime_get_ns() - call_t0);
+	}
 
 	return total_dma;
 
@@ -2281,6 +2308,7 @@ static ssize_t io_dma_submit_batch_sg(struct io_kiocb *req, struct device *dev,
 	/* Capture before the doorbell: dmaengine_submit() makes the descriptor
 	 * eligible for a concurrent reap-and-recycle. */
 	dma->compl_status = io_dma_tx_compl_status(req->ctx->dma.chan, tx);
+	dma->submit_ns = ktime_get_ns();
 	dma->cookie = dmaengine_submit(tx);
 	if (dma_submit_error(dma->cookie)) {
 		dma_unmap_sg(dev, src_sg, nr_entries, DMA_TO_DEVICE);
@@ -2505,6 +2533,7 @@ static ssize_t io_dma_submit_single_entry(struct io_kiocb *req,
 	/* Capture before the doorbell: dmaengine_submit() makes the descriptor
 	 * eligible for a concurrent reap-and-recycle. */
 	dma->compl_status = io_dma_tx_compl_status(req->ctx->dma.chan, tx);
+	dma->submit_ns = ktime_get_ns();
 	dma->cookie = dmaengine_submit(tx);
 	if (dma_submit_error(dma->cookie)) {
 		if (entry->src_is_page)
@@ -3212,6 +3241,9 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
 	task_len = dma->len;
 
 	if (ret == DMA_COMPLETE) {
+		if (dma->submit_ns)
+			io_dma_lat_record(&io_dma_lat_dma, task_len,
+					  ktime_get_ns() - dma->submit_ns);
 		pr_debug("dma task complete: len=%u result=%d\n",
 			 task_len, req->dma.dma_result);
 		if (req->dma.dma_result >= 0)
@@ -3343,8 +3375,21 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 	struct io_ring_ctx *ctx = req->ctx;
 	int ret = 0;
 
-	if (IS_ERR_OR_NULL(ctx->dma.chan))
+	if (IS_ERR_OR_NULL(ctx->dma.chan)) {
+		/*
+		 * CPU baseline path (no DSA): the copy already happened
+		 * synchronously in io_uring_copy_to_iter(). TCP has now
+		 * unlinked the source skb (tcp_eat_recv_skb ran with
+		 * free=false), so release it here.
+		 */
+		if (req->dma.cb_fn) {
+			struct io_dma *iod = io_kiocb_to_cmd(req, struct io_dma);
+
+			req->dma.cb_fn(&iod->kiocb, req->dma.cb_arg, 0);
+			req->dma.cb_fn = NULL;
+		}
 		return 0;
+	}
 
 	if (req->dma.dma_active) {
 		pr_debug("submit_queued: refcnt=%d\n", req->dma.dma_refcnt);

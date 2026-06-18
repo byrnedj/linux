@@ -1361,6 +1361,18 @@ retry_multishot:
 		/* IRQ completion mode is recv-only; capture it once here. */
 		req->dma.irq_mode = io_dma_irq_mode();
 		req->dma.buf_group = sr->buf_group;
+	} else if (force_nonblock && IS_ERR_OR_NULL(req->ctx->dma.chan)) {
+		/*
+		 * CPU baseline (no DSA): route the copy through
+		 * io_uring_copy_to_iter() for a latency baseline. The copy is
+		 * synchronous (no SKIP_COMPLETE / poll-kick), so it has no
+		 * poll-armed dependency and is safe on any issue. cb_fn is
+		 * cleared because io_uring_dma_prep() (which normally zeroes it)
+		 * is skipped, and a partial read takes TCP's plain copy path
+		 * while io_dma_submit_queued_tasks() still runs.
+		 */
+		kmsg->msg.msg_io_iocb = req;
+		req->dma.cb_fn = NULL;
 	} else {
 		kmsg->msg.msg_io_iocb = NULL;
 	}
