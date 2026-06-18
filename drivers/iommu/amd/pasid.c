@@ -106,6 +106,7 @@ int iommu_sva_set_dev_pasid(struct iommu_domain *domain,
 	struct pdom_dev_data *pdom_dev_data;
 	struct protection_domain *sva_pdom = to_pdomain(domain);
 	struct iommu_dev_data *dev_data = dev_iommu_priv_get(dev);
+	unsigned long irqflags;
 	int ret = -EINVAL;
 
 	if (old)
@@ -127,7 +128,7 @@ int iommu_sva_set_dev_pasid(struct iommu_domain *domain,
 	pdom_dev_data->pasid = pasid;
 	pdom_dev_data->dev_data = dev_data;
 
-	spin_lock_irqsave(&sva_pdom->lock, flags);
+	spin_lock_irqsave(&sva_pdom->lock, irqflags);
 
 	/* Setup GCR3 table */
 	ret = amd_iommu_set_gcr3(dev_data, pasid,
@@ -140,7 +141,7 @@ int iommu_sva_set_dev_pasid(struct iommu_domain *domain,
 	list_add(&pdom_dev_data->list, &sva_pdom->dev_data_list);
 
 out_unlock:
-	spin_unlock_irqrestore(&sva_pdom->lock, flags);
+	spin_unlock_irqrestore(&sva_pdom->lock, irqflags);
 	return ret;
 }
 
