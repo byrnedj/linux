@@ -417,6 +417,7 @@ struct io_dma_task {
 						 * accounting follow the task,
 						 * not the ring's primary
 						 */
+	u64			submit_ns;	/* ktime at hw submit, for latency stats */
 	dma_addr_t		src_dma;	/* DMA-mapped source address */
 	dma_addr_t		dst_dma;	/* pre-mapped dest DMA address */
 	u32			len;
