@@ -367,6 +367,7 @@ struct io_dma_batch_entry {
 struct io_dma_task {
 	struct io_kiocb		*req;
 	dma_cookie_t		cookie;
+	u64			submit_ns;	/* ktime at hw submit, for latency stats */
 	dma_addr_t		src_dma;	/* DMA-mapped source address */
 	dma_addr_t		dst_dma;	/* pre-mapped dest DMA address */
 	u32			len;
