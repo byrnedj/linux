@@ -1271,10 +1271,29 @@ retry_multishot:
 	kmsg->msg.msg_flags = 0;
 	kmsg->msg.msg_inq = -1;
 
-	if (force_nonblock && !IS_ERR_OR_NULL(req->ctx->dma.chan)) {
+	if (force_nonblock) {
+		/*
+		 * Route the recv copy through io_uring_copy_to_iter() so the
+		 * copy is accounted for. With a DSA channel this arms the
+		 * offload path; without one it still does a CPU copy via
+		 * io_dma_cpu_copy(), which records a CPU-copy latency baseline
+		 * to compare DSA against.
+		 */
 		kmsg->msg.msg_io_iocb = req;
-		io_uring_dma_prep(req);
-		req->dma.buf_group = sr->buf_group;
+		if (!IS_ERR_OR_NULL(req->ctx->dma.chan)) {
+			io_uring_dma_prep(req);
+			req->dma.buf_group = sr->buf_group;
+		} else {
+			/*
+			 * CPU baseline (no DSA): io_uring_dma_prep() is skipped,
+			 * so clear cb_fn explicitly. A partial read goes through
+			 * TCP's plain copy path (not io_uring_copy_to_iter), yet
+			 * io_dma_submit_queued_tasks() still runs — without this
+			 * it could invoke a stale cb_fn left by a prior use of
+			 * this recycled req.
+			 */
+			req->dma.cb_fn = NULL;
+		}
 	} else {
 		kmsg->msg.msg_io_iocb = NULL;
 	}

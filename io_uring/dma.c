@@ -652,6 +652,22 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	ctx = req->ctx;
 
 	len = min(iov_iter_count(src_iter), iov_iter_count(dst_iter));
+
+	/*
+	 * No DSA channel: do a pure CPU copy so a CPU-copy latency baseline
+	 * is still recorded (io_dma_cpu_copy() bins it) for comparison against
+	 * the DSA path. Store cb_fn so io_dma_submit_queued_tasks() can release
+	 * the source skb — it must run AFTER tcp_eat_recv_skb() unlinks the skb
+	 * from the receive queue (TCP ate it with free=false because
+	 * msg_io_iocb was set), so releasing it synchronously here would free a
+	 * still-linked skb and corrupt the queue.
+	 */
+	if (IS_ERR_OR_NULL(ctx->dma.chan)) {
+		req->dma.cb_fn = cb_fn;
+		req->dma.cb_arg = cb_arg;
+		return io_dma_cpu_copy(dst_iter, src_iter, len);
+	}
+
 	threshold = READ_ONCE(io_dma_cpu_threshold);
 
 	/*
@@ -1230,8 +1246,21 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 	struct io_ring_ctx *ctx = req->ctx;
 	int ret = 0;
 
-	if (IS_ERR_OR_NULL(ctx->dma.chan))
+	if (IS_ERR_OR_NULL(ctx->dma.chan)) {
+		/*
+		 * CPU baseline path (no DSA): the copy already happened
+		 * synchronously in io_uring_copy_to_iter(). TCP has now
+		 * unlinked the source skb (tcp_eat_recv_skb ran with
+		 * free=false), so release it here.
+		 */
+		if (req->dma.cb_fn) {
+			struct io_dma *iod = io_kiocb_to_cmd(req, struct io_dma);
+
+			req->dma.cb_fn(&iod->kiocb, req->dma.cb_arg, 0);
+			req->dma.cb_fn = NULL;
+		}
 		return 0;
+	}
 
 	if (req->dma.dma_active) {
 		pr_debug("submit_queued: refcnt=%d\n", req->dma.dma_refcnt);
