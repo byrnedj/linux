@@ -2647,83 +2647,89 @@ out:
 	return sent;
 }
 
-static int printkvec(struct sk_buff *skb, int off, int len, struct kvec *kvec)
+/*
+ * Build a kvec describing skb payload bytes [off, off+len) into kvec[0..max),
+ * walking the three places skb data lives: the linear region, the page frags,
+ * and the frag_list sub-skbs (GRO/jumbo). Returns the number of kvec entries
+ * filled (<= max). A slot is written only when bytes are actually emitted, so
+ * the caller never sees an uninitialized iov_base.
+ *
+ * Non-highmem only: page-frag entries store the frag's direct-map address
+ * (skb_frag_address()), which the caller dereferences after this returns. That
+ * matches the DSA/IOMMU (x86-64) recv-offload context this serves; on a highmem
+ * build the address would not be a stable kernel mapping.
+ *
+ * Stops early and returns the prefix written so far if the kvec runs out of
+ * capacity; the caller consumes only that prefix.
+ */
+static int tcp_skb_to_kvec(struct sk_buff *skb, int off, int len,
+			   struct kvec *kvec, int max)
 {
 	int start = skb_headlen(skb);
 	int copy = start - off;
-	int i;
-	int n = 0;
-	struct sk_buff *frag_iter;
 	struct kvec *saved_kvec = kvec;
+	struct kvec *end_kvec = kvec + max;
+	struct sk_buff *frag_iter;
+	int i;
 
-	/*
-	 * Advance kvec only when we actually write a slot. Previous version
-	 * indexed frags as kvec[i] and did "kvec += i" after the loop, which
-	 * left uninitialized slots whenever the linear region was bypassed
-	 * (off >= headlen) or leading frags were skipped (end <= off). The
-	 * per-CPU backing kvec then delivered stale iov_base pointers that
-	 * could land inside a recycled slab object (e.g., task_struct),
-	 * tripping usercopy hardening during copy_to_iter.
-	 */
+	if (max <= 0)
+		return 0;
+
+	/* Linear region. */
 	if (copy > 0) {
 		if (copy > len)
 			copy = len;
 
 		kvec->iov_base = skb->data + off;
 		kvec->iov_len = copy;
+		kvec++;
 
 		if ((len -= copy) == 0)
-			return 1;
+			return kvec - saved_kvec;
 		off += copy;
-		kvec++;
 	}
 
-
+	/* Page frags. */
 	for (i = 0; len && i < skb_shinfo(skb)->nr_frags; i++) {
-		int end;
 		const skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
-
-		end = start + skb_frag_size(frag);
-
+		int end = start + skb_frag_size(frag);
 
 		if ((copy = end - off) > 0) {
-			struct page *page = skb_frag_page(frag);
-			u8 *vaddr = kmap_local_page(page);
-
+			if (kvec == end_kvec)
+				return kvec - saved_kvec;
 			if (copy > len)
 				copy = len;
 
-			kvec->iov_base = vaddr + skb_frag_off(frag) + off - start;
+			/* Non-highmem: direct-map address, stable after return. */
+			kvec->iov_base = skb_frag_address(frag) + (off - start);
 			kvec->iov_len = copy;
 			kvec++;
 			off += copy;
-			kunmap_local(vaddr);
 			len -= copy;
 		}
 		start = end;
 	}
 
+	/* Frag list (GRO/jumbo sub-skbs). */
 	skb_walk_frags(skb, frag_iter) {
 		int end;
 
-		WARN_ON(start > off + len);
-
+		if (!len || kvec == end_kvec)
+			break;
 
 		end = start + frag_iter->len;
 		if ((copy = end - off) > 0) {
 			if (copy > len)
 				copy = len;
 
-			n = printkvec(frag_iter, off - start, copy, kvec);
+			kvec += tcp_skb_to_kvec(frag_iter, off - start, copy,
+						kvec, end_kvec - kvec);
 
 			off += copy;
-			kvec += n;
 			if ((len -= copy) == 0)
 				break;
-
 		}
 		start = end;
-
 	}
 
 	return kvec - saved_kvec;
@@ -2965,7 +2971,8 @@ found_ok_skb:
 
 					get_cpu();
 					kv = this_cpu_ptr(tcp_recv_kvec);
-					kvec_len = printkvec(skb, offset, used, kv);
+					kvec_len = tcp_skb_to_kvec(skb, offset, used,
+								   kv, KVEC_MAX);
 					iov_iter_kvec(&src, READ, kv, kvec_len, used);
 					put_cpu();
 
