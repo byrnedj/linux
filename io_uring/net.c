@@ -1329,7 +1329,23 @@ retry_multishot:
 	kmsg->msg.msg_flags = 0;
 	kmsg->msg.msg_inq = -1;
 
-	if (force_nonblock && !IS_ERR_OR_NULL(req->ctx->dma.chan)) {
+	/*
+	 * Only offload to DSA when the recv is already poll-armed
+	 * (REQ_F_POLLED). The DMA completion drives the req through poll
+	 * ownership (io_poll_kick), which is only valid once
+	 * __io_arm_poll_handler() has initialized poll_refs and added the req
+	 * to the cancel-hash; on the first inline issue poll is not yet armed,
+	 * so DMA there would later hash_del() an uninitialized node. Both
+	 * one-shot and multishot are supported: __io_dma_task_complete()
+	 * completes through poll ownership (terminal via dma_terminal for
+	 * one-shot / errors, aux-CQE re-arm for multishot success), so the
+	 * single poll-hash removal is preserved either way. A not-yet-armed
+	 * recv falls through to a normal copy and arms poll on -EAGAIN;
+	 * subsequent poll-driven issues then offload.
+	 */
+	if (force_nonblock && !IS_ERR_OR_NULL(req->ctx->dma.chan) &&
+	    (req->flags & REQ_F_POLLED)) {
+		/* DSA offload path: arm DMA; copy routes via io_uring_copy_to_iter. */
 		kmsg->msg.msg_io_iocb = req;
 		io_uring_dma_prep(req);
 		req->dma.buf_group = sr->buf_group;

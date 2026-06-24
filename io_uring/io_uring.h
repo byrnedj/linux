@@ -588,6 +588,9 @@ static inline bool io_has_work(struct io_ring_ctx *ctx)
 void io_uring_dma_prep(struct io_kiocb *req);
 void io_dma_init_freelist(struct io_ring_ctx *ctx, struct io_uring_params *p);
 int io_dma_submit_queued_tasks(struct io_kiocb *req);
+void io_dma_unmap_batch(struct io_ring_ctx *ctx, struct device *dev,
+			struct io_dma_batch_entry *entries, unsigned int nr,
+			bool put_folios);
 ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 			    u64 dst_user_addr, size_t want);
 extern struct kmem_cache *dma_cachep;

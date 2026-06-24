@@ -15,6 +15,7 @@
 #include "kbuf.h"
 #include "rsrc.h"
 #include "poll.h"
+#include "refs.h"
 
 #ifndef pr_fmt
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -182,6 +183,8 @@ void io_uring_dma_prep(struct io_kiocb *req)
 
 	req->dma.dma_active = true;
 	req->dma.dma_refcnt = 0;
+	req->dma.dma_ref_held = false;
+	req->dma.dma_terminal = false;
 	req->dma.dma_result = 0;
 	req->dma.dma_tasks = NULL;
 	req->dma.dma_tasks_tail = NULL;
@@ -302,48 +305,14 @@ static dma_addr_t io_dma_dst_addr(struct io_kiocb *req,
 }
 
 /*
- * Submit a single DMA chunk: map source, allocate task, submit descriptor.
- * Returns bytes submitted (>0), or 0 on failure (caller should CPU-copy).
+ * Append a submitted DMA task to the req's pending list (O(1) via tail
+ * pointer) and account it. Caller has filled in the task and obtained a
+ * valid cookie.
  */
-static size_t io_dma_submit_chunk(struct io_kiocb *req,
-				  struct device *dev, struct dma_chan *chan,
-				  void *src_kaddr, dma_addr_t dst_dma,
-				  size_t chunk_len)
+static void io_dma_task_link(struct io_kiocb *req, struct io_dma_task *dma)
 {
-	struct io_dma_task *dma;
-	dma_addr_t src_dma;
-	int rc;
-
-	src_dma = dma_map_single(dev, src_kaddr, chunk_len, DMA_TO_DEVICE);
-	if (dma_mapping_error(dev, src_dma))
-		return 0;
-
-	dma = io_dma_task_alloc(req->ctx);
-	if (!dma) {
-		dma_unmap_single(dev, src_dma, chunk_len, DMA_TO_DEVICE);
-		return 0;
-	}
-
-	dma->req = req;
 	dma->next = NULL;
-	dma->src_dma = src_dma;
-	dma->dst_dma = dst_dma;
-	dma->len = chunk_len;
-	dma->src_map_addr = src_dma;
-	dma->src_map_len = chunk_len;
-
-	rc = __io_dma_task_submit(chan, dma);
-	if (rc == -EAGAIN) {
-		dma->cookie = 0;
-	} else if (rc != 0) {
-		dma_unmap_single(dev, src_dma, chunk_len, DMA_TO_DEVICE);
-		io_dma_task_free(req->ctx, dma);
-		return 0;
-	}
-
 	req->dma.dma_refcnt++;
-
-	/* O(1) append using tail pointer */
 	if (!req->dma.dma_tasks) {
 		req->dma.dma_tasks = dma;
 		req->dma.dma_tasks_tail = dma;
@@ -351,73 +320,6 @@ static size_t io_dma_submit_chunk(struct io_kiocb *req,
 		req->dma.dma_tasks_tail->next = dma;
 		req->dma.dma_tasks_tail = dma;
 	}
-
-	return chunk_len;
-}
-
-/*
- * Submit a single DMA chunk from a page cache folio.
- * Uses dma_map_page() for the source and takes an extra folio reference
- * so the folio stays pinned until DMA completes.
- * Returns bytes submitted (>0), or 0 on failure.
- */
-static size_t __maybe_unused io_dma_submit_folio_chunk(struct io_kiocb *req,
-					struct device *dev,
-					struct dma_chan *chan,
-					struct folio *folio,
-					size_t folio_offset,
-					dma_addr_t dst_dma,
-					size_t chunk_len)
-{
-	struct io_dma_task *dma;
-	dma_addr_t src_dma;
-	int rc;
-
-	src_dma = dma_map_page(dev, &folio->page, folio_offset,
-			       chunk_len, DMA_TO_DEVICE);
-	if (dma_mapping_error(dev, src_dma))
-		return 0;
-
-	dma = io_dma_task_alloc(req->ctx);
-	if (!dma) {
-		dma_unmap_page(dev, src_dma, chunk_len, DMA_TO_DEVICE);
-		return 0;
-	}
-
-	/* Take an extra folio ref for the DMA task lifetime */
-	folio_get(folio);
-
-	dma->req = req;
-	dma->next = NULL;
-	dma->src_dma = src_dma;
-	dma->dst_dma = dst_dma;
-	dma->len = chunk_len;
-	dma->src_map_addr = src_dma;
-	dma->src_map_len = chunk_len;
-	dma->src_folio = folio;
-	dma->src_is_page = true;
-
-	rc = __io_dma_task_submit(chan, dma);
-	if (rc == -EAGAIN) {
-		dma->cookie = 0;
-	} else if (rc != 0) {
-		dma_unmap_page(dev, src_dma, chunk_len, DMA_TO_DEVICE);
-		folio_put(folio);
-		io_dma_task_free(req->ctx, dma);
-		return 0;
-	}
-
-	req->dma.dma_refcnt++;
-
-	if (!req->dma.dma_tasks) {
-		req->dma.dma_tasks = dma;
-		req->dma.dma_tasks_tail = dma;
-	} else {
-		req->dma.dma_tasks_tail->next = dma;
-		req->dma.dma_tasks_tail = dma;
-	}
-
-	return chunk_len;
 }
 
 /*
@@ -458,6 +360,12 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 		total_len += entries[i].src_len;
 	}
 
+	/*
+	 * Request cache-control as usual: idxd applies it to the MEMMOVE
+	 * sub-descriptors (the data movement, so the destination is left
+	 * cache-warm for the app), and strips it from the DSA_OPCODE_BATCH
+	 * dispatch descriptor where it is invalid (see idxd_dma_prep_memcpy_sg).
+	 */
 	tx = dmaengine_prep_dma_memcpy_sg(chan, dst_sgl, nr_entries,
 					   src_sgl, nr_entries, io_dma_prep_flags());
 	if (!tx) {
@@ -496,22 +404,21 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 		return -EFAULT;
 	}
 
-	/* Take folio refs for DMA duration */
+	/* Take folio refs for DMA duration (page-cache sources only; skb kvec
+	 * sources are kept alive by the deferred cb_fn at dma_refcnt == 0).
+	 */
 	for (i = 0; i < nr_entries; i++)
-		folio_get(entries[i].folio);
+		if (entries[i].src_is_page)
+			folio_get(entries[i].folio);
 
-	req->dma.dma_refcnt++;
-
-	if (!req->dma.dma_tasks) {
-		req->dma.dma_tasks = dma;
-		req->dma.dma_tasks_tail = dma;
-	} else {
-		req->dma.dma_tasks_tail->next = dma;
-		req->dma.dma_tasks_tail = dma;
-	}
+	io_dma_task_link(req, dma);
 
 	return total_len;
 }
+
+static ssize_t io_dma_submit_single_entry(struct io_kiocb *req,
+					  struct dma_chan *chan,
+					  struct io_dma_batch_entry *entry);
 
 ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 			struct iov_iter *src_iter,
@@ -525,6 +432,11 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	size_t len, total_dma;
 	unsigned int threshold;
 	u64 dst_base_addr;
+	struct io_dma_batch_entry *entries = NULL;
+	unsigned int nr_entries = 0;
+	unsigned int call_chunks = 0;
+	u64 call_t0;
+	ssize_t batch_ret;
 
 	cmd = container_of(kiocb, struct io_dma, kiocb);
 	req = cmd_to_io_kiocb(cmd);
@@ -569,89 +481,148 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	req->dma.cb_arg = cb_arg;
 
 	total_dma = 0;
+	call_t0 = ktime_get_ns();
 
 	/*
-	 * Defer small src segments (< threshold) to a CPU-copy pass after
-	 * all DMA has been submitted. Per-descriptor DMA overhead
-	 * (map/prep/submit/complete) loses to a cache-hot memcpy for
-	 * small segments. Submitting DMA first then copying small segments
-	 * overlaps the CPU work with in-flight DMA.
+	 * Small source segments (< threshold) are deferred to a CPU-copy pass:
+	 * per-descriptor DMA overhead loses to a cache-hot memcpy, and the
+	 * copies overlap with in-flight DMA. Each records the source address
+	 * and destination offset; they are copied after the DMA is submitted.
 	 */
 #define IO_DMA_CPU_DEFER_MAX	8
-	struct {
+	struct io_dma_cpu_seg {
 		void *src;
 		size_t len;
 		size_t dst_off;
-	} cpu_segs[IO_DMA_CPU_DEFER_MAX];
+	};
+	struct io_dma_cpu_seg cpu_segs[IO_DMA_CPU_DEFER_MAX];
 	unsigned int nr_cpu_segs = 0;
 	unsigned int i;
 
 	/*
-	 * Walk all source kvec segments. For each large segment, split into
-	 * DMA tasks at destination folio boundaries so no single transfer
-	 * crosses an IOMMU mapping. Small segments are queued for the
-	 * CPU-copy pass below.
+	 * Folio-bounded source chunks collected across ALL source segments of
+	 * this transfer. A TCP skb's linear region and each page frag is a
+	 * separate kvec segment; collecting across segments lets one DSA batch
+	 * descriptor (dmaengine_prep_dma_memcpy_sg) span many frags/folios, so
+	 * the whole recv is one transaction — larger transfer, one completion,
+	 * one latency sample — instead of one descriptor per frag. The batch is
+	 * flushed when full (IO_DMA_BATCH_MAX) and once at the end.
+	 *
+	 * dma_src[] mirrors the still-unflushed entries with the CPU-reachable
+	 * source address + destination offset, so the error path can CPU-copy a
+	 * chunk that was collected but not yet submitted to hardware (its length
+	 * is entries[i].src_len).
+	 */
+	struct io_dma_src_ref {
+		void *src;
+		size_t dst_off;
+	};
+	struct io_dma_src_ref dma_src[IO_DMA_BATCH_MAX];
+
+	entries = kmalloc_array(IO_DMA_BATCH_MAX, sizeof(*entries),
+				GFP_NOWAIT | __GFP_NOWARN);
+	if (!entries)
+		goto cpu_fallback;
+
+	/*
+	 * Walk the source one chunk at a time. src_iter is advanced per chunk
+	 * (and per deferred small segment), so it always points at the next
+	 * byte not yet claimed for DMA — which keeps the error path's CPU copy
+	 * of the remainder trivial.
 	 */
 	while (total_dma < len) {
-		void *seg_base;
-		size_t seg_avail, seg_remaining, seg_off;
+		size_t seg_avail, folio_remain, chunk_len;
+		void *src_kaddr;
+		dma_addr_t dst_dma, src_dma;
 
 		seg_avail = iter_iov_len(src_iter);
 		if (!seg_avail)
 			break;
+		seg_avail = min_t(size_t, seg_avail, len - total_dma);
+		src_kaddr = (void *)iter_iov_addr(src_iter);
 
-		seg_base = (void *)iter_iov_addr(src_iter);
-		seg_remaining = min_t(size_t, seg_avail, len - total_dma);
-
-		if (seg_remaining < threshold &&
+		/* Defer a small segment (or the small tail of one) to CPU. */
+		if (seg_avail < threshold &&
 		    nr_cpu_segs < IO_DMA_CPU_DEFER_MAX) {
-			cpu_segs[nr_cpu_segs].src = seg_base;
-			cpu_segs[nr_cpu_segs].len = seg_remaining;
+			cpu_segs[nr_cpu_segs].src = src_kaddr;
+			cpu_segs[nr_cpu_segs].len = seg_avail;
 			cpu_segs[nr_cpu_segs].dst_off = total_dma;
 			nr_cpu_segs++;
-			total_dma += seg_remaining;
-			iov_iter_advance(src_iter, seg_remaining);
+			total_dma += seg_avail;
+			iov_iter_advance(src_iter, seg_avail);
 			continue;
 		}
 
-		seg_off = 0;
+		/* Resolve the destination folio and clamp the chunk to it so no
+		 * single transfer crosses an IOMMU mapping.
+		 */
+		dst_dma = io_dma_dst_addr(req, dst_iter, dst_base_addr,
+					  total_dma, &folio_remain);
+		if (!dst_dma)
+			goto cpu_fallback_rest;
+		chunk_len = min_t(size_t, seg_avail, folio_remain);
 
-		/* Inner loop: split this source segment at folio boundaries */
-		while (seg_off < seg_remaining) {
-			size_t folio_remain, chunk_len, submitted;
-			dma_addr_t dst_dma;
+		src_dma = dma_map_single(dev, src_kaddr, chunk_len,
+					 DMA_TO_DEVICE);
+		if (dma_mapping_error(dev, src_dma))
+			goto cpu_fallback_rest;
 
-			dst_dma = io_dma_dst_addr(req, dst_iter,
-						  dst_base_addr, total_dma,
-						  &folio_remain);
-			if (!dst_dma)
+		entries[nr_entries].src_dma = src_dma;
+		entries[nr_entries].dst_dma = dst_dma;
+		entries[nr_entries].src_len = chunk_len;
+		entries[nr_entries].folio = NULL;
+		entries[nr_entries].src_is_page = false;
+		dma_src[nr_entries].src = src_kaddr;
+		dma_src[nr_entries].dst_off = total_dma;
+		nr_entries++;
+		call_chunks++;
+
+		total_dma += chunk_len;
+		iov_iter_advance(src_iter, chunk_len);
+
+		/* Flush a full batch and keep collecting. */
+		if (nr_entries == IO_DMA_BATCH_MAX) {
+			batch_ret = io_dma_submit_batch(req, dev, ctx->dma.chan,
+							entries, nr_entries);
+			if (batch_ret < 0)
 				goto cpu_fallback_rest;
-
-			chunk_len = min_t(size_t, seg_remaining - seg_off,
-					  folio_remain);
-
-			submitted = io_dma_submit_chunk(req, dev,
-							ctx->dma.chan,
-							seg_base + seg_off,
-							dst_dma, chunk_len);
-			if (!submitted)
-				goto cpu_fallback_rest;
-
-			seg_off += submitted;
-			total_dma += submitted;
+			nr_entries = 0;
 		}
-
-		/* Advance source iterator past this segment */
-		iov_iter_advance(src_iter, seg_off);
 	}
 
-	/* Advance destination iterator past all processed bytes */
+	/*
+	 * Flush the final partial batch. A single chunk uses a plain memcpy
+	 * descriptor (a 1-entry batch descriptor is pure overhead); >=2 chunks
+	 * use one batch descriptor spanning all the collected frags/folios.
+	 *
+	 * This deliberately batches at >=2, unlike io_dma_flush_batch()'s
+	 * IO_DMA_BATCH_MIN (8) cutoff used by the page-cache read path: a recv's
+	 * payoff is merging the 2-segment skbs that dominate here into one
+	 * transaction, so routing this through io_dma_flush_batch() would leave
+	 * those as two descriptors and defeat the merge.
+	 */
+	if (nr_entries) {
+		if (nr_entries == 1)
+			batch_ret = io_dma_submit_single_entry(req,
+					ctx->dma.chan, &entries[0]);
+		else
+			batch_ret = io_dma_submit_batch(req, dev,
+					ctx->dma.chan, entries, nr_entries);
+		if (batch_ret < 0)
+			goto cpu_fallback_rest;
+		nr_entries = 0;
+	}
+
+	kfree(entries);
+	entries = NULL;
+
+	/* Advance destination iterator past all processed bytes. */
 	iov_iter_advance(dst_iter, total_dma);
 
 	/*
-	 * Kick the DMA engine before the CPU pass so hardware starts
-	 * immediately; the CPU copies land in disjoint byte ranges of the
-	 * user buffer and overlap with the in-flight DMA writes.
+	 * Kick the engine before the CPU pass so hardware starts immediately;
+	 * the CPU copies land in disjoint byte ranges and overlap the in-flight
+	 * DMA writes.
 	 */
 	if (req->dma.dma_refcnt > 0)
 		dma_async_issue_pending(ctx->dma.chan);
@@ -659,26 +630,71 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	for (i = 0; i < nr_cpu_segs; i++) {
 		void __user *dst_ua =
 			(void __user *)(dst_base_addr + cpu_segs[i].dst_off);
+		unsigned long unc = copy_to_user(dst_ua, cpu_segs[i].src,
+						 cpu_segs[i].len);
 
-		WARN_ON_ONCE(copy_to_user(dst_ua, cpu_segs[i].src,
-					  cpu_segs[i].len));
+		if (unlikely(unc)) {
+			/*
+			 * Destination became unwritable. Back the undelivered
+			 * bytes out of total_dma so the recv reports a short
+			 * transfer rather than counting bytes never written.
+			 */
+			WARN_ON_ONCE(1);
+			total_dma -= unc;
+		}
 	}
+
 
 	return total_dma;
 
 cpu_fallback_rest:
 	/*
-	 * DMA submission failed mid-way.  Advance iterators past
-	 * already-DMA'd bytes, then CPU-copy the rest.
+	 * A chunk failed to map, a destination folio was unmapped, or a batch
+	 * failed to submit. Recover without losing data:
+	 *   - unmap and CPU-copy the chunks collected but not yet submitted
+	 *     (their CPU-reachable sources are in dma_src[]);
+	 *   - CPU-copy the deferred small segments;
+	 *   - CPU-copy the remainder [total_dma, len), whose source is exactly
+	 *     where src_iter now points (advanced per claimed chunk).
+	 * Already-submitted batches are left to complete in hardware; their
+	 * destination ranges are disjoint from everything copied here.
 	 */
-	if (total_dma > 0) {
-		iov_iter_advance(src_iter, total_dma);
-		iov_iter_advance(dst_iter, total_dma);
-	}
-	{
-		size_t remain = len - total_dma;
-		ssize_t cpu_ret = io_dma_cpu_copy(dst_iter, src_iter, remain);
+	if (nr_entries) {
+		io_dma_unmap_batch(req->ctx, dev, entries, nr_entries, false);
+		for (i = 0; i < nr_entries; i++) {
+			void __user *dst_ua = (void __user *)
+				(dst_base_addr + dma_src[i].dst_off);
+			unsigned long unc = copy_to_user(dst_ua, dma_src[i].src,
+							 entries[i].src_len);
 
+			if (unlikely(unc)) {
+				WARN_ON_ONCE(1);
+				total_dma -= unc;
+			}
+		}
+		nr_entries = 0;
+	}
+	kfree(entries);
+	entries = NULL;
+
+	for (i = 0; i < nr_cpu_segs; i++) {
+		void __user *dst_ua =
+			(void __user *)(dst_base_addr + cpu_segs[i].dst_off);
+		unsigned long unc = copy_to_user(dst_ua, cpu_segs[i].src,
+						 cpu_segs[i].len);
+
+		if (unlikely(unc)) {
+			WARN_ON_ONCE(1);
+			total_dma -= unc;
+		}
+	}
+	nr_cpu_segs = 0;
+
+	if (total_dma < len) {
+		ssize_t cpu_ret;
+
+		iov_iter_advance(dst_iter, total_dma);
+		cpu_ret = io_dma_cpu_copy(dst_iter, src_iter, len - total_dma);
 		if (cpu_ret > 0)
 			total_dma += cpu_ret;
 	}
@@ -720,7 +736,8 @@ static ssize_t io_dma_submit_single_entry(struct io_kiocb *req,
 	if (!dma)
 		return -ENOMEM;
 
-	folio_get(entry->folio);
+	if (entry->src_is_page)
+		folio_get(entry->folio);
 
 	dma->req = req;
 	dma->next = NULL;
@@ -729,46 +746,49 @@ static ssize_t io_dma_submit_single_entry(struct io_kiocb *req,
 	dma->len = entry->src_len;
 	dma->src_map_addr = entry->src_dma;
 	dma->src_map_len = entry->src_len;
-	dma->src_folio = entry->folio;
-	dma->src_is_page = true;
+	dma->src_folio = entry->src_is_page ? entry->folio : NULL;
+	dma->src_is_page = entry->src_is_page;
 	dma->is_batch = false;
 
 	dma->cookie = dmaengine_submit(tx);
 	if (dma_submit_error(dma->cookie)) {
-		folio_put(entry->folio);
+		if (entry->src_is_page)
+			folio_put(entry->folio);
 		io_dma_task_free(req->ctx, dma);
 		return -EFAULT;
 	}
 
-	req->dma.dma_refcnt++;
-
-	if (!req->dma.dma_tasks) {
-		req->dma.dma_tasks = dma;
-		req->dma.dma_tasks_tail = dma;
-	} else {
-		req->dma.dma_tasks_tail->next = dma;
-		req->dma.dma_tasks_tail = dma;
-	}
+	io_dma_task_link(req, dma);
 
 	return entry->src_len;
 }
 
 /*
- * Unmap source DMA mappings for batch entries on error paths.
+ * Release the source side of batch entries: unmap each DMA mapping (skipped
+ * under IOMMU passthrough) and, when put_folios is set, drop the folio ref a
+ * page-cache source took. Used by the error path (folio refs not yet taken ->
+ * put_folios=false), task completion, and the teardown drain.
  */
-static void io_dma_unmap_batch_entries(struct io_kiocb *req,
-				       struct device *dev,
-				       struct io_dma_batch_entry *entries,
-				       unsigned int nr)
+void io_dma_unmap_batch(struct io_ring_ctx *ctx, struct device *dev,
+			struct io_dma_batch_entry *entries, unsigned int nr,
+			bool put_folios)
 {
 	unsigned int i;
 
-	if (req->ctx->dma.use_phys_addrs)
-		return;
+	for (i = 0; i < nr; i++) {
+		struct io_dma_batch_entry *e = &entries[i];
 
-	for (i = 0; i < nr; i++)
-		dma_unmap_page(dev, entries[i].src_dma,
-			       entries[i].src_len, DMA_TO_DEVICE);
+		if (!ctx->dma.use_phys_addrs) {
+			if (e->src_is_page)
+				dma_unmap_page(dev, e->src_dma, e->src_len,
+					       DMA_TO_DEVICE);
+			else
+				dma_unmap_single(dev, e->src_dma, e->src_len,
+						 DMA_TO_DEVICE);
+		}
+		if (put_folios && e->src_is_page)
+			folio_put(e->folio);
+	}
 }
 
 /*
@@ -793,9 +813,9 @@ static ssize_t io_dma_flush_batch(struct io_kiocb *req,
 			ret = io_dma_submit_single_entry(req, chan, &entries[i]);
 			if (ret < 0) {
 				/* Unmap remaining entries */
-				io_dma_unmap_batch_entries(req, dev,
-							  entries + i + 1,
-							  nr_entries - i - 1);
+				io_dma_unmap_batch(req->ctx, dev,
+						   entries + i + 1,
+						   nr_entries - i - 1, false);
 				return total > 0 ? total : ret;
 			}
 			total += ret;
@@ -805,7 +825,7 @@ static ssize_t io_dma_flush_batch(struct io_kiocb *req,
 
 	ret = io_dma_submit_batch(req, dev, chan, entries, nr_entries);
 	if (ret < 0)
-		io_dma_unmap_batch_entries(req, dev, entries, nr_entries);
+		io_dma_unmap_batch(req->ctx, dev, entries, nr_entries, false);
 	return ret;
 }
 
@@ -958,6 +978,7 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 				entries[nr_entries].dst_dma = dst_dma;
 				entries[nr_entries].src_len = chunk;
 				entries[nr_entries].folio = folio;
+				entries[nr_entries].src_is_page = true;
 				nr_entries++;
 
 				copied += chunk;
@@ -1041,16 +1062,8 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
 
 	/* Clean up source DMA mappings and folio references */
 	if (dma->is_batch) {
-		int i;
-
-		for (i = 0; i < dma->batch_nr; i++) {
-			if (!req->ctx->dma.use_phys_addrs)
-				dma_unmap_page(dev,
-					       dma->batch_entries[i].src_dma,
-					       dma->batch_entries[i].src_len,
-					       DMA_TO_DEVICE);
-			folio_put(dma->batch_entries[i].folio);
-		}
+		io_dma_unmap_batch(req->ctx, dev, dma->batch_entries,
+				   dma->batch_nr, true);
 		kfree(dma->batch_entries);
 	} else {
 		if (dma->src_map_len && !req->ctx->dma.use_phys_addrs) {
@@ -1073,7 +1086,8 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
 		if (req->dma.dma_result >= 0)
 			req->dma.dma_result += task_len;
 	} else {
-		pr_debug("dma task failed: len=%u ret=%d\n", task_len, ret);
+		pr_debug("dma task failed: len=%u ret=%d is_batch=%d\n",
+			 task_len, ret, dma->is_batch);
 		req->dma.dma_result = -EFAULT;
 	}
 
@@ -1095,37 +1109,44 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
 			req->dma.cb_arg = NULL;
 		}
 
-		if (req->dma.dma_result < 0) {
-			req_set_fail(req);
-			io_req_set_res(req, req->dma.dma_result,
-				       req->dma.saved_cflags);
-			req->io_task_work.func = io_req_task_complete;
-			io_req_task_work_add(req);
-		} else if (req->flags & REQ_F_APOLL_MULTISHOT) {
-			/*
-			 * Multishot recv via DMA: mark the request as needing
-			 * an aux CQE flush on next io_recv entry, then drive
-			 * re-entry through the canonical poll state machine.
-			 * io_poll_kick() takes poll ownership and schedules
-			 * io_poll_task_func, which will call io_recv; the
-			 * prelude in io_recv flushes the aux CQE before the
-			 * next sock_recvmsg. This keeps DMA completion inside
-			 * the same lifecycle dance as a real socket wake and
-			 * avoids a separate retry task_work racing with poll.
-			 */
+		/*
+		 * The recv only reaches the DMA path while poll-armed (io_recv
+		 * gates on REQ_F_POLLED), so the req is always in the poll
+		 * cancel-hash here. Drive every completion through poll ownership
+		 * (io_poll_kick) so io_poll_task_func does the single hash_del:
+		 *
+		 *  - multishot success: post an aux CQE and stay armed. io_recv's
+		 *    prelude flushes pending_aux_cqe before the next sock_recvmsg.
+		 *  - terminal (one-shot recv, or a multishot DMA error): set the
+		 *    saved result and tear the poll down via dma_terminal, which
+		 *    io_poll_check_events() turns into IOU_POLL_REMOVE_POLL_USE_RES.
+		 */
+		if (req->dma.dma_result >= 0 &&
+		    (req->flags & REQ_F_APOLL_MULTISHOT)) {
 			req->dma.pending_aux_cqe = true;
-			io_poll_kick(req);
 		} else {
-			/*
-			 * One-shot recv: terminal completion via task_work.
-			 * __io_dma_poll() may run from a workqueue without
-			 * ctx->uring_lock, so io_req_task_complete() defers
-			 * the CQE post until the task_work loop acquires it.
-			 */
-			io_req_set_res(req, req->dma.saved_res,
-				       req->dma.saved_cflags);
-			req->io_task_work.func = io_req_task_complete;
-			io_req_task_work_add(req);
+			if (req->dma.dma_result < 0) {
+				req_set_fail(req);
+				req->dma.saved_res = req->dma.dma_result;
+			}
+			req->dma.dma_terminal = true;
+		}
+		io_poll_kick(req);
+
+		/*
+		 * Drop the in-flight DMA reference taken in
+		 * io_dma_submit_queued_tasks(). The completion handling above
+		 * only queues task_work (re-arm via io_poll_kick, or terminal
+		 * via io_req_task_complete) — it does not free the req inline —
+		 * so the req is still valid here. If we held the last reference
+		 * (the req was already terminally completed/cancelled, e.g. by
+		 * teardown), free it now; otherwise the owner frees it once it
+		 * drops its reference.
+		 */
+		if (req->dma.dma_ref_held) {
+			req->dma.dma_ref_held = false;
+			if (req_ref_put_and_test(req))
+				io_free_req(req);
 		}
 	}
 }
@@ -1173,6 +1194,25 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 
 			req->dma.dma_tasks = NULL;
 			req->dma.dma_tasks_tail = NULL;
+
+			/*
+			 * Hold a reference for the in-flight DMA. io_recv is
+			 * about to return IOU_ISSUE_SKIP_COMPLETE, handing the
+			 * req off to the DMA engine, but the req remains in the
+			 * poll cancel-hash. Without this ref, ring-teardown
+			 * cancellation (io_poll_remove_all) could free the req
+			 * while DMA still references it (and while it is still
+			 * hashed) -> use-after-free. The ref keeps it alive until
+			 * the last task completes; dropped in
+			 * __io_dma_task_complete() at dma_refcnt == 0. Mirrors the
+			 * io-wq reference pattern in io_wq_submit_work().
+			 */
+			if (!(req->flags & REQ_F_REFCOUNT))
+				__io_req_set_refcount(req, 2);
+			else
+				req_ref_get(req);
+			req->dma.dma_ref_held = true;
+
 			ret = -EIOCBQUEUED;
 		} else if (req->dma.cb_fn) {
 			/*
@@ -1193,14 +1233,28 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 	 * Use ctx (not req) below — __io_dma_poll may complete the
 	 * request and free it, so req must not be dereferenced after.
 	 */
-	if (atomic_read(&ctx->dma.poll_armed) == 0)
+	if (ret == -EIOCBQUEUED) {
+		/*
+		 * This req's tasks were just queued and io_recv will return
+		 * IOU_ISSUE_SKIP_COMPLETE. Do NOT complete them inline here: a
+		 * fast transfer (especially a single batched descriptor) can
+		 * finish synchronously, and __io_dma_task_complete() would then
+		 * re-enter io_poll_kick() for this same req while io_recv is
+		 * still unwinding — double-completing it (manifests as an
+		 * imbalanced file-ref put / req double-free at exit). Defer all
+		 * completion to poll_work, which runs from a clean context.
+		 */
+		if (READ_ONCE(ctx->dma.head))
+			schedule_work(&ctx->dma.poll_work);
+	} else if (atomic_read(&ctx->dma.poll_armed) == 0) {
+		/*
+		 * No task was queued for this req (e.g. CPU fallback). Draining
+		 * other reqs' already-queued tasks inline is safe — io_poll_kick
+		 * for a different req is ordinary async wakeup, not re-entrancy
+		 * on the req currently being issued.
+		 */
 		__io_dma_poll(ctx);
-
-	/* If DMA tasks are still pending after the synchronous poll,
-	 * schedule the poll work to keep draining completions.
-	 */
-	if (ret == -EIOCBQUEUED && READ_ONCE(ctx->dma.head))
-		schedule_work(&ctx->dma.poll_work);
+	}
 
 	return ret;
 }
