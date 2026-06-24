@@ -480,6 +480,14 @@ idxd_dma_prep_memcpy_sg(struct dma_chan *chan,
 		batch->num);
 	/* prepare DSA_OPCODE_BATCH */
 	op_flag_setup(flags, &desc_flags);
+	/*
+	 * Cache-Control is a data-mover flag and is set on the MEMMOVE
+	 * sub-descriptors above (when DMA_PREP_CACHE_CONTROL was requested).
+	 * The BATCH descriptor itself moves no data, so CC is invalid on it
+	 * and DSA fails the batch with DSA_COMP_INVALID_FLAGS (0x11). Strip it
+	 * from the dispatch descriptor only.
+	 */
+	desc_flags &= ~IDXD_OP_FLAG_CC;
 	idxd_prep_desc_common(wq, desc->hw, DSA_OPCODE_BATCH,
 			batch->dma_descs, 0, batch->num,
 			desc->compl_dma, desc_flags);
