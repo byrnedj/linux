@@ -290,6 +290,21 @@ static int io_poll_check_events(struct io_kiocb *req, io_tw_token_t tw)
 		}
 
 		/*
+		 * A DMA-offloaded recv needs a terminal completion: a one-shot
+		 * recv (any result), or a multishot recv that hit a DMA error.
+		 * Post the saved result and tear the poll down through the
+		 * ownership protocol — io_poll_task_func() does the single
+		 * hash_del() and io_req_task_complete(). This is hash-safe (one
+		 * removal) and surfaces the real result rather than -ECANCELED.
+		 */
+		if (req->dma.dma_terminal) {
+			req->dma.dma_terminal = false;
+			io_req_set_res(req, req->dma.saved_res,
+				       req->dma.saved_cflags);
+			return IOU_POLL_REMOVE_POLL_USE_RES;
+		}
+
+		/*
 		 * A DMA-offloaded multishot recv that completed since our last
 		 * pass left an aux CQE pending on the request. vfs_poll() below
 		 * would legitimately return 0 events (the socket was drained by

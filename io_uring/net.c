@@ -1271,29 +1271,38 @@ retry_multishot:
 	kmsg->msg.msg_flags = 0;
 	kmsg->msg.msg_inq = -1;
 
-	if (force_nonblock) {
+	/*
+	 * Only offload to DSA when the recv is already poll-armed
+	 * (REQ_F_POLLED). The DMA completion drives the req through poll
+	 * ownership (io_poll_kick), which is only valid once
+	 * __io_arm_poll_handler() has initialized poll_refs and added the req
+	 * to the cancel-hash; on the first inline issue poll is not yet armed,
+	 * so DMA there would later hash_del() an uninitialized node. Both
+	 * one-shot and multishot are supported: __io_dma_task_complete()
+	 * completes through poll ownership (terminal via dma_terminal for
+	 * one-shot / errors, aux-CQE re-arm for multishot success), so the
+	 * single poll-hash removal is preserved either way. A not-yet-armed
+	 * recv falls through to a normal copy and arms poll on -EAGAIN;
+	 * subsequent poll-driven issues then offload.
+	 */
+	if (force_nonblock && !IS_ERR_OR_NULL(req->ctx->dma.chan) &&
+	    (req->flags & REQ_F_POLLED)) {
+		/* DSA offload path: arm DMA; copy routes via io_uring_copy_to_iter. */
+		kmsg->msg.msg_io_iocb = req;
+		io_uring_dma_prep(req);
+		req->dma.buf_group = sr->buf_group;
+	} else if (force_nonblock && IS_ERR_OR_NULL(req->ctx->dma.chan)) {
 		/*
-		 * Route the recv copy through io_uring_copy_to_iter() so the
-		 * copy is accounted for. With a DSA channel this arms the
-		 * offload path; without one it still does a CPU copy via
-		 * io_dma_cpu_copy(), which records a CPU-copy latency baseline
-		 * to compare DSA against.
+		 * CPU baseline (no DSA): route the copy through
+		 * io_uring_copy_to_iter() for a latency baseline. The copy is
+		 * synchronous (no SKIP_COMPLETE / poll-kick), so it has no
+		 * poll-armed dependency and is safe on any issue. cb_fn is
+		 * cleared because io_uring_dma_prep() (which normally zeroes it)
+		 * is skipped, and a partial read takes TCP's plain copy path
+		 * while io_dma_submit_queued_tasks() still runs.
 		 */
 		kmsg->msg.msg_io_iocb = req;
-		if (!IS_ERR_OR_NULL(req->ctx->dma.chan)) {
-			io_uring_dma_prep(req);
-			req->dma.buf_group = sr->buf_group;
-		} else {
-			/*
-			 * CPU baseline (no DSA): io_uring_dma_prep() is skipped,
-			 * so clear cb_fn explicitly. A partial read goes through
-			 * TCP's plain copy path (not io_uring_copy_to_iter), yet
-			 * io_dma_submit_queued_tasks() still runs — without this
-			 * it could invoke a stale cb_fn left by a prior use of
-			 * this recycled req.
-			 */
-			req->dma.cb_fn = NULL;
-		}
+		req->dma.cb_fn = NULL;
 	} else {
 		kmsg->msg.msg_io_iocb = NULL;
 	}

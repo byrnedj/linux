@@ -2890,22 +2890,40 @@ static void io_release_dma_chan(struct io_ring_ctx *ctx)
 				pr_warn("Hung DMA offload task %p\n", dma);
 
 			/*
-			 * Release per-task resources (unmap, folio refs)
-			 * without dereferencing dma->req: the req may already
-			 * have been freed by cancel since ctx teardown runs
-			 * after refs drop. Mirrors __io_dma_task_complete's
-			 * cleanup minus the req-scope work.
+			 * Release per-task resources (unmap, folio refs) only.
+			 * Normal completion drains ctx->dma.head via
+			 * __io_dma_poll() in the exit loop, so a task reaching
+			 * this drain is one whose DMA never completed (hung
+			 * hardware; see the "Hung DMA" warn above). The in-flight
+			 * DMA reference (io_dma_submit_queued_tasks) keeps dma->req
+			 * alive here, but we intentionally do NOT drop that ref or
+			 * complete the req: that would need io_free_req(), whose
+			 * task_work falls back onto this ctx's fallback_work while
+			 * the ctx is being torn down -> teardown use-after-free.
+			 * The lingering req is a bounded leak confined to the
+			 * already-degraded hung-hardware path, which is preferable.
 			 */
 			if (dma->is_batch) {
 				u8 i;
 
 				for (i = 0; i < dma->batch_nr; i++) {
-					if (!ctx->dma.use_phys_addrs)
-						dma_unmap_page(dev,
-							dma->batch_entries[i].src_dma,
-							dma->batch_entries[i].src_len,
-							DMA_TO_DEVICE);
-					folio_put(dma->batch_entries[i].folio);
+					struct io_dma_batch_entry *e =
+						&dma->batch_entries[i];
+
+					if (!ctx->dma.use_phys_addrs) {
+						if (e->src_is_page)
+							dma_unmap_page(dev,
+								e->src_dma,
+								e->src_len,
+								DMA_TO_DEVICE);
+						else
+							dma_unmap_single(dev,
+								e->src_dma,
+								e->src_len,
+								DMA_TO_DEVICE);
+					}
+					if (e->src_is_page)
+						folio_put(e->folio);
 				}
 				kfree(dma->batch_entries);
 			} else {
