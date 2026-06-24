@@ -348,8 +348,12 @@ struct io_dma_kiocb {
 	struct io_dma_task	*dma_tasks_tail;
 	unsigned short		buf_group;	/* for DMA addr lookup */
 	bool			dma_active;	/* DMA copy armed for this req */
+	bool			dma_ref_held;	/* extra req ref held for in-flight DMA */
 	bool			mshot_in_flight; /* multishot recv awaiting DMA completion */
 	bool			pending_aux_cqe; /* DMA done, io_recv must post aux CQE */
+	bool			dma_terminal;	/* DMA done, terminate poll-armed req
+						 * with saved_res (one-shot, or
+						 * multishot error) */
 	u64			dst_user_addr;	/* user VA for reg buf DMA lookup */
 	void (*cb_fn)(struct kiocb *, void *, int);
 	void			*cb_arg;
@@ -359,7 +363,10 @@ struct io_dma_batch_entry {
 	dma_addr_t		src_dma;	/* DMA-mapped source address */
 	dma_addr_t		dst_dma;	/* pre-mapped dest DMA address */
 	u32			src_len;	/* source mapping length */
-	struct folio		*folio;		/* page cache folio ref */
+	struct folio		*folio;		/* page cache folio ref, or NULL */
+	bool			src_is_page;	/* src mapped via dma_map_page()
+						 * (folio source) vs dma_map_single()
+						 * (skb kvec source) */
 };
 
 #define IO_DMA_BATCH_MAX	32
