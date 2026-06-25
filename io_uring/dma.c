@@ -456,48 +456,14 @@ static dma_addr_t io_dma_dst_addr(struct io_kiocb *req,
 }
 
 /*
- * Submit a single DMA chunk: map source, allocate task, submit descriptor.
- * Returns bytes submitted (>0), or 0 on failure (caller should CPU-copy).
+ * Append a submitted DMA task to the req's pending list (O(1) via tail
+ * pointer) and account it. Caller has filled in the task and obtained a
+ * valid cookie.
  */
-static size_t __maybe_unused io_dma_submit_chunk(struct io_kiocb *req,
-				  struct device *dev, struct dma_chan *chan,
-				  void *src_kaddr, dma_addr_t dst_dma,
-				  size_t chunk_len)
+static void io_dma_task_link(struct io_kiocb *req, struct io_dma_task *dma)
 {
-	struct io_dma_task *dma;
-	dma_addr_t src_dma;
-	int rc;
-
-	src_dma = dma_map_single(dev, src_kaddr, chunk_len, DMA_TO_DEVICE);
-	if (dma_mapping_error(dev, src_dma))
-		return 0;
-
-	dma = io_dma_task_alloc(req->ctx);
-	if (!dma) {
-		dma_unmap_single(dev, src_dma, chunk_len, DMA_TO_DEVICE);
-		return 0;
-	}
-
-	dma->req = req;
 	dma->next = NULL;
-	dma->src_dma = src_dma;
-	dma->dst_dma = dst_dma;
-	dma->len = chunk_len;
-	dma->src_map_addr = src_dma;
-	dma->src_map_len = chunk_len;
-
-	rc = __io_dma_task_submit(chan, dma);
-	if (rc == -EAGAIN) {
-		dma->cookie = 0;
-	} else if (rc != 0) {
-		dma_unmap_single(dev, src_dma, chunk_len, DMA_TO_DEVICE);
-		io_dma_task_free(req->ctx, dma);
-		return 0;
-	}
-
 	req->dma.dma_refcnt++;
-
-	/* O(1) append using tail pointer */
 	if (!req->dma.dma_tasks) {
 		req->dma.dma_tasks = dma;
 		req->dma.dma_tasks_tail = dma;
@@ -505,73 +471,6 @@ static size_t __maybe_unused io_dma_submit_chunk(struct io_kiocb *req,
 		req->dma.dma_tasks_tail->next = dma;
 		req->dma.dma_tasks_tail = dma;
 	}
-
-	return chunk_len;
-}
-
-/*
- * Submit a single DMA chunk from a page cache folio.
- * Uses dma_map_page() for the source and takes an extra folio reference
- * so the folio stays pinned until DMA completes.
- * Returns bytes submitted (>0), or 0 on failure.
- */
-static size_t __maybe_unused io_dma_submit_folio_chunk(struct io_kiocb *req,
-					struct device *dev,
-					struct dma_chan *chan,
-					struct folio *folio,
-					size_t folio_offset,
-					dma_addr_t dst_dma,
-					size_t chunk_len)
-{
-	struct io_dma_task *dma;
-	dma_addr_t src_dma;
-	int rc;
-
-	src_dma = dma_map_page(dev, &folio->page, folio_offset,
-			       chunk_len, DMA_TO_DEVICE);
-	if (dma_mapping_error(dev, src_dma))
-		return 0;
-
-	dma = io_dma_task_alloc(req->ctx);
-	if (!dma) {
-		dma_unmap_page(dev, src_dma, chunk_len, DMA_TO_DEVICE);
-		return 0;
-	}
-
-	/* Take an extra folio ref for the DMA task lifetime */
-	folio_get(folio);
-
-	dma->req = req;
-	dma->next = NULL;
-	dma->src_dma = src_dma;
-	dma->dst_dma = dst_dma;
-	dma->len = chunk_len;
-	dma->src_map_addr = src_dma;
-	dma->src_map_len = chunk_len;
-	dma->src_folio = folio;
-	dma->src_is_page = true;
-
-	rc = __io_dma_task_submit(chan, dma);
-	if (rc == -EAGAIN) {
-		dma->cookie = 0;
-	} else if (rc != 0) {
-		dma_unmap_page(dev, src_dma, chunk_len, DMA_TO_DEVICE);
-		folio_put(folio);
-		io_dma_task_free(req->ctx, dma);
-		return 0;
-	}
-
-	req->dma.dma_refcnt++;
-
-	if (!req->dma.dma_tasks) {
-		req->dma.dma_tasks = dma;
-		req->dma.dma_tasks_tail = dma;
-	} else {
-		req->dma.dma_tasks_tail->next = dma;
-		req->dma.dma_tasks_tail = dma;
-	}
-
-	return chunk_len;
 }
 
 /*
@@ -664,22 +563,11 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 		if (entries[i].src_is_page)
 			folio_get(entries[i].folio);
 
-	req->dma.dma_refcnt++;
-
-	if (!req->dma.dma_tasks) {
-		req->dma.dma_tasks = dma;
-		req->dma.dma_tasks_tail = dma;
-	} else {
-		req->dma.dma_tasks_tail->next = dma;
-		req->dma.dma_tasks_tail = dma;
-	}
+	io_dma_task_link(req, dma);
 
 	return total_len;
 }
 
-static void io_dma_unmap_batch_entries(struct io_kiocb *req, struct device *dev,
-				       struct io_dma_batch_entry *entries,
-				       unsigned int nr);
 static ssize_t io_dma_submit_single_entry(struct io_kiocb *req,
 					  struct dma_chan *chan,
 					  struct io_dma_batch_entry *entry);
@@ -874,6 +762,12 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	 * Flush the final partial batch. A single chunk uses a plain memcpy
 	 * descriptor (a 1-entry batch descriptor is pure overhead); >=2 chunks
 	 * use one batch descriptor spanning all the collected frags/folios.
+	 *
+	 * This deliberately batches at >=2, unlike io_dma_flush_batch()'s
+	 * IO_DMA_BATCH_MIN (8) cutoff used by the page-cache read path: a recv's
+	 * payoff is merging the 2-segment skbs that dominate here into one
+	 * transaction, so routing this through io_dma_flush_batch() would leave
+	 * those as two descriptors and defeat the merge.
 	 */
 	if (nr_entries) {
 		if (nr_entries == 1)
@@ -940,7 +834,7 @@ cpu_fallback_rest:
 	 * destination ranges are disjoint from everything copied here.
 	 */
 	if (nr_entries) {
-		io_dma_unmap_batch_entries(req, dev, entries, nr_entries);
+		io_dma_unmap_batch(req->ctx, dev, entries, nr_entries, false);
 		for (i = 0; i < nr_entries; i++) {
 			void __user *dst_ua = (void __user *)
 				(dst_base_addr + dma_src[i].dst_off);
@@ -1039,39 +933,36 @@ static ssize_t io_dma_submit_single_entry(struct io_kiocb *req,
 		return -EFAULT;
 	}
 
-	req->dma.dma_refcnt++;
-
-	if (!req->dma.dma_tasks) {
-		req->dma.dma_tasks = dma;
-		req->dma.dma_tasks_tail = dma;
-	} else {
-		req->dma.dma_tasks_tail->next = dma;
-		req->dma.dma_tasks_tail = dma;
-	}
+	io_dma_task_link(req, dma);
 
 	return entry->src_len;
 }
 
 /*
- * Unmap source DMA mappings for batch entries on error paths.
+ * Release the source side of batch entries: unmap each DMA mapping (skipped
+ * under IOMMU passthrough) and, when put_folios is set, drop the folio ref a
+ * page-cache source took. Used by the error path (folio refs not yet taken ->
+ * put_folios=false), task completion, and the teardown drain.
  */
-static void io_dma_unmap_batch_entries(struct io_kiocb *req,
-				       struct device *dev,
-				       struct io_dma_batch_entry *entries,
-				       unsigned int nr)
+void io_dma_unmap_batch(struct io_ring_ctx *ctx, struct device *dev,
+			struct io_dma_batch_entry *entries, unsigned int nr,
+			bool put_folios)
 {
 	unsigned int i;
 
-	if (req->ctx->dma.use_phys_addrs)
-		return;
-
 	for (i = 0; i < nr; i++) {
-		if (entries[i].src_is_page)
-			dma_unmap_page(dev, entries[i].src_dma,
-				       entries[i].src_len, DMA_TO_DEVICE);
-		else
-			dma_unmap_single(dev, entries[i].src_dma,
-					 entries[i].src_len, DMA_TO_DEVICE);
+		struct io_dma_batch_entry *e = &entries[i];
+
+		if (!ctx->dma.use_phys_addrs) {
+			if (e->src_is_page)
+				dma_unmap_page(dev, e->src_dma, e->src_len,
+					       DMA_TO_DEVICE);
+			else
+				dma_unmap_single(dev, e->src_dma, e->src_len,
+						 DMA_TO_DEVICE);
+		}
+		if (put_folios && e->src_is_page)
+			folio_put(e->folio);
 	}
 }
 
@@ -1097,9 +988,9 @@ static ssize_t io_dma_flush_batch(struct io_kiocb *req,
 			ret = io_dma_submit_single_entry(req, chan, &entries[i]);
 			if (ret < 0) {
 				/* Unmap remaining entries */
-				io_dma_unmap_batch_entries(req, dev,
-							  entries + i + 1,
-							  nr_entries - i - 1);
+				io_dma_unmap_batch(req->ctx, dev,
+						   entries + i + 1,
+						   nr_entries - i - 1, false);
 				return total > 0 ? total : ret;
 			}
 			total += ret;
@@ -1109,7 +1000,7 @@ static ssize_t io_dma_flush_batch(struct io_kiocb *req,
 
 	ret = io_dma_submit_batch(req, dev, chan, entries, nr_entries);
 	if (ret < 0)
-		io_dma_unmap_batch_entries(req, dev, entries, nr_entries);
+		io_dma_unmap_batch(req->ctx, dev, entries, nr_entries, false);
 	return ret;
 }
 
@@ -1316,24 +1207,8 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
 
 	/* Clean up source DMA mappings and folio references */
 	if (dma->is_batch) {
-		int i;
-
-		for (i = 0; i < dma->batch_nr; i++) {
-			struct io_dma_batch_entry *e = &dma->batch_entries[i];
-
-			if (!req->ctx->dma.use_phys_addrs) {
-				if (e->src_is_page)
-					dma_unmap_page(dev, e->src_dma,
-						       e->src_len,
-						       DMA_TO_DEVICE);
-				else
-					dma_unmap_single(dev, e->src_dma,
-							 e->src_len,
-							 DMA_TO_DEVICE);
-			}
-			if (e->src_is_page)
-				folio_put(e->folio);
-		}
+		io_dma_unmap_batch(req->ctx, dev, dma->batch_entries,
+				   dma->batch_nr, true);
 		kfree(dma->batch_entries);
 	} else {
 		if (dma->src_map_len && !req->ctx->dma.use_phys_addrs) {
