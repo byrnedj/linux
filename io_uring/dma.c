@@ -1322,28 +1322,45 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
 		}
 
 		/*
-		 * The recv only reaches the DMA path while poll-armed (io_recv
-		 * gates on REQ_F_POLLED), so the req is always in the poll
-		 * cancel-hash here. Drive every completion through poll ownership
-		 * (io_poll_kick) so io_poll_task_func does the single hash_del:
+		 * Complete according to whether the req is still poll-armed.
 		 *
-		 *  - multishot success: post an aux CQE and stay armed. io_recv's
-		 *    prelude flushes pending_aux_cqe before the next sock_recvmsg.
-		 *  - terminal (one-shot recv, or a multishot DMA error): set the
-		 *    saved result and tear the poll down via dma_terminal, which
-		 *    io_poll_check_events() turns into IOU_POLL_REMOVE_POLL_USE_RES.
+		 * Multishot recv stays poll-armed across reissues (its apoll is
+		 * not EPOLLONESHOT; io_poll_check_events() reissues it in place),
+		 * so it is still in the poll cancel-hash. Drive completion through
+		 * poll ownership (io_poll_kick) so io_poll_task_func() does the
+		 * single hash_del() and we do not race poll's task_work llist:
+		 *  - success: post an aux CQE and stay armed (pending_aux_cqe);
+		 *    io_recv's prelude flushes it before the next sock_recvmsg.
+		 *  - DMA error: terminate via dma_terminal, which
+		 *    io_poll_check_events() turns into REMOVE_POLL_USE_RES.
+		 *
+		 * One-shot recv: its apoll is EPOLLONESHOT, so the first poll
+		 * event already tore it down (io_poll_task_func(): hash_del() +
+		 * io_req_task_submit()) before this reissue offloaded to DMA. The
+		 * req is no longer poll-armed and io_poll_kick() cannot reacquire
+		 * ownership, so complete it directly -- there is no poll task_work
+		 * to race. saved_res/saved_cflags were captured in io_recv().
 		 */
-		if (req->dma.dma_result >= 0 &&
-		    (req->flags & REQ_F_APOLL_MULTISHOT)) {
-			req->dma.pending_aux_cqe = true;
+		if (req->flags & REQ_F_APOLL_MULTISHOT) {
+			if (req->dma.dma_result >= 0) {
+				req->dma.pending_aux_cqe = true;
+			} else {
+				req_set_fail(req);
+				req->dma.saved_res = req->dma.dma_result;
+				req->dma.dma_terminal = true;
+			}
+			io_poll_kick(req);
 		} else {
 			if (req->dma.dma_result < 0) {
 				req_set_fail(req);
-				req->dma.saved_res = req->dma.dma_result;
+				io_req_set_res(req, req->dma.dma_result, 0);
+			} else {
+				io_req_set_res(req, req->dma.saved_res,
+					       req->dma.saved_cflags);
 			}
-			req->dma.dma_terminal = true;
+			req->io_task_work.func = io_req_task_complete;
+			io_req_task_work_add(req);
 		}
-		io_poll_kick(req);
 
 		/*
 		 * Drop the in-flight DMA reference taken in
