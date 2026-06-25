@@ -361,6 +361,28 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 	}
 
 	/*
+	 * Allocate everything that can fail BEFORE preparing the descriptor.
+	 * A prepared dmaengine descriptor has no unprepare API: once
+	 * dmaengine_prep_*() returns one it must be submitted or it leaks from
+	 * the engine's descriptor pool. So prep is the last fallible step
+	 * before dmaengine_submit().
+	 */
+	heap_entries = kmalloc_array(nr_entries, sizeof(*heap_entries),
+				     GFP_NOWAIT | __GFP_NOWARN);
+	if (!heap_entries) {
+		kfree(sgls);
+		return -ENOMEM;
+	}
+	memcpy(heap_entries, entries, nr_entries * sizeof(*heap_entries));
+
+	dma = io_dma_task_alloc(req->ctx);
+	if (!dma) {
+		kfree(heap_entries);
+		kfree(sgls);
+		return -ENOMEM;
+	}
+
+	/*
 	 * Request cache-control as usual: idxd applies it to the MEMMOVE
 	 * sub-descriptors (the data movement, so the destination is left
 	 * cache-warm for the app), and strips it from the DSA_OPCODE_BATCH
@@ -369,6 +391,8 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 	tx = dmaengine_prep_dma_memcpy_sg(chan, dst_sgl, nr_entries,
 					   src_sgl, nr_entries, io_dma_prep_flags());
 	if (!tx) {
+		io_dma_task_free(req->ctx, dma);
+		kfree(heap_entries);
 		kfree(sgls);
 		return -EAGAIN;
 	}
@@ -377,18 +401,6 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 	 * the driver copies what it needs into batch descriptors.
 	 */
 	kfree(sgls);
-
-	heap_entries = kmalloc_array(nr_entries, sizeof(*heap_entries),
-				     GFP_NOWAIT | __GFP_NOWARN);
-	if (!heap_entries)
-		return -ENOMEM;
-	memcpy(heap_entries, entries, nr_entries * sizeof(*heap_entries));
-
-	dma = io_dma_task_alloc(req->ctx);
-	if (!dma) {
-		kfree(heap_entries);
-		return -ENOMEM;
-	}
 
 	dma->req = req;
 	dma->next = NULL;
@@ -419,6 +431,14 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 static ssize_t io_dma_submit_single_entry(struct io_kiocb *req,
 					  struct dma_chan *chan,
 					  struct io_dma_batch_entry *entry);
+static ssize_t io_dma_submit_batch_sg(struct io_kiocb *req, struct device *dev,
+				      struct dma_chan *chan,
+				      struct io_dma_batch_entry *entries,
+				      unsigned int nr_entries);
+static ssize_t io_dma_recv_flush(struct io_kiocb *req, struct device *dev,
+				 struct dma_chan *chan,
+				 struct io_dma_batch_entry *entries,
+				 unsigned int nr_entries);
 
 ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 			struct iov_iter *src_iter,
@@ -526,7 +546,7 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	while (total_dma < len) {
 		size_t seg_avail, folio_remain, chunk_len;
 		void *src_kaddr;
-		dma_addr_t dst_dma, src_dma;
+		dma_addr_t dst_dma;
 
 		seg_avail = iter_iov_len(src_iter);
 		if (!seg_avail)
@@ -555,12 +575,12 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 			goto cpu_fallback_rest;
 		chunk_len = min_t(size_t, seg_avail, folio_remain);
 
-		src_dma = dma_map_single(dev, src_kaddr, chunk_len,
-					 DMA_TO_DEVICE);
-		if (dma_mapping_error(dev, src_dma))
-			goto cpu_fallback_rest;
-
-		entries[nr_entries].src_dma = src_dma;
+		/*
+		 * Record the chunk; the source is mapped later, once per batch
+		 * via dma_map_sg() in io_dma_recv_flush(). Deferring the map
+		 * means a chunk that is collected but never submitted (error
+		 * path) was never mapped, so it just needs a CPU copy.
+		 */
 		entries[nr_entries].dst_dma = dst_dma;
 		entries[nr_entries].src_kaddr = src_kaddr;
 		entries[nr_entries].dst_off = total_dma;
@@ -575,28 +595,18 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 
 		/* Flush a full batch and keep collecting. */
 		if (nr_entries == IO_DMA_BATCH_MAX) {
-			batch_ret = io_dma_submit_batch(req, dev, ctx->dma.chan,
-							entries, nr_entries);
+			batch_ret = io_dma_recv_flush(req, dev, ctx->dma.chan,
+						      entries, nr_entries);
 			if (batch_ret < 0)
 				goto cpu_fallback_rest;
 			nr_entries = 0;
 		}
 	}
 
-	/*
-	 * Flush the final partial batch. Same single-vs-batch cutoff as
-	 * io_dma_flush_batch() (1 -> memcpy, >=2 -> one batch descriptor), but
-	 * open-coded because the recv path recovers unsubmitted chunks via a CPU
-	 * copy on failure (cpu_fallback_rest, via entries[].src_kaddr), rather than
-	 * io_dma_flush_batch()'s unmap-and-return-error contract.
-	 */
+	/* Flush the final partial batch (single memcpy or one SG batch). */
 	if (nr_entries) {
-		if (nr_entries == 1)
-			batch_ret = io_dma_submit_single_entry(req,
-					ctx->dma.chan, &entries[0]);
-		else
-			batch_ret = io_dma_submit_batch(req, dev,
-					ctx->dma.chan, entries, nr_entries);
+		batch_ret = io_dma_recv_flush(req, dev, ctx->dma.chan,
+					      entries, nr_entries);
 		if (batch_ret < 0)
 			goto cpu_fallback_rest;
 		nr_entries = 0;
@@ -635,10 +645,12 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 
 cpu_fallback_rest:
 	/*
-	 * A chunk failed to map, a destination folio was unmapped, or a batch
-	 * failed to submit. Recover without losing data:
-	 *   - unmap and CPU-copy the chunks collected but not yet submitted
-	 *     (their CPU-reachable sources are entries[].src_kaddr);
+	 * A destination folio was unmapped or a batch failed to submit. Recover
+	 * without losing data:
+	 *   - CPU-copy the chunks collected but not yet submitted. Their source
+	 *     mapping is deferred to io_dma_recv_flush(), so these were never
+	 *     mapped (a failed flush unmaps its own batch); just copy from
+	 *     entries[].src_kaddr.
 	 *   - CPU-copy the deferred small segments;
 	 *   - CPU-copy the remainder [total_dma, len), whose source is exactly
 	 *     where src_iter now points (advanced per claimed chunk).
@@ -646,7 +658,6 @@ cpu_fallback_rest:
 	 * destination ranges are disjoint from everything copied here.
 	 */
 	if (nr_entries) {
-		io_dma_unmap_batch(req->ctx, dev, entries, nr_entries, false);
 		for (i = 0; i < nr_entries; i++) {
 			void __user *dst_ua = (void __user *)
 				(dst_base_addr + entries[i].dst_off);
@@ -699,6 +710,141 @@ cpu_fallback:
 EXPORT_SYMBOL_GPL(io_uring_copy_to_iter);
 
 /*
+ * Submit a recv batch (>=2 chunks), mapping all sources with a single
+ * dma_map_sg() instead of one dma_map_single() per chunk. dma_map_sg() may
+ * coalesce physically-contiguous sources into fewer segments; that is safe
+ * because idxd_dma_prep_memcpy_sg() walks the source and destination lists
+ * independently and re-splits at the finer boundary, so each pre-mapped
+ * destination chunk still gets its own MEMMOVE sub-descriptor. The mapped
+ * source SG is the unmap handle, held on the task until completion. recv
+ * sources are skb kvecs (no folio refs), so no batch_entries copy is kept.
+ */
+static ssize_t io_dma_submit_batch_sg(struct io_kiocb *req, struct device *dev,
+				      struct dma_chan *chan,
+				      struct io_dma_batch_entry *entries,
+				      unsigned int nr_entries)
+{
+	struct dma_async_tx_descriptor *tx;
+	struct scatterlist *src_sg, *dst_sg;
+	struct io_dma_task *dma;
+	size_t total_len = 0;
+	unsigned int dma_nents;
+	unsigned int i;
+
+	src_sg = kmalloc_array(nr_entries, sizeof(*src_sg),
+			       GFP_NOWAIT | __GFP_NOWARN);
+	if (!src_sg)
+		return -ENOMEM;
+	dst_sg = kmalloc_array(nr_entries, sizeof(*dst_sg),
+			       GFP_NOWAIT | __GFP_NOWARN);
+	if (!dst_sg) {
+		kfree(src_sg);
+		return -ENOMEM;
+	}
+
+	/* Map all source chunks in one shot. */
+	sg_init_table(src_sg, nr_entries);
+	for (i = 0; i < nr_entries; i++)
+		sg_set_buf(&src_sg[i], entries[i].src_kaddr, entries[i].src_len);
+
+	dma_nents = dma_map_sg(dev, src_sg, nr_entries, DMA_TO_DEVICE);
+	if (!dma_nents) {
+		kfree(dst_sg);
+		kfree(src_sg);
+		return -EFAULT;
+	}
+
+	/*
+	 * The destination is a pre-mapped registered/provided buffer: carry its
+	 * DMA addresses directly, uncoalesced (one segment per chunk).
+	 */
+	sg_init_table(dst_sg, nr_entries);
+	for (i = 0; i < nr_entries; i++) {
+		sg_dma_address(&dst_sg[i]) = entries[i].dst_dma;
+		sg_dma_len(&dst_sg[i]) = entries[i].src_len;
+		total_len += entries[i].src_len;
+	}
+
+	/*
+	 * Allocate the task BEFORE preparing the descriptor: a prepared
+	 * dmaengine descriptor has no unprepare API and must be submitted or
+	 * it leaks, so prep is the last fallible step before submit.
+	 */
+	dma = io_dma_task_alloc(req->ctx);
+	if (!dma) {
+		dma_unmap_sg(dev, src_sg, nr_entries, DMA_TO_DEVICE);
+		kfree(dst_sg);
+		kfree(src_sg);
+		return -ENOMEM;
+	}
+
+	tx = dmaengine_prep_dma_memcpy_sg(chan, dst_sg, nr_entries,
+					  src_sg, dma_nents, io_dma_prep_flags());
+	if (!tx) {
+		io_dma_task_free(req->ctx, dma);
+		dma_unmap_sg(dev, src_sg, nr_entries, DMA_TO_DEVICE);
+		kfree(dst_sg);
+		kfree(src_sg);
+		return -EAGAIN;
+	}
+
+	/* dst_sg is consumed by prep; src_sg is held for unmap at completion. */
+	kfree(dst_sg);
+
+	dma->req = req;
+	dma->next = NULL;
+	dma->len = total_len;
+	dma->is_batch = true;
+	dma->batch_nr = nr_entries;
+	dma->batch_entries = NULL;
+	dma->batch_src_sg = src_sg;
+	dma->batch_src_nents = nr_entries;
+
+	dma->cookie = dmaengine_submit(tx);
+	if (dma_submit_error(dma->cookie)) {
+		dma_unmap_sg(dev, src_sg, nr_entries, DMA_TO_DEVICE);
+		kfree(src_sg);
+		io_dma_task_free(req->ctx, dma);
+		return -EFAULT;
+	}
+
+	io_dma_task_link(req, dma);
+
+	return total_len;
+}
+
+/*
+ * Flush a collected recv batch. A lone chunk uses a plain memcpy descriptor
+ * (mapped here; a 1-entry SG batch is pure overhead); two or more go through
+ * io_dma_submit_batch_sg(). On failure the sources are left unmapped (the
+ * single map is undone here, the SG map is undone inside io_dma_submit_batch_sg)
+ * so the caller can CPU-copy them from src_kaddr.
+ */
+static ssize_t io_dma_recv_flush(struct io_kiocb *req, struct device *dev,
+				 struct dma_chan *chan,
+				 struct io_dma_batch_entry *entries,
+				 unsigned int nr_entries)
+{
+	ssize_t ret;
+	dma_addr_t src_dma;
+
+	if (nr_entries != 1)
+		return io_dma_submit_batch_sg(req, dev, chan, entries,
+					      nr_entries);
+
+	src_dma = dma_map_single(dev, entries[0].src_kaddr, entries[0].src_len,
+				 DMA_TO_DEVICE);
+	if (dma_mapping_error(dev, src_dma))
+		return -EFAULT;
+	entries[0].src_dma = src_dma;
+
+	ret = io_dma_submit_single_entry(req, chan, &entries[0]);
+	if (ret < 0 && !req->ctx->dma.use_phys_addrs)
+		dma_unmap_single(dev, src_dma, entries[0].src_len, DMA_TO_DEVICE);
+	return ret;
+}
+
+/*
  * Submit a single DMA descriptor for one batch entry. Used for a lone chunk,
  * where a 1-entry DSA batch descriptor would be pure overhead. The entry
  * already has DMA-mapped src_dma from the caller.
@@ -710,14 +856,21 @@ static ssize_t io_dma_submit_single_entry(struct io_kiocb *req,
 	struct dma_async_tx_descriptor *tx;
 	struct io_dma_task *dma;
 
-	tx = dmaengine_prep_dma_memcpy(chan, entry->dst_dma, entry->src_dma,
-				       entry->src_len, io_dma_prep_flags());
-	if (!tx)
-		return -EAGAIN;
-
+	/*
+	 * Allocate the task BEFORE preparing the descriptor: a prepared
+	 * dmaengine descriptor has no unprepare API and must be submitted or
+	 * it leaks, so prep is the last fallible step before submit.
+	 */
 	dma = io_dma_task_alloc(req->ctx);
 	if (!dma)
 		return -ENOMEM;
+
+	tx = dmaengine_prep_dma_memcpy(chan, entry->dst_dma, entry->src_dma,
+				       entry->src_len, io_dma_prep_flags());
+	if (!tx) {
+		io_dma_task_free(req->ctx, dma);
+		return -EAGAIN;
+	}
 
 	if (entry->src_is_page)
 		folio_get(entry->folio);
@@ -772,6 +925,27 @@ void io_dma_unmap_batch(struct io_ring_ctx *ctx, struct device *dev,
 		if (put_folios && e->src_is_page)
 			folio_put(e->folio);
 	}
+}
+
+/*
+ * Release a completed (or torn-down) batch task's source side. A recv batch
+ * carries a single dma_map_sg() mapping (batch_src_sg); everything else carries
+ * a per-entry batch_entries array. Called from task completion and the teardown
+ * drain, which must stay in sync.
+ */
+void io_dma_batch_cleanup(struct io_ring_ctx *ctx, struct device *dev,
+			  struct io_dma_task *dma)
+{
+	if (dma->batch_src_sg) {
+		if (!ctx->dma.use_phys_addrs)
+			dma_unmap_sg(dev, dma->batch_src_sg,
+				     dma->batch_src_nents, DMA_TO_DEVICE);
+		kfree(dma->batch_src_sg);
+	} else {
+		io_dma_unmap_batch(ctx, dev, dma->batch_entries, dma->batch_nr,
+				   true);
+	}
+	kfree(dma->batch_entries);	/* NULL for SG-mapped recv batches */
 }
 
 /*
@@ -1034,9 +1208,7 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
 
 	/* Clean up source DMA mappings and folio references */
 	if (dma->is_batch) {
-		io_dma_unmap_batch(req->ctx, dev, dma->batch_entries,
-				   dma->batch_nr, true);
-		kfree(dma->batch_entries);
+		io_dma_batch_cleanup(req->ctx, dev, dma);
 	} else {
 		if (dma->src_map_len && !req->ctx->dma.use_phys_addrs) {
 			if (dma->src_is_page)
