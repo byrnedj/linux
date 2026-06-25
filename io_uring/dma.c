@@ -591,15 +591,11 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	}
 
 	/*
-	 * Flush the final partial batch. A single chunk uses a plain memcpy
-	 * descriptor (a 1-entry batch descriptor is pure overhead); >=2 chunks
-	 * use one batch descriptor spanning all the collected frags/folios.
-	 *
-	 * This deliberately batches at >=2, unlike io_dma_flush_batch()'s
-	 * IO_DMA_BATCH_MIN (8) cutoff used by the page-cache read path: a recv's
-	 * payoff is merging the 2-segment skbs that dominate here into one
-	 * transaction, so routing this through io_dma_flush_batch() would leave
-	 * those as two descriptors and defeat the merge.
+	 * Flush the final partial batch. Same single-vs-batch cutoff as
+	 * io_dma_flush_batch() (1 -> memcpy, >=2 -> one batch descriptor), but
+	 * open-coded because the recv path recovers unsubmitted chunks via a CPU
+	 * copy on failure (cpu_fallback_rest, using dma_src[]), rather than
+	 * io_dma_flush_batch()'s unmap-and-return-error contract.
 	 */
 	if (nr_entries) {
 		if (nr_entries == 1)
@@ -713,12 +709,10 @@ cpu_fallback:
 }
 EXPORT_SYMBOL_GPL(io_uring_copy_to_iter);
 
-#define IO_DMA_BATCH_MIN	8
-
 /*
- * Submit a single DMA descriptor for one batch entry.
- * Used when nr_entries < IO_DMA_BATCH_MIN to avoid batch overhead.
- * The entry already has DMA-mapped src_dma from the caller.
+ * Submit a single DMA descriptor for one batch entry. Used for a lone chunk,
+ * where a 1-entry DSA batch descriptor would be pure overhead. The entry
+ * already has DMA-mapped src_dma from the caller.
  */
 static ssize_t io_dma_submit_single_entry(struct io_kiocb *req,
 					  struct dma_chan *chan,
@@ -792,38 +786,27 @@ void io_dma_unmap_batch(struct io_ring_ctx *ctx, struct device *dev,
 }
 
 /*
- * Flush collected batch entries.  Uses individual descriptors when below
- * IO_DMA_BATCH_MIN to avoid DSA batch descriptor overhead, and a single
- * batch descriptor otherwise.
+ * Flush collected batch entries: a single entry uses a plain memcpy
+ * descriptor (a 1-entry batch descriptor is pure overhead); two or more are
+ * submitted as one DSA batch descriptor. On submit failure the entries are
+ * unmapped (folio refs aren't taken until submit succeeds, so put_folios is
+ * false).
  */
 static ssize_t io_dma_flush_batch(struct io_kiocb *req,
 				  struct device *dev, struct dma_chan *chan,
 				  struct io_dma_batch_entry *entries,
 				  unsigned int nr_entries)
 {
-	ssize_t total = 0;
-	unsigned int i;
 	ssize_t ret;
 
 	if (!nr_entries)
 		return 0;
 
-	if (nr_entries < IO_DMA_BATCH_MIN) {
-		for (i = 0; i < nr_entries; i++) {
-			ret = io_dma_submit_single_entry(req, chan, &entries[i]);
-			if (ret < 0) {
-				/* Unmap remaining entries */
-				io_dma_unmap_batch(req->ctx, dev,
-						   entries + i + 1,
-						   nr_entries - i - 1, false);
-				return total > 0 ? total : ret;
-			}
-			total += ret;
-		}
-		return total;
-	}
+	if (nr_entries == 1)
+		ret = io_dma_submit_single_entry(req, chan, &entries[0]);
+	else
+		ret = io_dma_submit_batch(req, dev, chan, entries, nr_entries);
 
-	ret = io_dma_submit_batch(req, dev, chan, entries, nr_entries);
 	if (ret < 0)
 		io_dma_unmap_batch(req->ctx, dev, entries, nr_entries, false);
 	return ret;
