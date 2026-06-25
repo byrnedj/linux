@@ -2904,27 +2904,8 @@ static void io_release_dma_chan(struct io_ring_ctx *ctx)
 			 * already-degraded hung-hardware path, which is preferable.
 			 */
 			if (dma->is_batch) {
-				u8 i;
-
-				for (i = 0; i < dma->batch_nr; i++) {
-					struct io_dma_batch_entry *e =
-						&dma->batch_entries[i];
-
-					if (!ctx->dma.use_phys_addrs) {
-						if (e->src_is_page)
-							dma_unmap_page(dev,
-								e->src_dma,
-								e->src_len,
-								DMA_TO_DEVICE);
-						else
-							dma_unmap_single(dev,
-								e->src_dma,
-								e->src_len,
-								DMA_TO_DEVICE);
-					}
-					if (e->src_is_page)
-						folio_put(e->folio);
-				}
+				io_dma_unmap_batch(ctx, dev, dma->batch_entries,
+						   dma->batch_nr, true);
 				kfree(dma->batch_entries);
 			} else {
 				if (dma->src_map_len && !ctx->dma.use_phys_addrs) {
