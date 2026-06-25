@@ -13,6 +13,7 @@
 #include <uapi/linux/io_uring.h>
 
 struct folio;
+struct scatterlist;
 
 enum {
 	/*
@@ -332,7 +333,12 @@ struct io_dma_task {
 	bool			src_is_page;	/* true → dma_unmap_page, false → dma_unmap_single */
 	bool			is_batch;	/* true → batch task with batch_entries */
 	u8			batch_nr;	/* number of batch entries */
-	struct io_dma_batch_entry *batch_entries; /* heap-allocated cleanup array */
+	struct io_dma_batch_entry *batch_entries; /* heap-allocated cleanup array,
+						   * NULL for SG-mapped recv batches */
+	struct scatterlist	*batch_src_sg;	/* recv batch: source SG mapped with
+						 * one dma_map_sg(); the unmap handle,
+						 * freed at completion */
+	unsigned int		batch_src_nents;/* original nents for dma_unmap_sg() */
 	struct io_dma_task	*next;
 };
 
