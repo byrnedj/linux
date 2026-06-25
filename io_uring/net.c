@@ -1386,7 +1386,20 @@ retry_multishot:
 					 !!(req->flags & REQ_F_APOLL_MULTISHOT),
 					 req->dma.saved_cflags,
 					 kmsg->msg.msg_inq);
-				io_put_kbuf(req, req->dma.saved_res, sel.buf_list);
+				/*
+				 * A bundle recv consumed one provided buffer
+				 * per iovec segment; commit all of them, not
+				 * just the first, or the ring head diverges
+				 * from what the CQE reports and later recvs
+				 * scribble over buffers userspace still owns.
+				 * saved_cflags already carries the first bid,
+				 * which is all io_put_kbufs() would add.
+				 */
+				if (sr->flags & IORING_RECVSEND_BUNDLE)
+					io_put_kbufs(req, ret, sel.buf_list,
+						     io_bundle_nbufs(kmsg, ret));
+				else
+					io_put_kbuf(req, req->dma.saved_res, sel.buf_list);
 				/* For multishot recv, the completion task_work
 				 * needs to know this request has an in-flight
 				 * DMA so subsequent poll wakeups defer instead
