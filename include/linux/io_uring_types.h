@@ -362,14 +362,19 @@ struct io_dma_kiocb {
 struct io_dma_batch_entry {
 	dma_addr_t		src_dma;	/* DMA-mapped source address */
 	dma_addr_t		dst_dma;	/* pre-mapped dest DMA address */
-	u32			src_len;	/* source mapping length */
+	void			*src_kaddr;	/* CPU-reachable source; lets the
+						 * recv error path CPU-copy a chunk
+						 * collected but not yet submitted */
 	struct folio		*folio;		/* page cache folio ref, or NULL */
+	size_t			dst_off;	/* offset into the dst buffer, for
+						 * the same recv error-path CPU copy */
+	u32			src_len;	/* source mapping length */
 	bool			src_is_page;	/* src mapped via dma_map_page()
 						 * (folio source) vs dma_map_single()
 						 * (skb kvec source) */
 };
 
-#define IO_DMA_BATCH_MAX	32
+#define IO_DMA_BATCH_MAX	16
 
 struct io_dma_task {
 	struct io_kiocb		*req;

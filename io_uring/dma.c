@@ -432,7 +432,6 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	size_t len, total_dma;
 	unsigned int threshold;
 	u64 dst_base_addr;
-	struct io_dma_batch_entry *entries = NULL;
 	unsigned int nr_entries = 0;
 	unsigned int call_chunks = 0;
 	u64 call_t0;
@@ -488,8 +487,10 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	 * per-descriptor DMA overhead loses to a cache-hot memcpy, and the
 	 * copies overlap with in-flight DMA. Each records the source address
 	 * and destination offset; they are copied after the DMA is submitted.
+	 * Capped at 4 so this array plus the on-stack entries[] stay under the
+	 * frame-size limit; beyond the cap, small segments take the DMA path.
 	 */
-#define IO_DMA_CPU_DEFER_MAX	8
+#define IO_DMA_CPU_DEFER_MAX	4
 	struct io_dma_cpu_seg {
 		void *src;
 		size_t len;
@@ -508,21 +509,13 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	 * one latency sample — instead of one descriptor per frag. The batch is
 	 * flushed when full (IO_DMA_BATCH_MAX) and once at the end.
 	 *
-	 * dma_src[] mirrors the still-unflushed entries with the CPU-reachable
-	 * source address + destination offset, so the error path can CPU-copy a
-	 * chunk that was collected but not yet submitted to hardware (its length
-	 * is entries[i].src_len).
+	 * Each entry also carries its CPU-reachable source (src_kaddr) and
+	 * destination offset (dst_off) so the error path can CPU-copy a chunk
+	 * that was collected but not yet submitted to hardware. At
+	 * IO_DMA_BATCH_MAX == 16 the array is small enough to live on the stack,
+	 * which avoids a per-recv allocation on the hot path.
 	 */
-	struct io_dma_src_ref {
-		void *src;
-		size_t dst_off;
-	};
-	struct io_dma_src_ref dma_src[IO_DMA_BATCH_MAX];
-
-	entries = kmalloc_array(IO_DMA_BATCH_MAX, sizeof(*entries),
-				GFP_NOWAIT | __GFP_NOWARN);
-	if (!entries)
-		goto cpu_fallback;
+	struct io_dma_batch_entry entries[IO_DMA_BATCH_MAX];
 
 	/*
 	 * Walk the source one chunk at a time. src_iter is advanced per chunk
@@ -569,11 +562,11 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 
 		entries[nr_entries].src_dma = src_dma;
 		entries[nr_entries].dst_dma = dst_dma;
+		entries[nr_entries].src_kaddr = src_kaddr;
+		entries[nr_entries].dst_off = total_dma;
 		entries[nr_entries].src_len = chunk_len;
 		entries[nr_entries].folio = NULL;
 		entries[nr_entries].src_is_page = false;
-		dma_src[nr_entries].src = src_kaddr;
-		dma_src[nr_entries].dst_off = total_dma;
 		nr_entries++;
 		call_chunks++;
 
@@ -594,7 +587,7 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	 * Flush the final partial batch. Same single-vs-batch cutoff as
 	 * io_dma_flush_batch() (1 -> memcpy, >=2 -> one batch descriptor), but
 	 * open-coded because the recv path recovers unsubmitted chunks via a CPU
-	 * copy on failure (cpu_fallback_rest, using dma_src[]), rather than
+	 * copy on failure (cpu_fallback_rest, via entries[].src_kaddr), rather than
 	 * io_dma_flush_batch()'s unmap-and-return-error contract.
 	 */
 	if (nr_entries) {
@@ -608,9 +601,6 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 			goto cpu_fallback_rest;
 		nr_entries = 0;
 	}
-
-	kfree(entries);
-	entries = NULL;
 
 	/* Advance destination iterator past all processed bytes. */
 	iov_iter_advance(dst_iter, total_dma);
@@ -648,7 +638,7 @@ cpu_fallback_rest:
 	 * A chunk failed to map, a destination folio was unmapped, or a batch
 	 * failed to submit. Recover without losing data:
 	 *   - unmap and CPU-copy the chunks collected but not yet submitted
-	 *     (their CPU-reachable sources are in dma_src[]);
+	 *     (their CPU-reachable sources are entries[].src_kaddr);
 	 *   - CPU-copy the deferred small segments;
 	 *   - CPU-copy the remainder [total_dma, len), whose source is exactly
 	 *     where src_iter now points (advanced per claimed chunk).
@@ -659,8 +649,9 @@ cpu_fallback_rest:
 		io_dma_unmap_batch(req->ctx, dev, entries, nr_entries, false);
 		for (i = 0; i < nr_entries; i++) {
 			void __user *dst_ua = (void __user *)
-				(dst_base_addr + dma_src[i].dst_off);
-			unsigned long unc = copy_to_user(dst_ua, dma_src[i].src,
+				(dst_base_addr + entries[i].dst_off);
+			unsigned long unc = copy_to_user(dst_ua,
+							 entries[i].src_kaddr,
 							 entries[i].src_len);
 
 			if (unlikely(unc)) {
@@ -670,8 +661,6 @@ cpu_fallback_rest:
 		}
 		nr_entries = 0;
 	}
-	kfree(entries);
-	entries = NULL;
 
 	for (i = 0; i < nr_cpu_segs; i++) {
 		void __user *dst_ua =
