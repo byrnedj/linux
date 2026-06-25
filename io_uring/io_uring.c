@@ -2226,9 +2226,7 @@ static void io_release_dma_chan(struct io_ring_ctx *ctx)
 			 * already-degraded hung-hardware path, which is preferable.
 			 */
 			if (dma->is_batch) {
-				io_dma_unmap_batch(ctx, dev, dma->batch_entries,
-						   dma->batch_nr, true);
-				kfree(dma->batch_entries);
+				io_dma_batch_cleanup(ctx, dev, dma);
 			} else {
 				if (dma->src_map_len && !ctx->dma.use_phys_addrs) {
 					if (dma->src_is_page)
