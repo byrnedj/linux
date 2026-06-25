@@ -502,22 +502,6 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	total_dma = 0;
 	call_t0 = ktime_get_ns();
 
-	/*
-	 * Small source segments (< threshold) are deferred to a CPU-copy pass:
-	 * per-descriptor DMA overhead loses to a cache-hot memcpy, and the
-	 * copies overlap with in-flight DMA. Each records the source address
-	 * and destination offset; they are copied after the DMA is submitted.
-	 * Capped at 4 so this array plus the on-stack entries[] stay under the
-	 * frame-size limit; beyond the cap, small segments take the DMA path.
-	 */
-#define IO_DMA_CPU_DEFER_MAX	4
-	struct io_dma_cpu_seg {
-		void *src;
-		size_t len;
-		size_t dst_off;
-	};
-	struct io_dma_cpu_seg cpu_segs[IO_DMA_CPU_DEFER_MAX];
-	unsigned int nr_cpu_segs = 0;
 	unsigned int i;
 
 	/*
@@ -538,10 +522,18 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	struct io_dma_batch_entry entries[IO_DMA_BATCH_MAX];
 
 	/*
-	 * Walk the source one chunk at a time. src_iter is advanced per chunk
-	 * (and per deferred small segment), so it always points at the next
-	 * byte not yet claimed for DMA — which keeps the error path's CPU copy
-	 * of the remainder trivial.
+	 * Walk the source one chunk at a time. src_iter is advanced per chunk,
+	 * so it always points at the next byte not yet claimed for DMA — which
+	 * keeps the error path's CPU copy of the remainder trivial.
+	 *
+	 * Every segment of a DMA'd transfer rides in the batch, including ones
+	 * smaller than the threshold: the whole-transfer threshold gate above
+	 * already routes small recvs to a full CPU copy, so a transfer that
+	 * reaches here is worth DSA, and a sub-threshold segment is just one more
+	 * sub-descriptor in a batch we are already paying to build. Deferring
+	 * such segments to a CPU copy_to_user() pass (as an earlier design did)
+	 * burned ~2us of submit-thread time per recv copying data the engine
+	 * could move for ~free — the dominant cost in the submit path.
 	 */
 	while (total_dma < len) {
 		size_t seg_avail, folio_remain, chunk_len;
@@ -553,18 +545,6 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 			break;
 		seg_avail = min_t(size_t, seg_avail, len - total_dma);
 		src_kaddr = (void *)iter_iov_addr(src_iter);
-
-		/* Defer a small segment (or the small tail of one) to CPU. */
-		if (seg_avail < threshold &&
-		    nr_cpu_segs < IO_DMA_CPU_DEFER_MAX) {
-			cpu_segs[nr_cpu_segs].src = src_kaddr;
-			cpu_segs[nr_cpu_segs].len = seg_avail;
-			cpu_segs[nr_cpu_segs].dst_off = total_dma;
-			nr_cpu_segs++;
-			total_dma += seg_avail;
-			iov_iter_advance(src_iter, seg_avail);
-			continue;
-		}
 
 		/* Resolve the destination folio and clamp the chunk to it so no
 		 * single transfer crosses an IOMMU mapping.
@@ -615,30 +595,9 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	/* Advance destination iterator past all processed bytes. */
 	iov_iter_advance(dst_iter, total_dma);
 
-	/*
-	 * Kick the engine before the CPU pass so hardware starts immediately;
-	 * the CPU copies land in disjoint byte ranges and overlap the in-flight
-	 * DMA writes.
-	 */
+	/* Kick the engine so the hardware copies start immediately. */
 	if (req->dma.dma_refcnt > 0)
 		dma_async_issue_pending(ctx->dma.chan);
-
-	for (i = 0; i < nr_cpu_segs; i++) {
-		void __user *dst_ua =
-			(void __user *)(dst_base_addr + cpu_segs[i].dst_off);
-		unsigned long unc = copy_to_user(dst_ua, cpu_segs[i].src,
-						 cpu_segs[i].len);
-
-		if (unlikely(unc)) {
-			/*
-			 * Destination became unwritable. Back the undelivered
-			 * bytes out of total_dma so the recv reports a short
-			 * transfer rather than counting bytes never written.
-			 */
-			WARN_ON_ONCE(1);
-			total_dma -= unc;
-		}
-	}
 
 
 	return total_dma;
@@ -651,7 +610,6 @@ cpu_fallback_rest:
 	 *     mapping is deferred to io_dma_recv_flush(), so these were never
 	 *     mapped (a failed flush unmaps its own batch); just copy from
 	 *     entries[].src_kaddr.
-	 *   - CPU-copy the deferred small segments;
 	 *   - CPU-copy the remainder [total_dma, len), whose source is exactly
 	 *     where src_iter now points (advanced per claimed chunk).
 	 * Already-submitted batches are left to complete in hardware; their
@@ -672,19 +630,6 @@ cpu_fallback_rest:
 		}
 		nr_entries = 0;
 	}
-
-	for (i = 0; i < nr_cpu_segs; i++) {
-		void __user *dst_ua =
-			(void __user *)(dst_base_addr + cpu_segs[i].dst_off);
-		unsigned long unc = copy_to_user(dst_ua, cpu_segs[i].src,
-						 cpu_segs[i].len);
-
-		if (unlikely(unc)) {
-			WARN_ON_ONCE(1);
-			total_dma -= unc;
-		}
-	}
-	nr_cpu_segs = 0;
 
 	if (total_dma < len) {
 		ssize_t cpu_ret;
