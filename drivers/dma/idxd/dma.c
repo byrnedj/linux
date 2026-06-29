@@ -386,17 +386,45 @@ static enum dma_status idxd_dma_tx_status(struct dma_chan *dma_chan,
  */
 static void idxd_dma_issue_pending(struct dma_chan *dma_chan)
 {
+	struct idxd_dma_chan *idxd_chan =
+		container_of(dma_chan, struct idxd_dma_chan, chan);
+	struct idxd_wq *wq = idxd_chan->wq;
+	struct idxd_desc *desc, *n;
+	struct llist_node *head;
+
+	head = llist_del_all(&idxd_chan->issue_list);
+	if (!head)
+		return;
+	/* llist_del_all() reverses submission order; restore FIFO. */
+	head = llist_reverse_order(head);
+
+	llist_for_each_entry_safe(desc, n, head, llnode) {
+		int rc = idxd_submit_desc(wq, desc);
+
+		if (rc < 0) {
+			/*
+			 * Portal submit failed (e.g. a shared WQ is full;
+			 * idxd_submit_desc() has already removed the descriptor
+			 * from its pending_llist). Complete with an error so the
+			 * client's callback / cookie status reports failure
+			 * rather than the transfer silently never running.
+			 * Dedicated WQs use iosubmit_cmds512(), which can't fail.
+			 */
+			idxd_dma_complete_txd(desc, IDXD_COMPLETE_ABORT, true,
+					      NULL, NULL);
+		}
+	}
 }
 
 static dma_cookie_t idxd_dma_tx_submit(struct dma_async_tx_descriptor *tx)
 {
 	struct dma_chan *c = tx->chan;
-	pr_debug("idxd: have tx->chan\n");
-	struct idxd_wq *wq = to_idxd_wq(c);
-	pr_debug("idxd: have wq\n");
+	struct idxd_dma_chan *idxd_chan =
+		container_of(c, struct idxd_dma_chan, chan);
+	struct idxd_wq *wq = idxd_chan->wq;
+	struct idxd_desc *desc = container_of(tx, struct idxd_desc, txd);
 	dma_cookie_t cookie;
 	int rc;
-	struct idxd_desc *desc = container_of(tx, struct idxd_desc, txd);
 
 	cookie = (desc->gen << DESC_ID_BITS) | (desc->id & DESC_ID_MASK);
 
@@ -409,6 +437,23 @@ static dma_cookie_t idxd_dma_tx_submit(struct dma_async_tx_descriptor *tx)
 		desc->gen++;
 
 	tx->cookie = cookie;
+
+	/*
+	 * A completion-interrupt (RCI) descriptor can complete the instant the
+	 * engine starts, so its client needs a window to finish bookkeeping /
+	 * take references first: queue it and let idxd_dma_issue_pending() do the
+	 * portal write.
+	 *
+	 * Non-interrupt descriptors are reaped by polling and have no such race.
+	 * Submit them immediately so a portal-submit failure (a full shared WQ)
+	 * is returned synchronously as an error cookie, preserving the caller's
+	 * error handling (e.g. a CPU-copy fallback) rather than being deferred
+	 * into the void idxd_dma_issue_pending() path.
+	 */
+	if (desc->hw->flags & IDXD_OP_FLAG_RCI) {
+		llist_add(&desc->llnode, &idxd_chan->issue_list);
+		return cookie;
+	}
 
 	rc = idxd_submit_desc(wq, desc);
 	if (rc < 0) {
@@ -510,6 +555,7 @@ int idxd_register_dma_channel(struct idxd_dma_chan *ichan)
 	chan = &ichan->chan;
 	chan->device = dma;
 	list_add_tail(&chan->device_node, &dma->channels);
+	init_llist_head(&ichan->issue_list);
 
 	for (i = 0; i < wq->num_descs; i++) {
 		struct idxd_desc *desc = wq->descs[i];

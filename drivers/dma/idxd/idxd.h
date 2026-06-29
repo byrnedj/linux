@@ -186,6 +186,14 @@ enum idxd_op_type {
 struct idxd_dma_chan {
 	struct dma_chan chan;
 	struct idxd_wq *wq;
+
+	/*
+	 * Descriptors submitted via .device_tx_submit are queued here and only
+	 * written to the hardware portal by .device_issue_pending, per the
+	 * dmaengine contract. This lets a client finish bookkeeping / take
+	 * references for a descriptor before the engine can complete it.
+	 */
+	struct llist_head issue_list;
 };
 
 struct idxd_wq {
