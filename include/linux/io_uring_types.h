@@ -325,6 +325,18 @@ struct io_dma_channel {
 	struct work_struct	poll_work;
 	atomic_t		poll_armed;
 
+	/* Per-ctx completion kthread (busypoll/mwait modes); NULL falls back
+	 * to the poll_work kworker. Submit wakes it via compl_wait.
+	 */
+	struct task_struct	*compl_thread;
+	struct wait_queue_head	compl_wait;
+
+	/* IRQ mode: set true under ->lock just before dma_release_channel().
+	 * idxd's abort callbacks then orphan (unmap+free, no req completion)
+	 * instead of completing reqs in the unsafe late-teardown context.
+	 */
+	bool			releasing;
+
 	spinlock_t		lock;
 	struct io_dma_task	*head;
 	struct io_dma_task	*tail;
@@ -349,6 +361,10 @@ struct io_dma_kiocb {
 	struct io_dma_task	*dma_tasks_tail;
 	unsigned short		buf_group;	/* for DMA addr lookup */
 	bool			dma_active;	/* DMA copy armed for this req */
+	bool			irq_mode;	/* completion via dmaengine callback,
+						 * captured at prep so a mid-recv mode
+						 * switch can't split a req across the
+						 * IRQ and poll completion paths */
 	bool			dma_ref_held;	/* extra req ref held for in-flight DMA */
 	bool			mshot_in_flight; /* multishot recv awaiting DMA completion */
 	bool			pending_aux_cqe; /* DMA done, io_recv must post aux CQE */

@@ -1348,6 +1348,8 @@ retry_multishot:
 		/* DSA offload path: arm DMA; copy routes via io_uring_copy_to_iter. */
 		kmsg->msg.msg_io_iocb = req;
 		io_uring_dma_prep(req);
+		/* IRQ completion mode is recv-only; capture it once here. */
+		req->dma.irq_mode = io_dma_irq_mode();
 		req->dma.buf_group = sr->buf_group;
 	} else if (force_nonblock && IS_ERR_OR_NULL(req->ctx->dma.chan)) {
 		/*
