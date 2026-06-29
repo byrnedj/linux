@@ -2194,6 +2194,13 @@ static void io_release_dma_chan(struct io_ring_ctx *ctx)
 	struct device *dev;
 	int ret;
 
+	/*
+	 * Stop the completion kthread first, before tearing down any ctx->dma
+	 * state it touches. kthread_stop() waits for it to finish its current
+	 * __io_dma_poll() and exit, so no drain races the teardown below.
+	 */
+	io_dma_compl_thread_stop(ctx);
+
 	if (!IS_ERR_OR_NULL(ctx->dma.chan)) {
 		dev = ctx->dma.chan->device->dev;
 		dma = ctx->dma.head;
@@ -2265,6 +2272,19 @@ static void io_release_dma_chan(struct io_ring_ctx *ctx)
 	}
 
 	if (ctx->dma.chan && !IS_ERR(ctx->dma.chan)) {
+		unsigned long flags;
+
+		/*
+		 * IRQ mode: from here, idxd may abort still-in-flight descriptors
+		 * and invoke io_dma_irq_complete(). Mark the channel releasing
+		 * (under ->lock, which the callback also takes) so those abort
+		 * callbacks orphan the task instead of completing the req in this
+		 * unsafe late-teardown context.
+		 */
+		spin_lock_irqsave(&ctx->dma.lock, flags);
+		ctx->dma.releasing = true;
+		spin_unlock_irqrestore(&ctx->dma.lock, flags);
+
 		pr_info("io_uring DMA: releasing channel %s requester=%s[%d] tgid=%d ctx=%p\n",
 			dma_chan_name(ctx->dma.chan), current->comm,
 			task_pid_nr(current), task_tgid_nr(current), ctx);
@@ -2313,6 +2333,7 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 	INIT_WORK(&ctx->dma.poll_work, io_dma_poll_workfn);
 	atomic_set(&ctx->dma.poll_armed, 0);
 	io_dma_init_freelist(ctx, p);
+	io_dma_compl_thread_start(ctx);
 
 	return 0;
 failed:

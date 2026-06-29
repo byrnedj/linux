@@ -11,6 +11,10 @@
 #include <linux/swap.h>
 #include <linux/fs.h>
 #include <linux/scatterlist.h>
+#include <linux/timekeeping.h>
+#include <linux/debugfs.h>
+#include <linux/seq_file.h>
+#include <linux/kthread.h>
 #include "io_uring.h"
 #include "kbuf.h"
 #include "rsrc.h"
@@ -35,6 +39,235 @@ static inline unsigned long io_dma_prep_flags(void)
 {
 	return READ_ONCE(io_dma_cache_control) ? DMA_PREP_CACHE_CONTROL : 0;
 }
+
+/*
+ * DMA completion-detection mode, switchable at runtime via
+ * /sys/kernel/debug/io_uring_dma_completion_mode:
+ *
+ *  - kworker:  schedule_work() busy-poll on a shared kworker.
+ *  - mwait:    per-ctx kthread UMONITOR/UMWAITs on the completion record.
+ *  - irq:      interrupt-driven, no completion thread.
+ */
+enum {
+	IO_DMA_COMP_KWORKER,
+	IO_DMA_COMP_MWAIT,
+	IO_DMA_COMP_IRQ,
+	IO_DMA_COMP_NR,
+};
+static const char * const io_dma_comp_mode_names[IO_DMA_COMP_NR] = {
+	[IO_DMA_COMP_KWORKER]  = "kworker",
+	[IO_DMA_COMP_MWAIT]    = "mwait",
+	[IO_DMA_COMP_IRQ]      = "irq",
+};
+/* Default to the original kworker path so behaviour is unchanged until set. */
+static unsigned int io_dma_completion_mode __read_mostly = IO_DMA_COMP_KWORKER;
+
+/* For io_recv() (net.c) to capture the recv-only IRQ mode at prep time. */
+bool io_dma_irq_mode(void)
+{
+	return READ_ONCE(io_dma_completion_mode) == IO_DMA_COMP_IRQ;
+}
+
+/* dmaengine completion callback for IRQ mode; defined after the completion
+ * helpers it calls.
+ */
+static void io_dma_irq_complete(void *param, const struct dmaengine_result *res);
+
+/*
+ * Per-transaction latency tracking, split by copy engine (DMA vs CPU) and
+ * binned by transfer size. A "transaction" is one io_dma_task for the DMA
+ * side (descriptor or batch) and one io_dma_cpu_copy() call for the CPU side.
+ *
+ * Bins are contiguous so no transaction is uncounted -- this fills in the
+ * <4KB and 32-64KB bins that complete the requested set
+ * (4-8/8-16/16-32/64-128/128-256/256-512/512-1024KB and 1024KB+).
+ */
+static const struct {
+	size_t		max;	/* exclusive upper bound in bytes; 0 == catch-all */
+	const char	*label;
+} io_dma_lat_bins[] = {
+	{    4096, "<4KB"        },
+	{    8192, "4-8KB"      },
+	{   16384, "8-16KB"     },
+	{   32768, "16-32KB"    },
+	{   65536, "32-64KB"    },
+	{  131072, "64-128KB"   },
+	{  262144, "128-256KB"  },
+	{  524288, "256-512KB"  },
+	{ 1048576, "512KB-1MB"  },
+	{       0, ">=1MB"      },
+};
+#define IO_DMA_LAT_NBINS	ARRAY_SIZE(io_dma_lat_bins)
+
+struct io_dma_lat_stats {
+	atomic64_t	count[IO_DMA_LAT_NBINS];
+	atomic64_t	sum_ns[IO_DMA_LAT_NBINS];
+};
+
+static struct io_dma_lat_stats io_dma_lat_dma;	/* DSA transactions (per task) */
+static struct io_dma_lat_stats io_dma_lat_cpu;	/* CPU-copy transactions */
+static struct io_dma_lat_stats io_dma_lat_call;	/* DSA, per copy_to_iter call */
+
+/*
+ * Diagnostic: how many DMA descriptors (chunks) each io_uring_copy_to_iter()
+ * call emitted. Index 1..7 exact, index 8 = "8 or more"; index 0 unused. If
+ * this is overwhelmingly 1, each recv is a single source segment and there is
+ * nothing for batching to aggregate.
+ */
+#define IO_DMA_CHUNKS_HIST	9
+static atomic64_t io_dma_chunks_hist[IO_DMA_CHUNKS_HIST];
+
+static void io_dma_chunks_record(unsigned int n)
+{
+	if (n >= IO_DMA_CHUNKS_HIST)
+		n = IO_DMA_CHUNKS_HIST - 1;
+	atomic64_inc(&io_dma_chunks_hist[n]);
+}
+
+static unsigned int io_dma_lat_bin(size_t len)
+{
+	unsigned int i;
+
+	for (i = 0; i < IO_DMA_LAT_NBINS - 1; i++)
+		if (len < io_dma_lat_bins[i].max)
+			return i;
+	return IO_DMA_LAT_NBINS - 1;	/* catch-all */
+}
+
+static void io_dma_lat_record(struct io_dma_lat_stats *s, size_t len, u64 ns)
+{
+	unsigned int b = io_dma_lat_bin(len);
+
+	atomic64_inc(&s->count[b]);
+	atomic64_add(ns, &s->sum_ns[b]);
+}
+
+static void io_dma_lat_show_one(struct seq_file *m, const char *name,
+				struct io_dma_lat_stats *s)
+{
+	unsigned int i;
+
+	seq_printf(m, "%s:\n", name);
+	seq_printf(m, "  %-12s %12s %16s\n", "bin", "count", "avg_ns");
+	for (i = 0; i < IO_DMA_LAT_NBINS; i++) {
+		u64 count = atomic64_read(&s->count[i]);
+		u64 sum = atomic64_read(&s->sum_ns[i]);
+		u64 avg = count ? div64_u64(sum, count) : 0;
+
+		seq_printf(m, "  %-12s %12llu %16llu\n",
+			   io_dma_lat_bins[i].label, count, avg);
+	}
+}
+
+static int io_dma_lat_show(struct seq_file *m, void *v)
+{
+	unsigned int i;
+
+	io_dma_lat_show_one(m, "dma", &io_dma_lat_dma);
+	io_dma_lat_show_one(m, "cpu", &io_dma_lat_cpu);
+	io_dma_lat_show_one(m, "dma_call", &io_dma_lat_call);
+
+	seq_puts(m, "dma_chunks_per_call:\n");
+	for (i = 1; i < IO_DMA_CHUNKS_HIST; i++)
+		seq_printf(m, "  %u%-10s %12llu\n", i,
+			   i == IO_DMA_CHUNKS_HIST - 1 ? "+" : "",
+			   atomic64_read(&io_dma_chunks_hist[i]));
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(io_dma_lat);
+
+static void io_dma_lat_reset(struct io_dma_lat_stats *s)
+{
+	unsigned int i;
+
+	for (i = 0; i < IO_DMA_LAT_NBINS; i++) {
+		atomic64_set(&s->count[i], 0);
+		atomic64_set(&s->sum_ns[i], 0);
+	}
+}
+
+static ssize_t io_dma_lat_reset_write(struct file *file,
+				      const char __user *ubuf,
+				      size_t count, loff_t *ppos)
+{
+	unsigned int i;
+
+	io_dma_lat_reset(&io_dma_lat_dma);
+	io_dma_lat_reset(&io_dma_lat_cpu);
+	io_dma_lat_reset(&io_dma_lat_call);
+	for (i = 0; i < IO_DMA_CHUNKS_HIST; i++)
+		atomic64_set(&io_dma_chunks_hist[i], 0);
+	return count;
+}
+
+static const struct file_operations io_dma_lat_reset_fops = {
+	.owner		= THIS_MODULE,
+	.open		= simple_open,
+	.write		= io_dma_lat_reset_write,
+	.llseek		= noop_llseek,
+};
+
+static int io_dma_comp_mode_show(struct seq_file *m, void *v)
+{
+	unsigned int cur = READ_ONCE(io_dma_completion_mode);
+	unsigned int i;
+
+	for (i = 0; i < IO_DMA_COMP_NR; i++)
+		seq_printf(m, "%s%s%s ", i == cur ? "[" : "",
+			   io_dma_comp_mode_names[i], i == cur ? "]" : "");
+	seq_putc(m, '\n');
+	return 0;
+}
+
+static int io_dma_comp_mode_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, io_dma_comp_mode_show, NULL);
+}
+
+static ssize_t io_dma_comp_mode_write(struct file *file, const char __user *ubuf,
+				      size_t len, loff_t *ppos)
+{
+	char buf[16], *mode;
+	unsigned int i;
+
+	if (len == 0 || len >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, len))
+		return -EFAULT;
+	buf[len] = '\0';
+	mode = strim(buf);
+
+	for (i = 0; i < IO_DMA_COMP_NR; i++) {
+		if (strcmp(mode, io_dma_comp_mode_names[i]))
+			continue;
+		/* mwait is not wired up yet. */
+		if (i == IO_DMA_COMP_MWAIT)
+			return -EOPNOTSUPP;
+		WRITE_ONCE(io_dma_completion_mode, i);
+		return len;
+	}
+	return -EINVAL;
+}
+
+static const struct file_operations io_dma_comp_mode_fops = {
+	.owner		= THIS_MODULE,
+	.open		= io_dma_comp_mode_open,
+	.read		= seq_read,
+	.write		= io_dma_comp_mode_write,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
+void io_dma_debugfs_init(void)
+{
+	debugfs_create_file("io_uring_dma_latency", 0444, NULL, NULL,
+			    &io_dma_lat_fops);
+	debugfs_create_file("io_uring_dma_latency_reset", 0200, NULL, NULL,
+			    &io_dma_lat_reset_fops);
+	debugfs_create_file("io_uring_dma_completion_mode", 0644, NULL, NULL,
+			    &io_dma_comp_mode_fops);
+}
+
 /* Datapath alloc: pool first, then non-blocking slab, never sleeps. */
 static struct io_dma_task *io_dma_task_alloc(struct io_ring_ctx *ctx)
 {
@@ -127,6 +360,79 @@ void io_dma_poll_workfn(struct work_struct *w)
 	} while (READ_ONCE(ctx->dma.head));
 }
 
+/*
+ * Per-ctx completion kthread for the mwait mode. Sleeps
+ * until a submission wakes it (io_dma_submit_queued_tasks -> wake_up), then
+ * drains __io_dma_poll() until the in-flight list empties. __io_dma_poll() is
+ * serialized against the teardown drain via ctx->dma.poll_armed, so it is safe
+ * to run here concurrently with io_ring_exit_work().
+ */
+static int io_dma_compl_thread_fn(void *data)
+{
+	struct io_ring_ctx *ctx = data;
+
+	while (!kthread_should_stop()) {
+		wait_event_interruptible(ctx->dma.compl_wait,
+					 READ_ONCE(ctx->dma.head) ||
+					 kthread_should_stop());
+
+		while (READ_ONCE(ctx->dma.head) && !kthread_should_stop()) {
+			__io_dma_poll(ctx);
+			if (!READ_ONCE(ctx->dma.head))
+				break;
+			/*
+			 * Wait between drains. mwait (UMONITOR/UMWAIT on the
+			 * head completion record) lands in a later step; until
+			 * then the thread spins between passes.
+			 */
+			cpu_relax();
+		}
+	}
+	return 0;
+}
+
+/*
+ * Start the per-ctx completion kthread, pinned to a CPU on the DMA device's
+ * NUMA node (required for mwait to monitor the device's writes).
+ * On failure compl_thread stays NULL and the submit path falls back to the
+ * poll_work kworker, so this never fails channel setup.
+ */
+void io_dma_compl_thread_start(struct io_ring_ctx *ctx)
+{
+	struct task_struct *t;
+	int node, cpu;
+
+	init_waitqueue_head(&ctx->dma.compl_wait);
+	ctx->dma.compl_thread = NULL;
+
+	t = kthread_create(io_dma_compl_thread_fn, ctx, "iou-dmac/%d",
+			   task_pid_nr(current));
+	if (IS_ERR(t)) {
+		pr_warn("io_uring DMA: completion kthread create failed (%pe); "
+			"using kworker fallback\n", t);
+		return;
+	}
+
+	node = dev_to_node(ctx->dma.chan->device->dev);
+	cpu = (node != NUMA_NO_NODE) ? cpumask_first(cpumask_of_node(node))
+				     : nr_cpu_ids;
+	if (cpu >= nr_cpu_ids)
+		cpu = cpumask_first(cpu_online_mask);
+	kthread_bind(t, cpu);
+
+	ctx->dma.compl_thread = t;
+	wake_up_process(t);
+}
+
+/* Stop the completion kthread. Safe to call when it was never started. */
+void io_dma_compl_thread_stop(struct io_ring_ctx *ctx)
+{
+	if (ctx->dma.compl_thread) {
+		kthread_stop(ctx->dma.compl_thread);
+		ctx->dma.compl_thread = NULL;
+	}
+}
+
 static int __io_dma_task_submit(struct dma_chan *chan, struct io_dma_task *dma)
 {
 	struct dma_async_tx_descriptor *tx;
@@ -182,6 +488,15 @@ void io_uring_dma_prep(struct io_kiocb *req)
 	req->flags |= REQ_F_POLL_NO_LAZY;
 
 	req->dma.dma_active = true;
+	/*
+	 * Default to the poll/kworker completion path. IRQ mode is opt-in and
+	 * recv-only: io_recv() sets irq_mode after this, capturing the knob
+	 * once so copy_to_iter (arms the interrupt), io_dma_submit_queued_tasks
+	 * (head vs callback) and the doorbell all agree even if the knob flips
+	 * mid-recv. The page-cache read path (which also calls this) stays on
+	 * the poll path.
+	 */
+	req->dma.irq_mode = false;
 	req->dma.dma_refcnt = 0;
 	req->dma.dma_ref_held = false;
 	req->dma.dma_terminal = false;
@@ -595,8 +910,12 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	/* Advance destination iterator past all processed bytes. */
 	iov_iter_advance(dst_iter, total_dma);
 
-	/* Kick the engine so the hardware copies start immediately. */
-	if (req->dma.dma_refcnt > 0)
+	/*
+	 * Kick the engine so the hardware copies start immediately — except in
+	 * IRQ mode, where the doorbell is deferred to io_dma_submit_queued_tasks
+	 * so the in-flight ref is taken before any completion interrupt fires.
+	 */
+	if (req->dma.dma_refcnt > 0 && !req->dma.irq_mode)
 		dma_async_issue_pending(ctx->dma.chan);
 
 
@@ -639,7 +958,8 @@ cpu_fallback_rest:
 		if (cpu_ret > 0)
 			total_dma += cpu_ret;
 	}
-	if (req->dma.dma_refcnt > 0)
+	/* IRQ mode defers the doorbell to io_dma_submit_queued_tasks (see above). */
+	if (req->dma.dma_refcnt > 0 && !req->dma.irq_mode)
 		dma_async_issue_pending(ctx->dma.chan);
 	return total_dma;
 
@@ -723,8 +1043,10 @@ static ssize_t io_dma_submit_batch_sg(struct io_kiocb *req, struct device *dev,
 		return -ENOMEM;
 	}
 
-	tx = dmaengine_prep_dma_memcpy_sg(chan, dst_sg, nr_entries,
-					  src_sg, dma_nents, io_dma_prep_flags());
+	tx = dmaengine_prep_dma_memcpy_sg(chan, dst_sg, nr_entries, src_sg,
+			dma_nents,
+			io_dma_prep_flags() |
+			(req->dma.irq_mode ? DMA_PREP_INTERRUPT : 0));
 	if (!tx) {
 		io_dma_task_free(req->ctx, dma);
 		dma_unmap_sg(dev, src_sg, nr_entries, DMA_TO_DEVICE);
@@ -744,6 +1066,14 @@ static ssize_t io_dma_submit_batch_sg(struct io_kiocb *req, struct device *dev,
 	dma->batch_entries = NULL;
 	dma->batch_src_sg = src_sg;
 	dma->batch_src_nents = nr_entries;
+
+	/* IRQ mode: completion arrives via io_dma_irq_complete(); interrupt
+	 * descriptors can't be polled (idxd returns DMA_IN_PROGRESS for them).
+	 */
+	if (req->dma.irq_mode) {
+		tx->callback_result = io_dma_irq_complete;
+		tx->callback_param = dma;
+	}
 
 	dma->cookie = dmaengine_submit(tx);
 	if (dma_submit_error(dma->cookie)) {
@@ -811,7 +1141,9 @@ static ssize_t io_dma_submit_single_entry(struct io_kiocb *req,
 		return -ENOMEM;
 
 	tx = dmaengine_prep_dma_memcpy(chan, entry->dst_dma, entry->src_dma,
-				       entry->src_len, io_dma_prep_flags());
+			entry->src_len,
+			io_dma_prep_flags() |
+			(req->dma.irq_mode ? DMA_PREP_INTERRUPT : 0));
 	if (!tx) {
 		io_dma_task_free(req->ctx, dma);
 		return -EAGAIN;
@@ -830,6 +1162,12 @@ static ssize_t io_dma_submit_single_entry(struct io_kiocb *req,
 	dma->src_folio = entry->src_is_page ? entry->folio : NULL;
 	dma->src_is_page = entry->src_is_page;
 	dma->is_batch = false;
+
+	/* IRQ mode (recv only): complete via io_dma_irq_complete(). */
+	if (req->dma.irq_mode) {
+		tx->callback_result = io_dma_irq_complete;
+		tx->callback_param = dma;
+	}
 
 	dma->cookie = dmaengine_submit(tx);
 	if (dma_submit_error(dma->cookie)) {
@@ -1257,6 +1595,62 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
 	}
 }
 
+/*
+ * Release a task's resources without completing the req. Used by the IRQ
+ * callback during channel release (ctx->dma.releasing): idxd aborts any
+ * still-in-flight descriptor and invokes the callback, but completing the req
+ * that late would need io_free_req() whose task_work falls back onto the
+ * tearing-down ctx -> UAF (see io_release_dma_chan). So unmap + free the task
+ * and leave the req's in-flight ref leaked, exactly as io_release_dma_chan
+ * does for a hung task. Confined to the already-degraded teardown path.
+ */
+static void io_dma_task_release_orphan(struct io_ring_ctx *ctx,
+				       struct device *dev,
+				       struct io_dma_task *dma)
+{
+	if (dma->is_batch) {
+		io_dma_batch_cleanup(ctx, dev, dma);
+	} else {
+		if (dma->src_map_len && !ctx->dma.use_phys_addrs) {
+			if (dma->src_is_page)
+				dma_unmap_page(dev, dma->src_map_addr,
+					       dma->src_map_len, DMA_TO_DEVICE);
+			else
+				dma_unmap_single(dev, dma->src_map_addr,
+						 dma->src_map_len, DMA_TO_DEVICE);
+		}
+		if (dma->src_folio)
+			folio_put(dma->src_folio);
+	}
+	kmem_cache_free(dma_cachep, dma);
+}
+
+/*
+ * IRQ-mode completion. Runs in idxd's threaded IRQ (process context, no idxd
+ * lock held). Interrupt descriptors can't be polled, so this is the only
+ * completion path for them. Take ctx->dma.lock so __io_dma_task_complete()
+ * runs under the same serialization the poll path gives it (notably the
+ * non-atomic dma_refcnt, and against any concurrent drain). If the channel is
+ * being released, orphan the task instead of completing (see above).
+ */
+static void io_dma_irq_complete(void *param, const struct dmaengine_result *res)
+{
+	struct io_dma_task *dma = param;
+	struct io_kiocb *req = dma->req;
+	struct io_ring_ctx *ctx = req->ctx;
+	struct device *dev = ctx->dma.chan->device->dev;
+	int status = (res && res->result == DMA_TRANS_NOERROR) ?
+		     DMA_COMPLETE : DMA_ERROR;
+	unsigned long flags;
+
+	spin_lock_irqsave(&ctx->dma.lock, flags);
+	if (ctx->dma.releasing)
+		io_dma_task_release_orphan(ctx, dev, dma);
+	else
+		__io_dma_task_complete(dev, dma, status);
+	spin_unlock_irqrestore(&ctx->dma.lock, flags);
+}
+
 int io_dma_submit_queued_tasks(struct io_kiocb *req)
 {
 	struct io_ring_ctx *ctx = req->ctx;
@@ -1268,38 +1662,50 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 	if (req->dma.dma_active) {
 		pr_debug("submit_queued: refcnt=%d\n", req->dma.dma_refcnt);
 		if (req->dma.dma_refcnt > 0) {
-			struct io_dma_task *t = req->dma.dma_tasks;
-			struct io_dma_task *next;
-			unsigned long flags;
+			if (req->dma.irq_mode) {
+				/*
+				 * IRQ mode: each task completes via its dmaengine
+				 * callback (io_dma_irq_complete), so they are not
+				 * polled and don't go on ctx->dma.head. The doorbell
+				 * is deferred to the -EIOCBQUEUED branch below so the
+				 * in-flight ref is taken before any callback can fire.
+				 */
+				req->dma.dma_tasks = NULL;
+				req->dma.dma_tasks_tail = NULL;
+			} else {
+				struct io_dma_task *t = req->dma.dma_tasks;
+				struct io_dma_task *next;
+				unsigned long flags;
 
-			spin_lock_irqsave(&ctx->dma.lock, flags);
-			while (t) {
-				next = t->next;
+				spin_lock_irqsave(&ctx->dma.lock, flags);
+				while (t) {
+					next = t->next;
 
-				if (t->cookie == 0 && ctx->dma.head == NULL) {
-					spin_unlock_irqrestore(&ctx->dma.lock, flags);
-					pr_err("dma_prep failed unexpectedly\n");
-					__io_dma_task_complete(
-						ctx->dma.chan->device->dev,
-						t, DMA_ERROR);
-					spin_lock_irqsave(&ctx->dma.lock, flags);
+					if (t->cookie == 0 && ctx->dma.head == NULL) {
+						spin_unlock_irqrestore(&ctx->dma.lock, flags);
+						pr_err("dma_prep failed unexpectedly\n");
+						__io_dma_task_complete(
+							ctx->dma.chan->device->dev,
+							t, DMA_ERROR);
+						spin_lock_irqsave(&ctx->dma.lock, flags);
+						t = next;
+						continue;
+					}
+
+					t->next = NULL;
+					if (ctx->dma.tail == NULL)
+						ctx->dma.head = t;
+					else
+						ctx->dma.tail->next = t;
+					ctx->dma.tail = t;
+
 					t = next;
-					continue;
 				}
+				spin_unlock_irqrestore(&ctx->dma.lock, flags);
 
-				t->next = NULL;
-				if (ctx->dma.tail == NULL)
-					ctx->dma.head = t;
-				else
-					ctx->dma.tail->next = t;
-				ctx->dma.tail = t;
-
-				t = next;
+				req->dma.dma_tasks = NULL;
+				req->dma.dma_tasks_tail = NULL;
 			}
-			spin_unlock_irqrestore(&ctx->dma.lock, flags);
-
-			req->dma.dma_tasks = NULL;
-			req->dma.dma_tasks_tail = NULL;
 
 			/*
 			 * Hold a reference for the in-flight DMA. io_recv is
@@ -1348,10 +1754,26 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 		 * re-enter io_poll_kick() for this same req while io_recv is
 		 * still unwinding — double-completing it (manifests as an
 		 * imbalanced file-ref put / req double-free at exit). Defer all
-		 * completion to poll_work, which runs from a clean context.
+		 * completion to a clean context: the per-ctx kthread in mwait
+		 * mode (woken here), otherwise the poll_work kworker. A NULL
+		 * compl_thread (create failed) also falls back to the kworker.
 		 */
-		if (READ_ONCE(ctx->dma.head))
-			schedule_work(&ctx->dma.poll_work);
+		if (req->dma.irq_mode) {
+			/*
+			 * IRQ mode: ring the doorbell now, after the in-flight
+			 * ref was taken above, so a completion callback can never
+			 * run __io_dma_task_complete() before the ref exists.
+			 * Tasks are not on ctx->dma.head; the callbacks complete
+			 * them.
+			 */
+			dma_async_issue_pending(ctx->dma.chan);
+		} else if (READ_ONCE(ctx->dma.head)) {
+			if (READ_ONCE(io_dma_completion_mode) == IO_DMA_COMP_MWAIT &&
+			    ctx->dma.compl_thread)
+				wake_up(&ctx->dma.compl_wait);
+			else
+				schedule_work(&ctx->dma.poll_work);
+		}
 	} else if (atomic_read(&ctx->dma.poll_armed) == 0) {
 		/*
 		 * No task was queued for this req (e.g. CPU fallback). Draining
@@ -1380,8 +1802,20 @@ int __io_dma_poll(struct io_ring_ctx *ctx)
 	if (IS_ERR_OR_NULL(ctx->dma.chan))
 		goto out_disarm;
 
-	dma_async_issue_pending(ctx->dma.chan);
-
+	/*
+	 * Do NOT ring the channel doorbell here. dma_async_issue_pending() is
+	 * channel-global, and an IRQ-mode request deliberately leaves its
+	 * descriptors unissued between dmaengine_submit() in
+	 * io_uring_copy_to_iter() and the ref-then-doorbell sequence in
+	 * io_dma_submit_queued_tasks(): a ring from this context — which runs
+	 * with no uring_lock serialization against that window — would let a
+	 * completion interrupt fire before the in-flight ref exists and before
+	 * TCP has unlinked the source skb (double-complete, receive-queue
+	 * corruption). Nothing on ctx->dma.head needs a kick anyway: pollable
+	 * (non-interrupt) descriptors reach the hardware at dmaengine_submit()
+	 * time (see idxd_dma_tx_submit), and every submitter rings for its own
+	 * tasks from the issue path, under uring_lock.
+	 */
 	dev = ctx->dma.chan->device->dev;
 
 	spin_lock_irqsave(&ctx->dma.lock, flags);
