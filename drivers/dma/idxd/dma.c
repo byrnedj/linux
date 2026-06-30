@@ -656,8 +656,10 @@ static dma_cookie_t idxd_dma_tx_submit(struct dma_async_tx_descriptor *tx)
 	struct dma_chan *c = tx->chan;
 	struct idxd_dma_chan *idxd_chan =
 		container_of(c, struct idxd_dma_chan, chan);
+	struct idxd_wq *wq = idxd_chan->wq;
 	struct idxd_desc *desc = container_of(tx, struct idxd_desc, txd);
 	dma_cookie_t cookie;
+	int rc;
 
 	cookie = (desc->gen << DESC_ID_BITS) | (desc->id & DESC_ID_MASK);
 
@@ -672,11 +674,27 @@ static dma_cookie_t idxd_dma_tx_submit(struct dma_async_tx_descriptor *tx)
 	tx->cookie = cookie;
 
 	/*
-	 * Queue the descriptor; the portal write (idxd_submit_desc) is deferred
-	 * to idxd_dma_issue_pending(), so the descriptor cannot start/complete
-	 * until the client has issued.
+	 * A completion-interrupt (RCI) descriptor can complete the instant the
+	 * engine starts, so its client needs a window to finish bookkeeping /
+	 * take references first: queue it and let idxd_dma_issue_pending() do the
+	 * portal write.
+	 *
+	 * Non-interrupt descriptors are reaped by polling and have no such race.
+	 * Submit them immediately so a portal-submit failure (a full shared WQ)
+	 * is returned synchronously as an error cookie, preserving the caller's
+	 * error handling (e.g. a CPU-copy fallback) rather than being deferred
+	 * into the void idxd_dma_issue_pending() path.
 	 */
-	llist_add(&desc->llnode, &idxd_chan->issue_list);
+	if (desc->hw->flags & IDXD_OP_FLAG_RCI) {
+		llist_add(&desc->llnode, &idxd_chan->issue_list);
+		return cookie;
+	}
+
+	rc = idxd_submit_desc(wq, desc);
+	if (rc < 0) {
+		idxd_free_desc(wq, desc);
+		return rc;
+	}
 
 	return cookie;
 }
