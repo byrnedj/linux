@@ -685,6 +685,28 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 	}
 
 	/*
+	 * Allocate everything that can fail BEFORE preparing the descriptor.
+	 * A prepared dmaengine descriptor has no unprepare API: once
+	 * dmaengine_prep_*() returns one it must be submitted or it leaks from
+	 * the engine's descriptor pool. So prep is the last fallible step
+	 * before dmaengine_submit().
+	 */
+	heap_entries = kmalloc_array(nr_entries, sizeof(*heap_entries),
+				     GFP_NOWAIT | __GFP_NOWARN);
+	if (!heap_entries) {
+		kfree(sgls);
+		return -ENOMEM;
+	}
+	memcpy(heap_entries, entries, nr_entries * sizeof(*heap_entries));
+
+	dma = io_dma_task_alloc(req->ctx);
+	if (!dma) {
+		kfree(heap_entries);
+		kfree(sgls);
+		return -ENOMEM;
+	}
+
+	/*
 	 * Request cache-control as usual: idxd applies it to the MEMMOVE
 	 * sub-descriptors (the data movement, so the destination is left
 	 * cache-warm for the app), and strips it from the DSA_OPCODE_BATCH
@@ -693,6 +715,8 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 	tx = dmaengine_prep_dma_memcpy_sg(chan, dst_sgl, nr_entries,
 					   src_sgl, nr_entries, io_dma_prep_flags());
 	if (!tx) {
+		io_dma_task_free(req->ctx, dma);
+		kfree(heap_entries);
 		kfree(sgls);
 		return -EAGAIN;
 	}
@@ -701,18 +725,6 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 	 * the driver copies what it needs into batch descriptors.
 	 */
 	kfree(sgls);
-
-	heap_entries = kmalloc_array(nr_entries, sizeof(*heap_entries),
-				     GFP_NOWAIT | __GFP_NOWARN);
-	if (!heap_entries)
-		return -ENOMEM;
-	memcpy(heap_entries, entries, nr_entries * sizeof(*heap_entries));
-
-	dma = io_dma_task_alloc(req->ctx);
-	if (!dma) {
-		kfree(heap_entries);
-		return -ENOMEM;
-	}
 
 	dma->req = req;
 	dma->next = NULL;
@@ -1050,11 +1062,25 @@ static ssize_t io_dma_submit_batch_sg(struct io_kiocb *req, struct device *dev,
 		total_len += entries[i].src_len;
 	}
 
+	/*
+	 * Allocate the task BEFORE preparing the descriptor: a prepared
+	 * dmaengine descriptor has no unprepare API and must be submitted or
+	 * it leaks, so prep is the last fallible step before submit.
+	 */
+	dma = io_dma_task_alloc(req->ctx);
+	if (!dma) {
+		dma_unmap_sg(dev, src_sg, nr_entries, DMA_TO_DEVICE);
+		kfree(dst_sg);
+		kfree(src_sg);
+		return -ENOMEM;
+	}
+
 	tx = dmaengine_prep_dma_memcpy_sg(chan, dst_sg, nr_entries, src_sg,
 			dma_nents,
 			io_dma_prep_flags() |
 			(req->dma.irq_mode ? DMA_PREP_INTERRUPT : 0));
 	if (!tx) {
+		io_dma_task_free(req->ctx, dma);
 		dma_unmap_sg(dev, src_sg, nr_entries, DMA_TO_DEVICE);
 		kfree(dst_sg);
 		kfree(src_sg);
@@ -1063,13 +1089,6 @@ static ssize_t io_dma_submit_batch_sg(struct io_kiocb *req, struct device *dev,
 
 	/* dst_sg is consumed by prep; src_sg is held for unmap at completion. */
 	kfree(dst_sg);
-
-	dma = io_dma_task_alloc(req->ctx);
-	if (!dma) {
-		dma_unmap_sg(dev, src_sg, nr_entries, DMA_TO_DEVICE);
-		kfree(src_sg);
-		return -ENOMEM;
-	}
 
 	dma->req = req;
 	dma->next = NULL;
@@ -1145,16 +1164,23 @@ static ssize_t io_dma_submit_single_entry(struct io_kiocb *req,
 	struct dma_async_tx_descriptor *tx;
 	struct io_dma_task *dma;
 
+	/*
+	 * Allocate the task BEFORE preparing the descriptor: a prepared
+	 * dmaengine descriptor has no unprepare API and must be submitted or
+	 * it leaks, so prep is the last fallible step before submit.
+	 */
+	dma = io_dma_task_alloc(req->ctx);
+	if (!dma)
+		return -ENOMEM;
+
 	tx = dmaengine_prep_dma_memcpy(chan, entry->dst_dma, entry->src_dma,
 			entry->src_len,
 			io_dma_prep_flags() |
 			(req->dma.irq_mode ? DMA_PREP_INTERRUPT : 0));
-	if (!tx)
+	if (!tx) {
+		io_dma_task_free(req->ctx, dma);
 		return -EAGAIN;
-
-	dma = io_dma_task_alloc(req->ctx);
-	if (!dma)
-		return -ENOMEM;
+	}
 
 	if (entry->src_is_page)
 		folio_get(entry->folio);
