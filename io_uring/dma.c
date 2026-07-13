@@ -13,6 +13,7 @@
 #include <linux/scatterlist.h>
 #include "io_uring.h"
 #include "rsrc.h"
+#include "refs.h"
 
 #ifndef pr_fmt
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -165,6 +166,15 @@ void io_uring_dma_prep(struct io_kiocb *req)
 		return;
 
 	req->dma.dma_active = true;
+	/*
+	 * dma_ref_held is deliberately NOT reset here: it is set/cleared
+	 * only under ctx->dma.lock by the submit/complete ref protocol, and
+	 * a reissue can reach this prep while the previous cycle's
+	 * completer may still be about to drop the previous in-flight ref.
+	 * Clearing the flag here would erase that pending drop and leak one
+	 * req reference per race.  A fresh req needs no init: the submit
+	 * path sets it.
+	 */
 	req->dma.dma_refcnt = 0;
 	req->dma.dma_result = 0;
 	req->dma.dma_tasks = NULL;
@@ -678,6 +688,21 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
 			req->io_task_work.func = io_req_task_complete;
 			io_req_task_work_add(req);
 		}
+
+		/*
+		 * Drop the in-flight DMA reference taken in
+		 * io_dma_submit_queued_tasks(). The completion handling above
+		 * only queues task_work — it does not free the req inline —
+		 * so the req is still valid here. If we held the last
+		 * reference (the req was already terminally
+		 * completed/cancelled, e.g. by teardown), free it now;
+		 * otherwise the owner frees it once it drops its reference.
+		 */
+		if (req->dma.dma_ref_held) {
+			req->dma.dma_ref_held = false;
+			if (req_ref_put_and_test(req))
+				io_free_req(req);
+		}
 	}
 }
 
@@ -692,34 +717,56 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 	if (req->dma.dma_active) {
 		pr_debug("submit_queued: refcnt=%d\n", req->dma.dma_refcnt);
 		if (req->dma.dma_refcnt > 0) {
-			struct io_dma_task *t = req->dma.dma_tasks;
-			struct io_dma_task *next;
 			unsigned long flags;
 
+			/*
+			 * Take the in-flight DMA reference BEFORE the tasks
+			 * become reachable by any completer. The hardware
+			 * doorbell was already rung by the submit path
+			 * (io_dma_filemap_read()), so the instant the tasks
+			 * are published to ctx->dma.head below a concurrent
+			 * drain -- the poll_work kworker or io_ring_exit_work
+			 * -- can reach dma_refcnt == 0 in
+			 * __io_dma_task_complete(). Were the ref taken after
+			 * publishing, that drain would complete the req, see
+			 * dma_ref_held == false and drop nothing, and this path
+			 * would then set refcount/dma_ref_held on an
+			 * already-completed req: double-complete / orphaned ref /
+			 * use-after-free. Taking it here (before publish)
+			 * closes the window; dropped in
+			 * __io_dma_task_complete() at dma_refcnt == 0.
+			 * Mirrors io_wq_submit_work().
+			 *
+			 * The take must ALSO be under ctx->dma.lock, the lock
+			 * every completer holds through its dma_refcnt == 0
+			 * block. A reissue can reach here while the PREVIOUS
+			 * cycle's completer may still be between completing the
+			 * request and dropping the previous in-flight ref.
+			 * Taken unlocked, this ref/flag write interleaves into
+			 * that window: the completer then either skips its drop
+			 * or donates it to the new cycle, and one reference
+			 * leaks each time. The lock orders this take strictly
+			 * after that drop.
+			 */
 			spin_lock_irqsave(&ctx->dma.lock, flags);
-			while (t) {
-				next = t->next;
+			if (!(req->flags & REQ_F_REFCOUNT))
+				__io_req_set_refcount(req, 2);
+			else
+				req_ref_get(req);
+			req->dma.dma_ref_held = true;
 
-				if (t->cookie == 0 && ctx->dma.head == NULL) {
-					spin_unlock_irqrestore(&ctx->dma.lock, flags);
-					pr_err("dma_prep failed unexpectedly\n");
-					__io_dma_task_complete(
-						ctx->dma.chan->device->dev,
-						t, DMA_ERROR);
-					spin_lock_irqsave(&ctx->dma.lock, flags);
-					t = next;
-					continue;
-				}
-
-				t->next = NULL;
-				if (ctx->dma.tail == NULL)
-					ctx->dma.head = t;
-				else
-					ctx->dma.tail->next = t;
-				ctx->dma.tail = t;
-
-				t = next;
-			}
+			/*
+			 * Splice the req's task list onto ctx->dma.head.
+			 * Every task on the list was fully submitted with
+			 * a valid cookie (tasks are linked only after
+			 * dmaengine_submit() succeeds), so the pollers can
+			 * consume the list as-is.
+			 */
+			if (ctx->dma.tail == NULL)
+				ctx->dma.head = req->dma.dma_tasks;
+			else
+				ctx->dma.tail->next = req->dma.dma_tasks;
+			ctx->dma.tail = req->dma.dma_tasks_tail;
 			spin_unlock_irqrestore(&ctx->dma.lock, flags);
 
 			req->dma.dma_tasks = NULL;

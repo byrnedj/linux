@@ -347,6 +347,7 @@ struct io_dma_kiocb {
 	struct io_dma_task	*dma_tasks;
 	struct io_dma_task	*dma_tasks_tail;
 	bool			dma_active;	/* DMA copy armed for this req */
+	bool			dma_ref_held;	/* extra req ref held for in-flight DMA */
 	u64			dst_user_addr;	/* user VA for reg buf DMA lookup */
 };
 
