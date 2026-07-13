@@ -2806,6 +2806,7 @@ static int tcp_recvmsg_locked(struct sock *sk, struct msghdr *msg, size_t len,
 	target = sock_rcvlowat(sk, flags & MSG_WAITALL, len);
 
 	do {
+		bool dma_owned = false;
 		u32 offset;
 
 		/* Are we at urgent data? Stop if we have read anything or have SIGURG pending. */
@@ -2991,6 +2992,14 @@ found_ok_skb:
 						 */
 						if (err > 0)
 							err = 0;
+						/*
+						 * Only on success does the DMA engine take
+						 * over the skb (cb_fn frees it on completion);
+						 * on any other path through this iteration the
+						 * eat below must free the skb itself.
+						 */
+						if (!err)
+							dma_owned = true;
 					}
 				} else {
 					/* Pure CPU copy: either no iocb, or a partial
@@ -3062,7 +3071,7 @@ skip_copy:
 		if (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN)
 			goto found_fin_ok;
 		if (!(flags & MSG_PEEK))
-			tcp_eat_recv_skb(sk, skb, !msg->msg_io_iocb);
+			tcp_eat_recv_skb(sk, skb, !dma_owned);
 
 		if (!msg->msg_io_iocb)
 			continue;
@@ -3073,7 +3082,7 @@ found_fin_ok:
 		/* Process the FIN. */
 		WRITE_ONCE(*seq, *seq + 1);
 		if (!(flags & MSG_PEEK))
-			tcp_eat_recv_skb(sk, skb, !msg->msg_io_iocb);
+			tcp_eat_recv_skb(sk, skb, !dma_owned);
 		break;
 	} while (len > 0);
 
