@@ -1682,6 +1682,37 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 	if (req->dma.dma_active) {
 		pr_debug("submit_queued: refcnt=%d\n", req->dma.dma_refcnt);
 		if (req->dma.dma_refcnt > 0) {
+			/*
+			 * Take the in-flight DMA reference BEFORE the tasks
+			 * become reachable by any completer. In non-IRQ mode the
+			 * hardware doorbell was already rung in
+			 * io_uring_copy_to_iter(), so the instant the tasks are
+			 * published to ctx->dma.head below (under ctx->dma.lock) a
+			 * concurrent drain -- the poll_work kworker, the busypoll
+			 * kthread, or io_ring_exit_work -- can reach
+			 * dma_refcnt == 0 in __io_dma_task_complete(). Were the ref
+			 * taken after publishing, that drain would complete the
+			 * req, see dma_ref_held == false and drop nothing, and this
+			 * path would then set refcount/dma_ref_held on an
+			 * already-completed req: double-complete / orphaned ref /
+			 * use-after-free. Taking it here (before publish, and
+			 * before IRQ mode's deferred doorbell) closes the window;
+			 * the completer serialises on ctx->dma.lock and observes
+			 * the ref. Dropped in __io_dma_task_complete() at
+			 * dma_refcnt == 0. Mirrors io_wq_submit_work().
+			 *
+			 * io_recv is about to return IOU_ISSUE_SKIP_COMPLETE,
+			 * handing the req to the DMA engine while it stays in the
+			 * poll cancel-hash; without this ref, teardown
+			 * cancellation (io_poll_remove_all) could free the still-
+			 * hashed req while DMA references it.
+			 */
+			if (!(req->flags & REQ_F_REFCOUNT))
+				__io_req_set_refcount(req, 2);
+			else
+				req_ref_get(req);
+			req->dma.dma_ref_held = true;
+
 			if (req->dma.irq_mode) {
 				/*
 				 * IRQ mode: each task completes via its dmaengine
@@ -1726,24 +1757,6 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 				req->dma.dma_tasks = NULL;
 				req->dma.dma_tasks_tail = NULL;
 			}
-
-			/*
-			 * Hold a reference for the in-flight DMA. io_recv is
-			 * about to return IOU_ISSUE_SKIP_COMPLETE, handing the
-			 * req off to the DMA engine, but the req remains in the
-			 * poll cancel-hash. Without this ref, ring-teardown
-			 * cancellation (io_poll_remove_all) could free the req
-			 * while DMA still references it (and while it is still
-			 * hashed) -> use-after-free. The ref keeps it alive until
-			 * the last task completes; dropped in
-			 * __io_dma_task_complete() at dma_refcnt == 0. Mirrors the
-			 * io-wq reference pattern in io_wq_submit_work().
-			 */
-			if (!(req->flags & REQ_F_REFCOUNT))
-				__io_req_set_refcount(req, 2);
-			else
-				req_ref_get(req);
-			req->dma.dma_ref_held = true;
 
 			ret = -EIOCBQUEUED;
 		} else if (req->dma.cb_fn) {
