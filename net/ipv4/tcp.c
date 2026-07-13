@@ -2743,7 +2743,6 @@ static void cb_fn(struct kiocb *kiocb, void *arg, int err)
 }
 
 #define KVEC_MAX 256
-static DEFINE_PER_CPU(struct kvec[KVEC_MAX], tcp_recv_kvec);
 
 /*
  *	This routine copies from a sock struct into the user buffer.
@@ -2964,31 +2963,45 @@ found_ok_skb:
 					struct iov_iter src;
 					struct kvec *kv;
 					int kvec_len;
-					size_t avail = iov_iter_count(&msg->msg_iter);
 
-					pr_debug("tcp_recvmsg: used=%zu avail=%zu flags=0x%x\n",
-						 (size_t)used, avail, flags);
-
-					get_cpu();
-					kv = this_cpu_ptr(tcp_recv_kvec);
-					kvec_len = tcp_skb_to_kvec(skb, offset, used,
-								   kv, KVEC_MAX);
-					iov_iter_kvec(&src, READ, kv, kvec_len, used);
-					put_cpu();
-
-					pr_debug("tcp_recvmsg: kvec_len=%d\n", kvec_len);
-
-					err = io_uring_copy_to_iter((struct kiocb *)msg->msg_io_iocb, &msg->msg_iter,
-							&src, cb_fn, skb, 0);
-					/* io_uring_copy_to_iter returns positive byte count
-					 * on success, but the error check below expects 0.
+					/*
+					 * Describe the skb payload as a kvec for
+					 * io_uring_copy_to_iter(). That call reads the
+					 * kvec throughout its body -- including its
+					 * CPU-copy fallback, which can sleep -- and only
+					 * copies the source addresses into its own storage
+					 * before returning. The kvec must therefore stay
+					 * live and privately owned for the whole call, so it
+					 * cannot be a preempt-disabled per-CPU scratch
+					 * buffer: once put_cpu() re-enables preemption
+					 * another recvmsg on this CPU would overwrite it
+					 * mid-copy. Allocate a private kvec for the duration
+					 * of the call; on allocation failure fall back to a
+					 * plain CPU copy.
 					 */
-					if (err > 0)
-						err = 0;
+					kv = kmalloc_array(KVEC_MAX, sizeof(*kv),
+							   GFP_NOWAIT | __GFP_NOWARN);
+					if (!kv) {
+						err = skb_copy_datagram_msg(skb, offset,
+									    msg, used);
+					} else {
+						kvec_len = tcp_skb_to_kvec(skb, offset,
+									   used, kv, KVEC_MAX);
+						iov_iter_kvec(&src, READ, kv, kvec_len,
+							      used);
 
-					pr_debug("tcp_recvmsg: io_uring_copy ret=%d avail_after=%zu\n",
-						 err, iov_iter_count(&msg->msg_iter));
+						err = io_uring_copy_to_iter((struct kiocb *)msg->msg_io_iocb,
+								&msg->msg_iter, &src, cb_fn, skb, 0);
+						/*
+						 * io_uring_copy_to_iter() returns a positive
+						 * byte count on success; the check below
+						 * wants 0.
+						 */
+						if (err > 0)
+							err = 0;
 
+						kfree(kv);
+					}
 				} else {
 					/* Pure CPU copy: either no iocb, or a partial
 					 * skb read that must keep the skb on the queue.
