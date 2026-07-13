@@ -2974,12 +2974,35 @@ found_ok_skb:
 					 */
 					kv = io_uring_recv_kvec((struct kiocb *)msg->msg_io_iocb,
 								KVEC_MAX);
-					if (!kv) {
+					kvec_len = 0;
+					if (kv) {
+						kvec_len = tcp_skb_to_kvec(skb, offset,
+									   used, kv, KVEC_MAX);
+						/*
+						 * A completely full kvec may mean
+						 * tcp_skb_to_kvec() ran out of slots
+						 * before describing all 'used' bytes
+						 * (it can only truncate once every slot
+						 * is taken). Check, and treat a short
+						 * description like an allocation
+						 * failure: consuming only a prefix here
+						 * would advance *seq past bytes that
+						 * were never copied.
+						 */
+						if (kvec_len == KVEC_MAX) {
+							size_t described = 0;
+							int i;
+
+							for (i = 0; i < kvec_len; i++)
+								described += kv[i].iov_len;
+							if (described < used)
+								kvec_len = 0;
+						}
+					}
+					if (!kvec_len) {
 						err = skb_copy_datagram_msg(skb, offset,
 									    msg, used);
 					} else {
-						kvec_len = tcp_skb_to_kvec(skb, offset,
-									   used, kv, KVEC_MAX);
 						iov_iter_kvec(&src, READ, kv, kvec_len,
 							      used);
 
