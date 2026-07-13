@@ -117,7 +117,6 @@
 #include <net/addrconf.h>
 #include <net/udp_tunnel.h>
 #include <net/gro.h>
-#include <linux/io_uring.h>
 #if IS_ENABLED(CONFIG_IPV6)
 #include <net/ipv6_stubs.h>
 #endif
@@ -2052,98 +2051,6 @@ EXPORT_IPV6_MOD(udp_read_skb);
  * 	return it, otherwise we block.
  */
 
-static void cb_fn(struct kiocb *kiocb, void *arg, int err)
-{
-	struct sk_buff *skb = arg;
-	struct socket *socket = sock_from_file(kiocb->ki_filp);
-
-	skb_consume_udp(socket->sk, skb, err);
-}
-
-static int printkvec(struct sk_buff *skb, int off, int len, struct kvec *kvec)
-{
-	int start = skb_headlen(skb);
-	int copy = start - off;
-	int i;
-	int n = 0;
-	struct sk_buff *frag_iter;
-	struct kvec *saved_kvec = kvec;
-
-	/*
-	 * Advance kvec only when we actually write a slot. Previous version
-	 * indexed frags as kvec[i] and did "kvec += i" after the loop, which
-	 * left uninitialized slots whenever the linear region was bypassed
-	 * (off >= headlen) or leading frags were skipped (end <= off). The
-	 * per-CPU backing kvec then delivered stale iov_base pointers that
-	 * could land inside a recycled slab object (e.g., task_struct),
-	 * tripping usercopy hardening during copy_to_iter.
-	 */
-	if (copy > 0) {
-		if (copy > len)
-			copy = len;
-
-		kvec->iov_base = skb->data + off;
-		kvec->iov_len = copy;
-
-		if ((len -= copy) == 0)
-			return 1;
-		off += copy;
-		kvec++;
-	}
-
-
-	for (i = 0; len && i < skb_shinfo(skb)->nr_frags; i++) {
-		int end;
-		const skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
-
-		end = start + skb_frag_size(frag);
-
-
-		if ((copy = end - off) > 0) {
-			struct page *page = skb_frag_page(frag);
-			u8 *vaddr = kmap_local_page(page);
-
-			if (copy > len)
-				copy = len;
-
-			kvec->iov_base = vaddr + skb_frag_off(frag) + off - start;
-			kvec->iov_len = copy;
-			kvec++;
-			off += copy;
-			kunmap_local(vaddr);
-			len -= copy;
-		}
-		start = end;
-	}
-
-	skb_walk_frags(skb, frag_iter) {
-		int end;
-
-		WARN_ON(start > off + len);
-
-
-		end = start + frag_iter->len;
-		if ((copy = end - off) > 0) {
-			if (copy > len)
-				copy = len;
-
-			n = printkvec(frag_iter, off - start, copy, kvec);
-
-			off += copy;
-			kvec += n;
-			if ((len -= copy) == 0)
-				break;
-
-		}
-		start = end;
-
-	}
-
-	return kvec - saved_kvec;
-}
-
-static struct kvec kvec[256][128];
-
 int udp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags,
 		int *addr_len)
 {
@@ -2185,34 +2092,11 @@ try_again:
 			goto csum_copy_err;
 	}
 
-	if (checksum_valid || udp_skb_csum_unnecessary(skb) || msg->msg_io_iocb) {
-		if (msg->msg_io_iocb) {
-			struct iov_iter src;
-
-			if (udp_skb_is_linear(skb)) {
-				struct kvec kvec = { .iov_base = skb->data + off, .iov_len = copied };
-
-				iov_iter_kvec(&src, READ, &kvec, 1, copied);
-				err = io_uring_copy_to_iter((struct kiocb *)msg->msg_io_iocb, &msg->msg_iter,
-						&src, cb_fn, skb, 0);
-			} else {
-				int kvec_len;
-				int cpu = get_cpu();
-				kvec_len = printkvec(skb, off, copied, kvec[cpu]);
-				iov_iter_kvec(&src, READ, kvec[cpu], kvec_len, copied);
-				put_cpu();
-				err = io_uring_copy_to_iter((struct kiocb *)msg->msg_io_iocb, &msg->msg_iter,
-						&src, cb_fn, skb, 0);
-
-
-			}
-			return err;
-		} else {
-			if (udp_skb_is_linear(skb))
-				err = copy_linear_skb(skb, copied, off, &msg->msg_iter);
-			else
-				err = skb_copy_datagram_msg(skb, off, msg, copied);
-		}
+	if (checksum_valid || udp_skb_csum_unnecessary(skb)) {
+		if (udp_skb_is_linear(skb))
+			err = copy_linear_skb(skb, copied, off, &msg->msg_iter);
+		else
+			err = skb_copy_datagram_msg(skb, off, msg, copied);
 	} else {
 		err = skb_copy_and_csum_datagram_msg(skb, off, msg);
 
