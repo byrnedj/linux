@@ -1025,8 +1025,12 @@ struct kvec *io_uring_recv_kvec(struct kiocb *kiocb, unsigned int nr)
 	struct io_kiocb *req = cmd_to_io_kiocb(cmd);
 
 	if (req->dma.recv_kvec_nr < nr) {
-		struct kvec *kv = kmalloc_array(nr, sizeof(*kv),
-						GFP_NOWAIT | __GFP_NOWARN);
+		/*
+		 * The only caller is tcp_recvmsg_locked(), sleepable process
+		 * context, so reclaim is allowed: the NULL return (and the
+		 * caller's CPU-copy fallback) is all but unreachable.
+		 */
+		struct kvec *kv = kmalloc_array(nr, sizeof(*kv), GFP_KERNEL);
 		if (!kv)
 			return NULL;
 		kfree(req->dma.recv_kvec);
