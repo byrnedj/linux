@@ -586,6 +586,7 @@ static inline bool io_has_work(struct io_ring_ctx *ctx)
 }
 
 void io_uring_dma_prep(struct io_kiocb *req);
+void io_dma_free_recv_kvec(struct io_kiocb *req);
 void io_dma_init_freelist(struct io_ring_ctx *ctx, struct io_uring_params *p);
 void io_dma_debugfs_init(void);
 int io_dma_submit_queued_tasks(struct io_kiocb *req);

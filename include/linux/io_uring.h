@@ -43,6 +43,7 @@ ssize_t io_uring_copy_to_iter(struct kiocb *iocb, struct iov_iter *dst_iter,
 			struct iov_iter *src_iter,
 			void (*cb_fn)(struct kiocb *, void *, int), void *cb_arg,
 			unsigned long flags);
+struct kvec *io_uring_recv_kvec(struct kiocb *iocb, unsigned int nr);
 #else
 static inline void io_uring_task_cancel(void)
 {
@@ -71,6 +72,10 @@ static inline ssize_t io_uring_copy_to_iter(struct kiocb *iocb, struct iov_iter 
 			unsigned long flags)
 {
 	return -EOPNOTSUPP;
+}
+static inline struct kvec *io_uring_recv_kvec(struct kiocb *iocb, unsigned int nr)
+{
+	return NULL;
 }
 #endif
 

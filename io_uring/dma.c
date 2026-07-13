@@ -1007,6 +1007,49 @@ cpu_fallback:
 EXPORT_SYMBOL_GPL(io_uring_copy_to_iter);
 
 /*
+ * Hand the recv copy path a scratch kvec that stays live and privately owned
+ * for the whole (sleepable) io_uring_copy_to_iter() call. The buffer is cached
+ * on the request and reused across multishot recv reissues, so the steady
+ * state costs no allocation; it is freed when the req leaves the slab cache
+ * (io_dma_free_recv_kvec(), called from __io_req_caches_free()).
+ *
+ * A per-CPU buffer cannot serve this: io_uring_copy_to_iter() reads the kvec
+ * throughout its body, including its CPU-copy fallback which can sleep, so once
+ * preemption is re-enabled another recvmsg on the same CPU would clobber a
+ * shared buffer mid-copy. Returns NULL if the (first-use) allocation fails; the
+ * caller then falls back to a plain CPU copy.
+ */
+struct kvec *io_uring_recv_kvec(struct kiocb *kiocb, unsigned int nr)
+{
+	struct io_dma *cmd = container_of(kiocb, struct io_dma, kiocb);
+	struct io_kiocb *req = cmd_to_io_kiocb(cmd);
+
+	if (req->dma.recv_kvec_nr < nr) {
+		struct kvec *kv = kmalloc_array(nr, sizeof(*kv),
+						GFP_NOWAIT | __GFP_NOWARN);
+		if (!kv)
+			return NULL;
+		kfree(req->dma.recv_kvec);
+		req->dma.recv_kvec = kv;
+		req->dma.recv_kvec_nr = nr;
+	}
+	return req->dma.recv_kvec;
+}
+EXPORT_SYMBOL_GPL(io_uring_recv_kvec);
+
+/* Release a request's cached recv kvec. Called for every req as it leaves the
+ * slab cache; a no-op for reqs that never took the DMA recv path.
+ */
+void io_dma_free_recv_kvec(struct io_kiocb *req)
+{
+	if (req->dma.recv_kvec) {
+		kfree(req->dma.recv_kvec);
+		req->dma.recv_kvec = NULL;
+		req->dma.recv_kvec_nr = 0;
+	}
+}
+
+/*
  * Submit a recv batch (>=2 chunks), mapping all sources with a single
  * dma_map_sg() instead of one dma_map_single() per chunk. dma_map_sg() may
  * coalesce physically-contiguous sources into fewer segments; that is safe

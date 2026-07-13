@@ -2973,14 +2973,17 @@ found_ok_skb:
 					 * before returning. The kvec must therefore stay
 					 * live and privately owned for the whole call, so it
 					 * cannot be a preempt-disabled per-CPU scratch
-					 * buffer: once put_cpu() re-enables preemption
-					 * another recvmsg on this CPU would overwrite it
-					 * mid-copy. Allocate a private kvec for the duration
-					 * of the call; on allocation failure fall back to a
-					 * plain CPU copy.
+					 * buffer: once preemption is re-enabled another
+					 * recvmsg on this CPU would overwrite it mid-copy.
+					 *
+					 * io_uring_recv_kvec() hands back a buffer cached on
+					 * the request and reused across multishot reissues,
+					 * so the steady state allocates nothing. It returns
+					 * NULL only if the first-use allocation fails, in
+					 * which case fall back to a plain CPU copy.
 					 */
-					kv = kmalloc_array(KVEC_MAX, sizeof(*kv),
-							   GFP_NOWAIT | __GFP_NOWARN);
+					kv = io_uring_recv_kvec((struct kiocb *)msg->msg_io_iocb,
+								KVEC_MAX);
 					if (!kv) {
 						err = skb_copy_datagram_msg(skb, offset,
 									    msg, used);
@@ -2999,8 +3002,6 @@ found_ok_skb:
 						 */
 						if (err > 0)
 							err = 0;
-
-						kfree(kv);
 					}
 				} else {
 					/* Pure CPU copy: either no iocb, or a partial

@@ -2171,6 +2171,7 @@ static __cold void __io_req_caches_free(struct io_ring_ctx *ctx)
 
 	while (!io_req_cache_empty(ctx)) {
 		req = io_extract_req(ctx);
+		io_dma_free_recv_kvec(req);
 		io_poison_req(req);
 		kmem_cache_free(req_cachep, req);
 		nr++;
