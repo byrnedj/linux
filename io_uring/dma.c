@@ -126,31 +126,6 @@ void io_dma_poll_workfn(struct work_struct *w)
 	} while (READ_ONCE(ctx->dma.head));
 }
 
-static int __io_dma_task_submit(struct dma_chan *chan, struct io_dma_task *dma)
-{
-	struct dma_async_tx_descriptor *tx;
-
-	tx = dmaengine_prep_dma_memcpy(chan, dma->dst_dma, dma->src_dma,
-				       dma->len, io_dma_prep_flags());
-	if (!tx) {
-		pr_err("dma prep failed: len=%u src=0x%llx dst=0x%llx\n",
-		       dma->len, (u64)dma->src_dma, (u64)dma->dst_dma);
-		return -EAGAIN;
-	}
-
-	dma->cookie = dmaengine_submit(tx);
-	if (dma_submit_error(dma->cookie)) {
-		pr_debug("dma submit error: cookie=%d len=%u\n",
-			 dma->cookie, dma->len);
-		return -EFAULT;
-	}
-
-	pr_debug("dma task submitted: cookie=%d len=%u src=0x%llx dst=0x%llx\n",
-		 dma->cookie, dma->len,
-		 (u64)dma->src_dma, (u64)dma->dst_dma);
-	return 0;
-}
-
 /* TODO: Laid out like io_rw because we have to get back from this kiocb to the io_kiocb. */
 struct io_dma {
 	/* NOTE: kiocb has the file as the first member, so don't do it here */
@@ -795,8 +770,7 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 
 int __io_dma_poll(struct io_ring_ctx *ctx)
 {
-	struct io_dma_task *dma, *next, *prev;
-	struct io_kiocb *req;
+	struct io_dma_task *dma, *next;
 	int ret;
 	struct device *dev;
 	int count;
@@ -819,9 +793,6 @@ int __io_dma_poll(struct io_ring_ctx *ctx)
 	while (dma != NULL) {
 		next = dma->next;
 
-		if (dma->cookie == 0)
-			break;
-
 		ret = dmaengine_async_is_tx_complete(ctx->dma.chan,
 						     dma->cookie);
 		if (ret == DMA_IN_PROGRESS)
@@ -838,38 +809,6 @@ int __io_dma_poll(struct io_ring_ctx *ctx)
 	ctx->dma.head = dma;
 	if (!dma)
 		ctx->dma.tail = NULL;
-
-	/* Try to submit any entries that were queued with cookie==0 */
-	prev = NULL;
-	while (dma && count > 0) {
-		next = dma->next;
-
-		if (dma->cookie != 0) {
-			prev = dma;
-			dma = next;
-			continue;
-		}
-
-		req = dma->req;
-
-		ret = __io_dma_task_submit(ctx->dma.chan, dma);
-		if (ret != 0) {
-			if (prev)
-				prev->next = next;
-			else
-				ctx->dma.head = next;
-
-			if (ctx->dma.tail == dma)
-				ctx->dma.tail = prev;
-
-			__io_dma_task_complete(dev, dma, DMA_ERROR);
-		} else {
-			prev = dma;
-			count--;
-		}
-
-		dma = next;
-	}
 	spin_unlock_irqrestore(&ctx->dma.lock, flags);
 
 	pr_debug("poll: completed=%d remaining=%s\n",
