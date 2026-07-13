@@ -14,6 +14,7 @@
 
 struct folio;
 struct scatterlist;
+struct kvec;
 
 enum {
 	/*
@@ -317,6 +318,11 @@ struct io_dma_kiocb {
 	u64			dst_user_addr;	/* user VA for reg buf DMA lookup */
 	void (*cb_fn)(struct kiocb *, void *, int);
 	void			*cb_arg;
+	struct kvec		*recv_kvec;	/* cached recv-copy source kvec;
+						 * allocated on first use, reused
+						 * across multishot reissues, freed
+						 * when the req leaves the slab cache */
+	unsigned int		recv_kvec_nr;	/* capacity of recv_kvec, in entries */
 };
 
 struct io_dma_batch_entry {
