@@ -1842,8 +1842,20 @@ int __io_dma_poll(struct io_ring_ctx *ctx)
 	if (IS_ERR_OR_NULL(ctx->dma.chan))
 		goto out_disarm;
 
-	dma_async_issue_pending(ctx->dma.chan);
-
+	/*
+	 * Do NOT ring the channel doorbell here. dma_async_issue_pending() is
+	 * channel-global, and an IRQ-mode request deliberately leaves its
+	 * descriptors unissued between dmaengine_submit() in
+	 * io_uring_copy_to_iter() and the ref-then-doorbell sequence in
+	 * io_dma_submit_queued_tasks(): a ring from this context — which runs
+	 * with no uring_lock serialization against that window — would let a
+	 * completion interrupt fire before the in-flight ref exists and before
+	 * TCP has unlinked the source skb (double-complete, receive-queue
+	 * corruption). Nothing on ctx->dma.head needs a kick anyway: pollable
+	 * (non-interrupt) descriptors reach the hardware at dmaengine_submit()
+	 * time (see idxd_dma_tx_submit), and every submitter rings for its own
+	 * tasks from the issue path, under uring_lock.
+	 */
 	dev = ctx->dma.chan->device->dev;
 
 	spin_lock_irqsave(&ctx->dma.lock, flags);
