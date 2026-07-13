@@ -489,16 +489,21 @@ void io_uring_dma_prep(struct io_kiocb *req)
 
 	req->dma.dma_active = true;
 	/*
-	 * Default to the poll/kworker completion path. IRQ mode is opt-in and
-	 * recv-only: io_recv() sets irq_mode after this, capturing the knob
-	 * once so copy_to_iter (arms the interrupt), io_dma_submit_queued_tasks
-	 * (head vs callback) and the doorbell all agree even if the knob flips
-	 * mid-recv. The page-cache read path (which also calls this) stays on
-	 * the poll path.
+	 * Default to the poll/kworker completion path. IRQ mode is opt-in
+	 * and recv-only: io_recv() sets irq_mode after this, capturing the
+	 * knob once so the interrupt arming, the publish decision, and the
+	 * doorbell all agree even if the knob flips mid-recv.
+	 *
+	 * dma_ref_held is deliberately NOT reset here: it is set/cleared
+	 * only under ctx->dma.lock by the submit/complete ref protocol, and
+	 * a multishot reissue reaches this prep while the previous cycle's
+	 * completer may still be about to drop the previous in-flight ref.
+	 * Clearing the flag here would erase that pending drop and leak one
+	 * req reference per race.  A fresh req needs no init: the submit
+	 * path sets it.
 	 */
 	req->dma.irq_mode = false;
 	req->dma.dma_refcnt = 0;
-	req->dma.dma_ref_held = false;
 	req->dma.dma_terminal = false;
 	req->dma.dma_result = 0;
 	req->dma.dma_tasks = NULL;
@@ -1662,68 +1667,78 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 	if (req->dma.dma_active) {
 		pr_debug("submit_queued: refcnt=%d\n", req->dma.dma_refcnt);
 		if (req->dma.dma_refcnt > 0) {
-			if (req->dma.irq_mode) {
-				/*
-				 * IRQ mode: each task completes via its dmaengine
-				 * callback (io_dma_irq_complete), so they are not
-				 * polled and don't go on ctx->dma.head. The doorbell
-				 * is deferred to the -EIOCBQUEUED branch below so the
-				 * in-flight ref is taken before any callback can fire.
-				 */
-				req->dma.dma_tasks = NULL;
-				req->dma.dma_tasks_tail = NULL;
-			} else {
-				struct io_dma_task *t = req->dma.dma_tasks;
-				struct io_dma_task *next;
-				unsigned long flags;
-
-				spin_lock_irqsave(&ctx->dma.lock, flags);
-				while (t) {
-					next = t->next;
-
-					if (t->cookie == 0 && ctx->dma.head == NULL) {
-						spin_unlock_irqrestore(&ctx->dma.lock, flags);
-						pr_err("dma_prep failed unexpectedly\n");
-						__io_dma_task_complete(
-							ctx->dma.chan->device->dev,
-							t, DMA_ERROR);
-						spin_lock_irqsave(&ctx->dma.lock, flags);
-						t = next;
-						continue;
-					}
-
-					t->next = NULL;
-					if (ctx->dma.tail == NULL)
-						ctx->dma.head = t;
-					else
-						ctx->dma.tail->next = t;
-					ctx->dma.tail = t;
-
-					t = next;
-				}
-				spin_unlock_irqrestore(&ctx->dma.lock, flags);
-
-				req->dma.dma_tasks = NULL;
-				req->dma.dma_tasks_tail = NULL;
-			}
+			unsigned long flags;
 
 			/*
-			 * Hold a reference for the in-flight DMA. io_recv is
-			 * about to return IOU_ISSUE_SKIP_COMPLETE, handing the
-			 * req off to the DMA engine, but the req remains in the
-			 * poll cancel-hash. Without this ref, ring-teardown
-			 * cancellation (io_poll_remove_all) could free the req
-			 * while DMA still references it (and while it is still
-			 * hashed) -> use-after-free. The ref keeps it alive until
-			 * the last task completes; dropped in
-			 * __io_dma_task_complete() at dma_refcnt == 0. Mirrors the
-			 * io-wq reference pattern in io_wq_submit_work().
+			 * Take the in-flight DMA reference BEFORE the tasks
+			 * become reachable by any completer. In non-IRQ mode the
+			 * hardware doorbell was already rung in
+			 * io_uring_copy_to_iter(), so the instant the tasks are
+			 * published to ctx->dma.head below a concurrent drain --
+			 * the poll_work kworker, the busypoll kthread, or
+			 * io_ring_exit_work -- can reach dma_refcnt == 0 in
+			 * __io_dma_task_complete(). Were the ref taken after
+			 * publishing, that drain would complete the req, see
+			 * dma_ref_held == false and drop nothing, and this path
+			 * would then set refcount/dma_ref_held on an
+			 * already-completed req: double-complete / orphaned ref /
+			 * use-after-free. Taking it here (before publish, and
+			 * before IRQ mode's deferred doorbell) closes the window;
+			 * dropped in __io_dma_task_complete() at dma_refcnt == 0.
+			 * Mirrors io_wq_submit_work().
+			 *
+			 * The take must ALSO be under ctx->dma.lock, the lock
+			 * every completer holds through its dma_refcnt == 0
+			 * block. A multishot reissue reaches here while the
+			 * PREVIOUS cycle's completer may still be between
+			 * publishing pending_aux_cqe / kicking the poll (which
+			 * is what let this reissue run) and dropping the
+			 * previous in-flight ref. Taken unlocked, this
+			 * ref/flag write interleaves into that window: the
+			 * completer then either skips its drop or donates it to
+			 * the new cycle, and one reference leaks each time --
+			 * accumulating on the long-lived multishot req until it
+			 * can never be freed and ring teardown wedges. The lock
+			 * orders this take strictly after that drop.
+			 *
+			 * io_recv is about to return IOU_ISSUE_SKIP_COMPLETE,
+			 * handing the req to the DMA engine while it stays in the
+			 * poll cancel-hash; without this ref, teardown
+			 * cancellation (io_poll_remove_all) could free the still-
+			 * hashed req while DMA references it.
 			 */
+			spin_lock_irqsave(&ctx->dma.lock, flags);
 			if (!(req->flags & REQ_F_REFCOUNT))
 				__io_req_set_refcount(req, 2);
 			else
 				req_ref_get(req);
 			req->dma.dma_ref_held = true;
+
+			if (!req->dma.irq_mode) {
+				/*
+				 * Splice the req's task list onto ctx->dma.head.
+				 * Every task on the list was fully submitted with
+				 * a valid cookie (io_dma_task_link() runs only
+				 * after dmaengine_submit() succeeds), so the
+				 * pollers can consume the list as-is.
+				 *
+				 * IRQ-mode tasks are not published: each one
+				 * completes via its dmaengine callback
+				 * (io_dma_irq_complete), and the doorbell is
+				 * deferred to the -EIOCBQUEUED branch below so no
+				 * callback can fire before the ref taken above
+				 * exists.
+				 */
+				if (ctx->dma.tail == NULL)
+					ctx->dma.head = req->dma.dma_tasks;
+				else
+					ctx->dma.tail->next = req->dma.dma_tasks;
+				ctx->dma.tail = req->dma.dma_tasks_tail;
+			}
+			spin_unlock_irqrestore(&ctx->dma.lock, flags);
+
+			req->dma.dma_tasks = NULL;
+			req->dma.dma_tasks_tail = NULL;
 
 			ret = -EIOCBQUEUED;
 		} else if (req->dma.cb_fn) {
