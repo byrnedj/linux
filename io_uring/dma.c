@@ -1735,6 +1735,7 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
 		 */
 		if (req->dma.dma_ref_held) {
 			req->dma.dma_ref_held = false;
+			atomic_inc(&req->ctx->dma.diag_refs_dropped);
 			if (req_ref_put_and_test(req))
 				io_free_req(req);
 		}
@@ -1778,6 +1779,7 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 			else
 				req_ref_get(req);
 			req->dma.dma_ref_held = true;
+			atomic_inc(&ctx->dma.diag_refs_taken);
 			spin_unlock_irqrestore(&ctx->dma.lock, flags);
 
 			/*
@@ -1984,6 +1986,61 @@ out_disarm:
  * loop because task_work or CQEs are ready. Returns false to fall back
  * to schedule(). This is a no-op for rings with no DMA channel.
  */
+/*
+ * Teardown diagnostic, called from io_ring_exit_work() when the ring's
+ * references fail to drop within the timeout. The dump distinguishes the
+ * wedge classes before teardown proceeds anyway:
+ *
+ *  - task(s) on the pending lists: a descriptor stuck DMA_IN_PROGRESS;
+ *    every listed task is polled each pass, so any entry may be the
+ *    wedged one.
+ *  - empty list but nr_req_allocated > 0: a ctx reference held by
+ *    something other than DMA.
+ */
+void io_dma_dump_stuck(struct io_ring_ctx *ctx)
+{
+	struct io_dma_task *dma;
+	int count = 0, shown = 0;
+
+	pr_err("io_uring DMA teardown stuck: ctx=%p nr_req_allocated=%u chan=%s poll_armed=%d\n",
+	       ctx, ctx->nr_req_allocated,
+	       IS_ERR_OR_NULL(ctx->dma.chan) ? "none" :
+			dma_chan_name(ctx->dma.chan),
+	       atomic_read(&ctx->dma.poll_armed));
+
+	/*
+	 * refs_taken vs refs_dropped says whether every in-flight DMA req
+	 * ref was released; an imbalance locates the wedge in the ref-drop
+	 * path of __io_dma_task_complete().
+	 */
+	pr_err("io_uring DMA teardown stuck: refs_taken=%d refs_dropped=%d\n",
+	       atomic_read(&ctx->dma.diag_refs_taken),
+	       atomic_read(&ctx->dma.diag_refs_dropped));
+
+	if (IS_ERR_OR_NULL(ctx->dma.chan))
+		return;
+
+	/*
+	 * poll_list belongs to the (quiesced-by-now) poller and submit_list
+	 * is lock-free; this walk is racy by design, feeding only a
+	 * diagnostic dump on an already-wedged teardown.
+	 */
+	for (dma = READ_ONCE(ctx->dma.poll_list); dma; dma = dma->next) {
+		count++;
+		if (shown < 8) {
+			struct io_kiocb *req = dma->req;
+
+			pr_err("  task=%p cookie=0x%08x len=%u batch=%d req=%p refcnt=%u ref_held=%d\n",
+			       dma, dma->cookie, dma->len, dma->is_batch, req,
+			       req->dma.dma_refcnt, req->dma.dma_ref_held);
+			shown++;
+		}
+	}
+
+	pr_err("io_uring DMA teardown stuck: %d task(s) on poll_list, submit_list %sempty\n",
+	       count, llist_empty(&ctx->dma.submit_list) ? "" : "NON-");
+}
+
 bool io_dma_cq_wait_poll(struct io_ring_ctx *ctx, struct io_wait_queue *iowq)
 {
 	unsigned int budget_us = READ_ONCE(io_dma_cq_poll_us);
