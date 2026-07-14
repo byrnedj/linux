@@ -341,6 +341,35 @@ void io_dma_debugfs_init(void)
 			    &io_dma_cpu_lat_fops);
 }
 
+/*
+ * io_dma_task allocation wrapper: an inline scatterlist array rides in the
+ * same slab object, sized so the source SG of nearly every recv batch
+ * (dma_chunks_per_call is ~3, ≤8 covers >99.9% of observed batches) needs no
+ * separate allocation. The mapped source SG must live until completion (it
+ * is the dma_unmap_sg() handle), which is exactly the task's lifetime.
+ * Batches with more entries fall back to kmalloc (sg_inline stays false).
+ *
+ * io_dma_task_alloc()'s memset covers only the task part; users of the
+ * inline array initialize it themselves (sg_init_table).
+ */
+#define IO_DMA_INLINE_SG	8
+
+struct io_dma_task_mem {
+	struct io_dma_task	t;
+	struct scatterlist	sg[IO_DMA_INLINE_SG];
+};
+
+static inline struct scatterlist *io_dma_task_inline_sg(struct io_dma_task *t)
+{
+	return container_of(t, struct io_dma_task_mem, t)->sg;
+}
+
+void io_dma_cache_init(void)
+{
+	dma_cachep = KMEM_CACHE(io_dma_task_mem,
+				SLAB_HWCACHE_ALIGN | SLAB_ACCOUNT);
+}
+
 /* Datapath alloc: pool first, then non-blocking slab, never sleeps. */
 static struct io_dma_task *io_dma_task_alloc(struct io_ring_ctx *ctx)
 {
@@ -402,8 +431,17 @@ void io_dma_init_freelist(struct io_ring_ctx *ctx, struct io_uring_params *p)
 	d->free_count = 0;
 
 	/*
+	 * Scratch for the scatterlist arrays that prep consumes within the
+	 * submission call (see io_dma_channel). Allocation failure is fine:
+	 * submitters fall back to per-call kmalloc.
+	 */
+	d->sg_scratch = kmalloc_array(2 * IO_DMA_BATCH_MAX,
+				      sizeof(struct scatterlist), GFP_KERNEL);
+
+	/*
 	 * Cover roughly the in-flight CQ depth; clamp to a sane range.
-	 * io_dma_task is tiny (~96B), so even 8192 is ~768KB worst case.
+	 * io_dma_task_mem is ~448B with the inline SG array, so even 8192 is
+	 * ~3.5MB worst case; typical rings prefill 256 (~112KB).
 	 */
 	n = clamp(p->cq_entries * 2u, 256u, 8192u);
 	d->free_max = n;
@@ -705,16 +743,25 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 	struct scatterlist *sgls, *src_sgl, *dst_sgl;
 	struct io_dma_task *dma;
 	u32 total_len = 0;
+	bool sg_scratch;
 	int i;
 
-	/* Allocate src + dst scatterlists together.
+	/* Both scatterlists here are consumed by prep within this call
+	 * (sources are pre-mapped per-page; batch_entries is the cleanup
+	 * handle), so the per-channel scratch covers them: 2 * nr_entries <=
+	 * 2 * IO_DMA_BATCH_MAX, and submissions are serialized by uring_lock.
 	 * Initialize SG tables so sg_next()/sg_is_last() work correctly,
 	 * then populate DMA addresses from the entries array.
 	 */
-	sgls = kmalloc_array(nr_entries * 2, sizeof(*sgls),
-			     GFP_NOWAIT | __GFP_NOWARN);
-	if (!sgls)
-		return -ENOMEM;
+	sg_scratch = req->ctx->dma.sg_scratch != NULL;
+	if (sg_scratch) {
+		sgls = req->ctx->dma.sg_scratch;
+	} else {
+		sgls = kmalloc_array(nr_entries * 2, sizeof(*sgls),
+				     GFP_NOWAIT | __GFP_NOWARN);
+		if (!sgls)
+			return -ENOMEM;
+	}
 	src_sgl = sgls;
 	dst_sgl = sgls + nr_entries;
 
@@ -738,7 +785,8 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 	heap_entries = kmalloc_array(nr_entries, sizeof(*heap_entries),
 				     GFP_NOWAIT | __GFP_NOWARN);
 	if (!heap_entries) {
-		kfree(sgls);
+		if (!sg_scratch)
+			kfree(sgls);
 		return -ENOMEM;
 	}
 	memcpy(heap_entries, entries, nr_entries * sizeof(*heap_entries));
@@ -746,7 +794,8 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 	dma = io_dma_task_alloc(req->ctx);
 	if (!dma) {
 		kfree(heap_entries);
-		kfree(sgls);
+		if (!sg_scratch)
+			kfree(sgls);
 		return -ENOMEM;
 	}
 
@@ -761,14 +810,16 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 	if (!tx) {
 		io_dma_task_free(req->ctx, dma);
 		kfree(heap_entries);
-		kfree(sgls);
+		if (!sg_scratch)
+			kfree(sgls);
 		return -EAGAIN;
 	}
 
 	/* SG arrays are consumed by dmaengine_prep_dma_memcpy_sg —
 	 * the driver copies what it needs into batch descriptors.
 	 */
-	kfree(sgls);
+	if (!sg_scratch)
+		kfree(sgls);
 
 	dma->req = req;
 	dma->next = NULL;
@@ -1093,18 +1144,50 @@ static ssize_t io_dma_submit_batch_sg(struct io_kiocb *req, struct device *dev,
 	struct scatterlist *src_sg, *dst_sg;
 	struct io_dma_task *dma;
 	size_t total_len = 0;
+	bool src_inline, dst_scratch;
 	unsigned int dma_nents;
 	unsigned int i;
 
-	src_sg = kmalloc_array(nr_entries, sizeof(*src_sg),
-			       GFP_NOWAIT | __GFP_NOWARN);
-	if (!src_sg)
+	/*
+	 * Allocate the task first: besides being needed before prep (a
+	 * prepared dmaengine descriptor has no unprepare API and must be
+	 * submitted or it leaks, so prep is the last fallible step before
+	 * submit), the task allocation carries the inline source SG array
+	 * that nearly every batch uses instead of a kmalloc.
+	 */
+	dma = io_dma_task_alloc(req->ctx);
+	if (!dma)
 		return -ENOMEM;
-	dst_sg = kmalloc_array(nr_entries, sizeof(*dst_sg),
-			       GFP_NOWAIT | __GFP_NOWARN);
-	if (!dst_sg) {
-		kfree(src_sg);
-		return -ENOMEM;
+
+	src_inline = nr_entries <= IO_DMA_INLINE_SG;
+	if (src_inline) {
+		src_sg = io_dma_task_inline_sg(dma);
+	} else {
+		src_sg = kmalloc_array(nr_entries, sizeof(*src_sg),
+				       GFP_NOWAIT | __GFP_NOWARN);
+		if (!src_sg) {
+			io_dma_task_free(req->ctx, dma);
+			return -ENOMEM;
+		}
+	}
+
+	/*
+	 * The destination SG is consumed inside prep, so the per-channel
+	 * scratch (submissions are serialized by uring_lock) avoids a
+	 * second allocation.
+	 */
+	dst_scratch = req->ctx->dma.sg_scratch != NULL;
+	if (dst_scratch) {
+		dst_sg = req->ctx->dma.sg_scratch;
+	} else {
+		dst_sg = kmalloc_array(nr_entries, sizeof(*dst_sg),
+				       GFP_NOWAIT | __GFP_NOWARN);
+		if (!dst_sg) {
+			if (!src_inline)
+				kfree(src_sg);
+			io_dma_task_free(req->ctx, dma);
+			return -ENOMEM;
+		}
 	}
 
 	/* Map all source chunks in one shot. */
@@ -1114,8 +1197,11 @@ static ssize_t io_dma_submit_batch_sg(struct io_kiocb *req, struct device *dev,
 
 	dma_nents = dma_map_sg(dev, src_sg, nr_entries, DMA_TO_DEVICE);
 	if (!dma_nents) {
-		kfree(dst_sg);
-		kfree(src_sg);
+		if (!dst_scratch)
+			kfree(dst_sg);
+		if (!src_inline)
+			kfree(src_sg);
+		io_dma_task_free(req->ctx, dma);
 		return -EFAULT;
 	}
 
@@ -1130,33 +1216,23 @@ static ssize_t io_dma_submit_batch_sg(struct io_kiocb *req, struct device *dev,
 		total_len += entries[i].src_len;
 	}
 
-	/*
-	 * Allocate the task BEFORE preparing the descriptor: a prepared
-	 * dmaengine descriptor has no unprepare API and must be submitted or
-	 * it leaks, so prep is the last fallible step before submit.
-	 */
-	dma = io_dma_task_alloc(req->ctx);
-	if (!dma) {
-		dma_unmap_sg(dev, src_sg, nr_entries, DMA_TO_DEVICE);
-		kfree(dst_sg);
-		kfree(src_sg);
-		return -ENOMEM;
-	}
-
 	tx = dmaengine_prep_dma_memcpy_sg(chan, dst_sg, nr_entries, src_sg,
 			dma_nents,
 			io_dma_prep_flags() |
 			(req->dma.irq_mode ? DMA_PREP_INTERRUPT : 0));
 	if (!tx) {
-		io_dma_task_free(req->ctx, dma);
 		dma_unmap_sg(dev, src_sg, nr_entries, DMA_TO_DEVICE);
-		kfree(dst_sg);
-		kfree(src_sg);
+		if (!dst_scratch)
+			kfree(dst_sg);
+		if (!src_inline)
+			kfree(src_sg);
+		io_dma_task_free(req->ctx, dma);
 		return -EAGAIN;
 	}
 
 	/* dst_sg is consumed by prep; src_sg is held for unmap at completion. */
-	kfree(dst_sg);
+	if (!dst_scratch)
+		kfree(dst_sg);
 
 	dma->req = req;
 	dma->next = NULL;
@@ -1166,6 +1242,7 @@ static ssize_t io_dma_submit_batch_sg(struct io_kiocb *req, struct device *dev,
 	dma->batch_entries = NULL;
 	dma->batch_src_sg = src_sg;
 	dma->batch_src_nents = nr_entries;
+	dma->sg_inline = src_inline;
 
 	/* IRQ mode: completion arrives via io_dma_irq_complete(); interrupt
 	 * descriptors can't be polled (idxd returns DMA_IN_PROGRESS for them).
@@ -1178,7 +1255,8 @@ static ssize_t io_dma_submit_batch_sg(struct io_kiocb *req, struct device *dev,
 	dma->cookie = dmaengine_submit(tx);
 	if (dma_submit_error(dma->cookie)) {
 		dma_unmap_sg(dev, src_sg, nr_entries, DMA_TO_DEVICE);
-		kfree(src_sg);
+		if (!src_inline)
+			kfree(src_sg);
 		io_dma_task_free(req->ctx, dma);
 		return -EFAULT;
 	}
@@ -1323,7 +1401,9 @@ void io_dma_batch_cleanup(struct io_ring_ctx *ctx, struct device *dev,
 		if (!ctx->dma.use_phys_addrs)
 			dma_unmap_sg(dev, dma->batch_src_sg,
 				     dma->batch_src_nents, DMA_TO_DEVICE);
-		kfree(dma->batch_src_sg);
+		/* Inline SG lives in the task allocation; freed with it. */
+		if (!dma->sg_inline)
+			kfree(dma->batch_src_sg);
 	} else {
 		io_dma_unmap_batch(ctx, dev, dma->batch_entries, dma->batch_nr,
 				   true);

@@ -350,6 +350,13 @@ struct io_dma_channel {
 	struct io_dma_task	*free_list;	/* chained via ->next */
 	unsigned int		free_count;	/* parked objects */
 	unsigned int		free_max;	/* pool cap == target size */
+
+	/* Scratch scatterlists (2 * IO_DMA_BATCH_MAX entries) for arrays that
+	 * dmaengine_prep_dma_memcpy_sg() consumes within the call. All batch
+	 * submissions run in the issue path under uring_lock, so one scratch
+	 * per channel suffices. NULL → submitters fall back to kmalloc.
+	 */
+	struct scatterlist	*sg_scratch;
 };
 
 struct io_dma_kiocb {
@@ -410,6 +417,9 @@ struct io_dma_task {
 	struct folio		*src_folio;	/* page cache folio ref to put on completion */
 	bool			src_is_page;	/* true → dma_unmap_page, false → dma_unmap_single */
 	bool			is_batch;	/* true → batch task with batch_entries */
+	bool			sg_inline;	/* batch_src_sg points at the task
+						 * allocation's inline array; don't
+						 * kfree it at cleanup */
 	u8			batch_nr;	/* number of batch entries */
 	struct io_dma_batch_entry *batch_entries; /* heap-allocated cleanup array,
 						   * NULL for SG-mapped recv batches */
