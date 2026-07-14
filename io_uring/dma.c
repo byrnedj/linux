@@ -12,6 +12,9 @@
 #include <linux/fs.h>
 #include <linux/scatterlist.h>
 #include <linux/sizes.h>
+#include <linux/timekeeping.h>
+#include <linux/debugfs.h>
+#include <linux/task_work.h>
 #include "io_uring.h"
 #include "rw.h"
 #include "rsrc.h"
@@ -34,6 +37,18 @@ static inline unsigned long io_dma_prep_flags(void)
 }
 
 /*
+ * Busy-poll budget in microseconds for draining in-flight DMA
+ * completions from the CQ-wait path (io_dma_cq_wait_poll()) before the
+ * waiting task commits to sleeping. A DSA transfer for a typical read
+ * chunk completes in about 4 to 6us plus queueing. Sleeping instead
+ * leaves the completion to the poll worker that the publish queued,
+ * plus a wakeup of this task, about 10us more, just to be woken again.
+ * 0 disables the poll. This is tunable via debugfs
+ * io_uring_dma/cq_poll_us.
+ */
+static unsigned int io_dma_cq_poll_us __read_mostly = 20;
+
+/*
  * Devices a ring stripes over, one channel each. One channel reaches one
  * device, four engines of sixteen; a single-stream op striped across the
  * devices reaches them all. A ring takes no more devices than a buffer
@@ -46,6 +61,16 @@ static inline unsigned long io_dma_prep_flags(void)
  * exist for experiments, and 0 takes the default. Read at ring creation.
  */
 unsigned int io_dma_stripe_chans __read_mostly = IO_DMA_RING_CHANS;
+
+void io_dma_debugfs_init(void)
+{
+	struct dentry *dir;
+
+	dir = debugfs_create_dir("io_uring_dma", NULL);
+
+	debugfs_create_u32("cq_poll_us", 0644, dir, &io_dma_cq_poll_us);
+	debugfs_create_u32("stripe_chans", 0644, dir, &io_dma_stripe_chans);
+}
 
 /* Datapath allocation takes from the pool first and then falls back
  * to the non-blocking slab. It never sleeps.
@@ -1132,4 +1157,82 @@ out_disarm:
 	 */
 	atomic_set_release(&ctx->dma.poll_armed, 0);
 	return io_dma_pending(ctx) ? 1 : 0;
+}
+
+/*
+ * Called from io_cqring_wait_schedule() right before the task would
+ * block. If this ring has DMA tasks in flight, spin on their
+ * completion records for at most io_dma_cq_poll_us. Completions found
+ * here run __io_dma_task_complete() in this task's context. The CQE
+ * itself is posted by the poll task_work that this queues, so we
+ * report progress via the pending-work checks and let the wait loop
+ * run it.
+ *
+ * @deadline is the first expiry of the caller's wait timer in the ring's
+ * clock. That is the end of min_wait when one is set and the timeout
+ * otherwise, or KTIME_MAX when the wait has neither. The spin starts no
+ * poll pass once it has passed and stops at the first check at or after
+ * it.
+ *
+ * Returns true if the caller should skip sleeping and re-run its wait
+ * loop because task_work or CQEs are ready. Returns false to fall back
+ * to schedule(). This is a no-op for rings with no DMA channel.
+ */
+bool io_dma_cq_wait_poll(struct io_ring_ctx *ctx, struct io_wait_queue *iowq,
+			 ktime_t deadline)
+{
+	unsigned int budget_us = READ_ONCE(io_dma_cq_poll_us);
+	u64 spin_ns, end_ns;
+
+	if (!budget_us || IS_ERR_OR_NULL(ctx->dma.chan))
+		return false;
+	if (!io_dma_pending(ctx))
+		return false;
+
+	/*
+	 * Only the caller's timed sleep applies the deadline, so the spin
+	 * ends at the deadline and does not start once it has passed. The
+	 * ring's clock is read only here and the spin is timed with
+	 * ktime_get_ns(), as napi's busy poll does. IORING_REGISTER_CLOCK
+	 * can switch the ring's clock meanwhile, and comparing readings of
+	 * two clocks could leave the spin without a time bound.
+	 */
+	spin_ns = (u64)budget_us * NSEC_PER_USEC;
+	if (deadline != KTIME_MAX) {
+		ktime_t now = io_get_time(ctx);
+
+		if (now >= deadline)
+			return false;
+		spin_ns = min_t(u64, spin_ns, ktime_sub(deadline, now));
+	}
+	end_ns = ktime_get_ns() + spin_ns;
+	for (;;) {
+		__io_dma_poll(ctx);
+
+		if (task_work_pending(current) || io_local_work_pending(ctx) ||
+		    io_should_wake(iowq))
+			return true;
+		if (!io_dma_pending(ctx))
+			return false;
+		if (need_resched() || task_sigpending(current))
+			break;
+		if (ktime_get_ns() >= end_ns)
+			break;
+		cpu_relax();
+	}
+
+	/*
+	 * The caller is about to block with tasks still pending, and the
+	 * poll worker is their backstop. No exit of the spin queues it.
+	 * Every publish queues the worker after it raises tasks_pending,
+	 * and the worker polls again or requeues itself while
+	 * io_dma_pending(), which reads tasks_pending first, is true, so
+	 * the worker does not exit while a task is pending. Queueing it
+	 * here as well would find it running nearly every time, and
+	 * queueing a running work item wakes an idle kworker only to hand
+	 * the item back to the busy one. A task whose publisher has raised
+	 * tasks_pending but not yet reached its queue_work() is picked up
+	 * once the publisher gets there.
+	 */
+	return false;
 }
