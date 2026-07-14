@@ -176,6 +176,7 @@ int io_prepare_config(struct io_ctx_config *config);
 
 bool io_cqe_cache_refill(struct io_ring_ctx *ctx, bool overflow, bool cqe32);
 void io_dma_poll_workfn(struct work_struct *w);
+void io_dma_debugfs_init(void);
 extern unsigned int io_dma_cache_control;
 void io_req_defer_failed(struct io_kiocb *req, s32 res);
 bool io_post_aux_cqe(struct io_ring_ctx *ctx, u64 user_data, s32 res, u32 cflags);
@@ -606,6 +607,7 @@ static inline bool io_dma_pending(struct io_ring_ctx *ctx)
 	return !llist_empty(&ctx->dma.submit_list) ||
 	       READ_ONCE(ctx->dma.poll_list) != NULL;
 }
+bool io_dma_cq_wait_poll(struct io_ring_ctx *ctx, struct io_wait_queue *iowq);
 int kiocb_done(struct io_kiocb *req, ssize_t ret, struct io_br_sel *sel, unsigned int issue_flags);
 void io_submit_flush_completions(struct io_ring_ctx *ctx);
 
