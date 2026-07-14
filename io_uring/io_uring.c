@@ -3426,6 +3426,8 @@ static int __init io_uring_init(void)
 
 	dma_cachep = KMEM_CACHE(io_dma_task, SLAB_HWCACHE_ALIGN | SLAB_ACCOUNT);
 
+	io_dma_debugfs_init();
+
 	iou_wq = alloc_workqueue("iou_exit", WQ_UNBOUND, 64);
 	BUG_ON(!iou_wq);
 

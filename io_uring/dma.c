@@ -11,6 +11,11 @@
 #include <linux/swap.h>
 #include <linux/fs.h>
 #include <linux/scatterlist.h>
+#include <linux/timekeeping.h>
+#include <linux/debugfs.h>
+#include <linux/seq_file.h>
+#include <linux/kthread.h>
+#include <linux/task_work.h>
 #include "io_uring.h"
 #include "rsrc.h"
 #include "refs.h"
@@ -32,6 +37,22 @@ unsigned int io_dma_cache_control __read_mostly = 1;
 static inline unsigned long io_dma_prep_flags(void)
 {
 	return READ_ONCE(io_dma_cache_control) ? DMA_PREP_CACHE_CONTROL : 0;
+}
+
+/*
+ * Busy-poll budget (in microseconds) for draining in-flight DMA completions
+ * from the CQ-wait path (io_dma_cq_wait_poll()) before the waiting task
+ * commits to sleeping. A DSA transfer for a typical read chunk completes
+ * in ~4-6us plus queueing; sleeping instead costs a kworker schedule_work +
+ * wakeup (~+10us when the poller is idle) just to be woken again. 0
+ * disables the poll. Tunable via debugfs io_uring_dma_cq_poll_us.
+ */
+static unsigned int io_dma_cq_poll_us __read_mostly = 20;
+
+void io_dma_debugfs_init(void)
+{
+	debugfs_create_u32("io_uring_dma_cq_poll_us", 0644, NULL,
+			   &io_dma_cq_poll_us);
 }
 
 /* Datapath alloc: pool first, then non-blocking slab, never sleeps. */
@@ -818,3 +839,44 @@ out_disarm:
 	atomic_set(&ctx->dma.poll_armed, 0);
 	return ctx->dma.head ? 1 : 0;
 }
+
+/*
+ * Called from io_cqring_wait_schedule() right before the task would block.
+ * If this ring has pollable (non-IRQ) DMA tasks in flight, spin on their
+ * completion records for at most io_dma_cq_poll_us. Completions found here
+ * run __io_dma_task_complete() in this task's context; the CQE itself is
+ * posted by the poll task_work that queues (io_poll_kick -> this task), so
+ * report progress via the pending-work checks and let the wait loop run it.
+ *
+ * Returns true if the caller should skip sleeping and re-run its wait loop
+ * (task_work/CQEs are ready), false to fall through to schedule(). IRQ-mode
+ * tasks never appear on ctx->dma.head, so this is a no-op for them, as it is
+ * for rings with no DMA channel.
+ */
+bool io_dma_cq_wait_poll(struct io_ring_ctx *ctx, struct io_wait_queue *iowq)
+{
+	unsigned int budget_us = READ_ONCE(io_dma_cq_poll_us);
+	u64 end_ns;
+
+	if (!budget_us || IS_ERR_OR_NULL(ctx->dma.chan))
+		return false;
+	if (!READ_ONCE(ctx->dma.head))
+		return false;
+
+	end_ns = ktime_get_ns() + (u64)budget_us * NSEC_PER_USEC;
+	for (;;) {
+		__io_dma_poll(ctx);
+
+		if (task_work_pending(current) || io_local_work_pending(ctx) ||
+		    io_should_wake(iowq))
+			return true;
+		if (!READ_ONCE(ctx->dma.head))
+			return false;
+		if (need_resched() || task_sigpending(current))
+			return false;
+		if (ktime_get_ns() >= end_ns)
+			return false;
+		cpu_relax();
+	}
+}
+
