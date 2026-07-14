@@ -178,6 +178,17 @@ static inline int io_cqring_wait_schedule(struct io_ring_ctx *ctx,
 		return -EINTR;
 	if (unlikely(io_should_wake(iowq)))
 		return 0;
+	/*
+	 * Before sleeping, briefly busy-poll any in-flight DMA completions
+	 * for this ring: the transfer this waiter needs typically finishes
+	 * within a few microseconds, while sleeping costs a poller/irq
+	 * wakeup round trip just to be woken again. A hit queues the poll
+	 * task_work that posts the CQE; returning 1 re-runs the wait loop,
+	 * which executes it. The kworker/irq completers remain the backstop
+	 * when the budget expires.
+	 */
+	if (io_dma_cq_wait_poll(ctx, iowq))
+		return 1;
 
 	return __io_cqring_wait_schedule(ctx, iowq, ext_arg, start_time);
 }

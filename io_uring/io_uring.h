@@ -598,6 +598,7 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 			    u64 dst_user_addr, size_t want);
 extern struct kmem_cache *dma_cachep;
 int __io_dma_poll(struct io_ring_ctx *ctx);
+bool io_dma_cq_wait_poll(struct io_ring_ctx *ctx, struct io_wait_queue *iowq);
 bool io_dma_irq_mode(void);
 void io_dma_compl_thread_start(struct io_ring_ctx *ctx);
 void io_dma_compl_thread_stop(struct io_ring_ctx *ctx);
