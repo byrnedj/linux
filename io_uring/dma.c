@@ -15,6 +15,7 @@
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
 #include <linux/kthread.h>
+#include <linux/pm_qos.h>
 #include <linux/task_work.h>
 #include "io_uring.h"
 #include "kbuf.h"
@@ -270,6 +271,62 @@ static const struct file_operations io_dma_comp_mode_fops = {
 	.release	= single_release,
 };
 
+/*
+ * Optional global CPU latency QoS request. DMA completion latency includes
+ * waking a kworker or the idxd threaded-irq handler on an idle CPU; on a
+ * large idle machine those wakeups pay deep C-state exit latency. Writing
+ * N >= 0 (microseconds) installs/updates a cpu_latency_qos request bounding
+ * C-state exit latency machine-wide; writing a negative value removes it.
+ * Default: no request (-1), so power policy is unchanged until opted in.
+ */
+static DEFINE_MUTEX(io_dma_cpu_lat_lock);
+static struct pm_qos_request io_dma_cpu_lat_qos;
+static int io_dma_cpu_lat_us = -1;
+
+static int io_dma_cpu_lat_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", READ_ONCE(io_dma_cpu_lat_us));
+	return 0;
+}
+
+static int io_dma_cpu_lat_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, io_dma_cpu_lat_show, NULL);
+}
+
+static ssize_t io_dma_cpu_lat_write(struct file *file, const char __user *ubuf,
+				    size_t len, loff_t *ppos)
+{
+	int val, ret;
+
+	ret = kstrtoint_from_user(ubuf, len, 0, &val);
+	if (ret)
+		return ret;
+
+	mutex_lock(&io_dma_cpu_lat_lock);
+	if (val < 0) {
+		if (cpu_latency_qos_request_active(&io_dma_cpu_lat_qos))
+			cpu_latency_qos_remove_request(&io_dma_cpu_lat_qos);
+		val = -1;
+	} else if (cpu_latency_qos_request_active(&io_dma_cpu_lat_qos)) {
+		cpu_latency_qos_update_request(&io_dma_cpu_lat_qos, val);
+	} else {
+		cpu_latency_qos_add_request(&io_dma_cpu_lat_qos, val);
+	}
+	WRITE_ONCE(io_dma_cpu_lat_us, val);
+	mutex_unlock(&io_dma_cpu_lat_lock);
+	return len;
+}
+
+static const struct file_operations io_dma_cpu_lat_fops = {
+	.owner		= THIS_MODULE,
+	.open		= io_dma_cpu_lat_open,
+	.read		= seq_read,
+	.write		= io_dma_cpu_lat_write,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
 void io_dma_debugfs_init(void)
 {
 	debugfs_create_file("io_uring_dma_latency", 0444, NULL, NULL,
@@ -280,6 +337,8 @@ void io_dma_debugfs_init(void)
 			    &io_dma_comp_mode_fops);
 	debugfs_create_u32("io_uring_dma_cq_poll_us", 0644, NULL,
 			   &io_dma_cq_poll_us);
+	debugfs_create_file("io_uring_dma_cpu_latency_us", 0644, NULL, NULL,
+			    &io_dma_cpu_lat_fops);
 }
 
 /* Datapath alloc: pool first, then non-blocking slab, never sleeps. */
