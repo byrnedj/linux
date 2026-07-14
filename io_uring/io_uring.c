@@ -2629,6 +2629,20 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 	dma_cap_set(DMA_MEMCPY_SG, mask);
 
 	/*
+	 * Set up the submit and poll state before acquisition sets
+	 * ctx->dma.chan. Every path to the state tests the channel
+	 * first, so none can find it uninitialized.
+	 */
+	init_llist_head(&ctx->dma.submit_list);
+	ctx->dma.poll_list = NULL;
+	ctx->dma.poll_list_tail = NULL;
+	spin_lock_init(&ctx->dma.lock);
+	INIT_WORK(&ctx->dma.poll_work, io_dma_poll_workfn);
+	atomic_set(&ctx->dma.poll_armed, 0);
+	atomic_set(&ctx->dma.diag_refs_taken, 0);
+	atomic_set(&ctx->dma.diag_refs_dropped, 0);
+
+	/*
 	 * One channel per device, in the pool's canonical order, so rings
 	 * that hold the same devices from the same start agree on which
 	 * device a file region stripes to. Devices on the caller's NUMA
@@ -2704,12 +2718,6 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 			 task_tgid_nr(current));
 	}
 
-	init_llist_head(&ctx->dma.submit_list);
-	ctx->dma.poll_list = NULL;
-	ctx->dma.poll_list_tail = NULL;
-	spin_lock_init(&ctx->dma.lock);
-	INIT_WORK(&ctx->dma.poll_work, io_dma_poll_workfn);
-	atomic_set(&ctx->dma.poll_armed, 0);
 	io_dma_init_freelist(ctx, p);
 
 	return 0;
@@ -2882,6 +2890,7 @@ static __cold void io_ring_exit_work(struct work_struct *work)
 	unsigned long interval = HZ / 20;
 	struct io_tctx_exit exit;
 	struct io_tctx_node *node;
+	bool dma_dumped = false;
 	int ret;
 
 	mutex_lock(&ctx->uring_lock);
@@ -2934,6 +2943,9 @@ static __cold void io_ring_exit_work(struct work_struct *work)
 		io_req_caches_free(ctx);
 
 		if (WARN_ON_ONCE(time_after(jiffies, timeout))) {
+			/* A full DMA dump once, then one line a minute. */
+			if (io_dma_dump_stuck(ctx, dma_dumped))
+				dma_dumped = true;
 			/* there is little hope left, don't run it too often */
 			interval = HZ * 60;
 		}

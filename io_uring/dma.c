@@ -5104,6 +5104,7 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
 		 */
 		if (req->dma.dma_ref_held) {
 			req->dma.dma_ref_held = false;
+			atomic_inc(&req->ctx->dma.diag_refs_dropped);
 			if (req_ref_put_and_test(req))
 				io_free_req(req);
 		}
@@ -5162,6 +5163,7 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 			else
 				req_ref_get(req);
 			req->dma.dma_ref_held = true;
+			atomic_inc(&ctx->dma.diag_refs_taken);
 			spin_unlock_irqrestore(&ctx->dma.lock, flags);
 
 			/*
@@ -5354,6 +5356,115 @@ out_disarm:
 	 */
 	atomic_set_release(&ctx->dma.poll_armed, 0);
 	return io_dma_pending(ctx) ? 1 : 0;
+}
+
+/*
+ * Teardown diagnostic, called from io_ring_exit_work() when the ring's
+ * references fail to drop within the timeout. Teardown cannot proceed
+ * until they do, so the exit work calls this again about once a minute
+ * for as long as the wedge lasts. The dump distinguishes the wedge
+ * classes. Tasks on the pending lists mean a descriptor is stuck
+ * DMA_IN_PROGRESS. Every listed task is polled each pass, so any entry
+ * may be the wedged one. An empty list with nr_req_allocated > 0 and
+ * balanced ref counters means a ctx reference is held by something
+ * other than DMA.
+ *
+ * With @brief the caller has had one full dump already, and only a
+ * one-line summary is printed while DMA tasks are pending, so a long
+ * wedge does not push the first dump, the WARN and the provider's own
+ * errors out of the log. Returns true when the poll list was walked,
+ * which completes a full dump. A dump that could not take the poller
+ * arm returns false, so the next call dumps in full again.
+ */
+bool io_dma_dump_stuck(struct io_ring_ctx *ctx, bool brief)
+{
+	char names[IO_DMA_RING_CHANS * 16] = "";
+	struct io_dma_task *dma;
+	int count = 0, shown = 0;
+	unsigned int i, spins = 0;
+	unsigned long end;
+	int len = 0;
+
+	/* A ring without a channel is stuck on something else. */
+	if (IS_ERR_OR_NULL(ctx->dma.chan))
+		return false;
+
+	if (brief) {
+		if (io_dma_pending(ctx))
+			pr_err("io_uring DMA teardown still stuck: ctx=%p nr_req_allocated=%u tasks_pending=%d refs_taken=%d refs_dropped=%d\n",
+			       ctx, ctx->nr_req_allocated,
+			       atomic_read(&ctx->dma.tasks_pending),
+			       atomic_read(&ctx->dma.diag_refs_taken),
+			       atomic_read(&ctx->dma.diag_refs_dropped));
+		return true;
+	}
+
+	/*
+	 * A ring stripes over every channel it holds, and a task is polled
+	 * on its own submission channel, so the header lists them all and
+	 * each task line names its channel and ring.
+	 */
+	for (i = 0; i < ctx->dma.nr_chans; i++)
+		len += scnprintf(names + len, sizeof(names) - len, "%s%s",
+				 i ? "," : "",
+				 dma_chan_name(ctx->dma.chans[i]));
+	pr_err("io_uring DMA teardown stuck: ctx=%p nr_req_allocated=%u tasks_pending=%d nr_chans=%u chans=%s poll_armed=%d\n",
+	       ctx, ctx->nr_req_allocated,
+	       atomic_read(&ctx->dma.tasks_pending), ctx->dma.nr_chans,
+	       names, atomic_read(&ctx->dma.poll_armed));
+
+	/*
+	 * A request takes one DMA req ref when it publishes its tasks and
+	 * drops it when the last of them completes. Without a skipped
+	 * drop, refs_taken - refs_dropped is the number of requests with
+	 * tasks in flight, which is at most tasks_pending. A larger
+	 * difference means __io_dma_task_complete() skipped a drop.
+	 * Balanced counters mean the leaked reference is not the DMA ref.
+	 */
+	pr_err("io_uring DMA teardown stuck: refs_taken=%d refs_dropped=%d\n",
+	       atomic_read(&ctx->dma.diag_refs_taken),
+	       atomic_read(&ctx->dma.diag_refs_dropped));
+
+	/*
+	 * poll_list belongs to whoever holds the poller arm. The poll
+	 * worker requeues itself while tasks are pending and frees the
+	 * tasks it completes, so the walk takes the arm and skips the
+	 * dump rather than read behind a live poller. In a wedge that
+	 * worker holds the arm for all of each pass but the few
+	 * instructions between two passes, so a single attempt mostly
+	 * finds it busy. The claim is retried for about 10ms, which spans
+	 * many of those gaps, and the list goes undumped only when the arm
+	 * stays held throughout. tasks_pending, printed above, needs no
+	 * arm.
+	 */
+	end = jiffies + msecs_to_jiffies(10);
+	while (atomic_read(&ctx->dma.poll_armed) ||
+	       atomic_cmpxchg(&ctx->dma.poll_armed, 0, 1) != 0) {
+		if (time_after(jiffies, end)) {
+			pr_err("io_uring DMA teardown stuck: poller busy, list not dumped\n");
+			return false;
+		}
+		cpu_relax();
+		if (!(++spins & 1023))
+			cond_resched();
+	}
+	for (dma = READ_ONCE(ctx->dma.poll_list); dma; dma = dma->next) {
+		count++;
+		if (shown < 8) {
+			struct io_kiocb *req = dma->req;
+
+			pr_err("  ctx=%p task=%p chan=%s cookie=0x%08x len=%u batch=%d req=%p refcnt=%u ref_held=%d\n",
+			       ctx, dma, dma_chan_name(dma->chan),
+			       dma->cookie, dma->len, dma->is_batch, req,
+			       req->dma.dma_refcnt, req->dma.dma_ref_held);
+			shown++;
+		}
+	}
+	atomic_set_release(&ctx->dma.poll_armed, 0);
+
+	pr_err("io_uring DMA teardown stuck: %d task(s) on poll_list, submit_list %sempty\n",
+	       count, llist_empty(&ctx->dma.submit_list) ? "" : "NON-");
+	return true;
 }
 
 /*
