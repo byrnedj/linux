@@ -2268,6 +2268,9 @@ static void io_release_dma_chan(struct io_ring_ctx *ctx)
 			kmem_cache_free(dma_cachep, t);
 		}
 		ctx->dma.free_count = 0;
+
+		kfree(ctx->dma.sg_scratch);
+		ctx->dma.sg_scratch = NULL;
 	}
 
 	if (ctx->dma.chan && !IS_ERR(ctx->dma.chan)) {
@@ -3464,7 +3467,7 @@ static int __init io_uring_init(void)
 				SLAB_HWCACHE_ALIGN | SLAB_PANIC | SLAB_ACCOUNT |
 				SLAB_TYPESAFE_BY_RCU);
 	
-        dma_cachep = KMEM_CACHE(io_dma_task, SLAB_HWCACHE_ALIGN | SLAB_ACCOUNT);
+	io_dma_cache_init();
 
 	io_dma_debugfs_init();
 

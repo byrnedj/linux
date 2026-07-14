@@ -598,6 +598,7 @@ void io_dma_batch_cleanup(struct io_ring_ctx *ctx, struct device *dev,
 ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 			    u64 dst_user_addr);
 extern struct kmem_cache *dma_cachep;
+void io_dma_cache_init(void);
 int __io_dma_poll(struct io_ring_ctx *ctx);
 bool io_dma_cq_wait_poll(struct io_ring_ctx *ctx, struct io_wait_queue *iowq);
 void io_dma_dump_stuck(struct io_ring_ctx *ctx);
