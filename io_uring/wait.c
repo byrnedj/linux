@@ -179,6 +179,33 @@ static inline int io_cqring_wait_schedule(struct io_ring_ctx *ctx,
 	if (unlikely(io_should_wake(iowq)))
 		return 0;
 	/*
+	 * Before sleeping, briefly busy-poll any in-flight DMA completions
+	 * for this ring. The transfer this waiter needs typically finishes
+	 * within a few microseconds, while sleeping costs a poller wakeup
+	 * round trip just to be woken again. A hit queues the poll
+	 * task_work that posts the CQE. Returning 1 re-runs the wait loop,
+	 * which executes that task_work. The kworker completer remains the
+	 * backstop when the budget expires.
+	 */
+	/*
+	 * The poll takes spinlocks and does unmap work, which sleeps on
+	 * PREEMPT_RT, so it must not run with the task state set for the
+	 * coming schedule(). Run it in TASK_RUNNING and re-arm the state
+	 * afterwards, rechecking wakeup conditions that may have fired
+	 * while it ran. Rings without DMA in flight, which is every ring
+	 * without a channel, skip the state flip and the call.
+	 */
+	if (!IS_ERR_OR_NULL(ctx->dma.chan) && io_dma_pending(ctx)) {
+		__set_current_state(TASK_RUNNING);
+		if (io_dma_cq_wait_poll(ctx, iowq))
+			return 1;
+		set_current_state(TASK_INTERRUPTIBLE);
+		if (io_should_wake(iowq) || io_has_work(ctx)) {
+			__set_current_state(TASK_RUNNING);
+			return 1;
+		}
+	}
+	/*
 	 * A DEFER_TASKRUN producer that stalls between publishing its work
 	 * and claiming the wake can claim an arm from a later wait cycle
 	 * than the one its work belongs to: this task may already have
