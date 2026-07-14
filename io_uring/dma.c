@@ -15,6 +15,7 @@
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
 #include <linux/kthread.h>
+#include <linux/task_work.h>
 #include "io_uring.h"
 #include "kbuf.h"
 #include "rsrc.h"
@@ -65,6 +66,17 @@ static const char * const io_dma_comp_mode_names[IO_DMA_COMP_NR] = {
 };
 /* Default to the original kworker path so behaviour is unchanged until set. */
 static unsigned int io_dma_completion_mode __read_mostly = IO_DMA_COMP_KWORKER;
+
+/*
+ * Busy-poll budget (in microseconds) for draining in-flight DMA completions
+ * from the CQ-wait path (io_dma_cq_wait_poll()) before the waiting task
+ * commits to sleeping. A DSA transfer for a typical recv completes in
+ * ~4-6us plus queueing; sleeping instead costs a kworker schedule_work +
+ * wakeup (~+10us when the poller is idle) or an MSI-X -> threaded-irq round
+ * trip (~+8-10us) just to be woken again. 0 disables the poll. Tunable via
+ * debugfs io_uring_dma_cq_poll_us.
+ */
+static unsigned int io_dma_cq_poll_us __read_mostly = 20;
 
 /* For io_recv() (net.c) to capture the recv-only IRQ mode at prep time. */
 bool io_dma_irq_mode(void)
@@ -270,6 +282,8 @@ void io_dma_debugfs_init(void)
 			    &io_dma_lat_reset_fops);
 	debugfs_create_file("io_uring_dma_completion_mode", 0644, NULL, NULL,
 			    &io_dma_comp_mode_fops);
+	debugfs_create_u32("io_uring_dma_cq_poll_us", 0644, NULL,
+			   &io_dma_cq_poll_us);
 }
 
 /* Datapath alloc: pool first, then non-blocking slab, never sleeps. */
@@ -1920,6 +1934,46 @@ int __io_dma_poll(struct io_ring_ctx *ctx)
 out_disarm:
 	atomic_set(&ctx->dma.poll_armed, 0);
 	return ctx->dma.head ? 1 : 0;
+}
+
+/*
+ * Called from io_cqring_wait_schedule() right before the task would block.
+ * If this ring has pollable (non-IRQ) DMA tasks in flight, spin on their
+ * completion records for at most io_dma_cq_poll_us. Completions found here
+ * run __io_dma_task_complete() in this task's context; the CQE itself is
+ * posted by the poll task_work that queues (io_poll_kick -> this task), so
+ * report progress via the pending-work checks and let the wait loop run it.
+ *
+ * Returns true if the caller should skip sleeping and re-run its wait loop
+ * (task_work/CQEs are ready), false to fall through to schedule(). IRQ-mode
+ * tasks never appear on ctx->dma.head, so this is a no-op for them, as it is
+ * for rings with no DMA channel.
+ */
+bool io_dma_cq_wait_poll(struct io_ring_ctx *ctx, struct io_wait_queue *iowq)
+{
+	unsigned int budget_us = READ_ONCE(io_dma_cq_poll_us);
+	u64 end_ns;
+
+	if (!budget_us || IS_ERR_OR_NULL(ctx->dma.chan))
+		return false;
+	if (!READ_ONCE(ctx->dma.head))
+		return false;
+
+	end_ns = ktime_get_ns() + (u64)budget_us * NSEC_PER_USEC;
+	for (;;) {
+		__io_dma_poll(ctx);
+
+		if (task_work_pending(current) || io_local_work_pending(ctx) ||
+		    io_should_wake(iowq))
+			return true;
+		if (!READ_ONCE(ctx->dma.head))
+			return false;
+		if (need_resched() || task_sigpending(current))
+			return false;
+		if (ktime_get_ns() >= end_ns)
+			return false;
+		cpu_relax();
+	}
 }
 
 /*
