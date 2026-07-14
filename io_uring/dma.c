@@ -12,6 +12,9 @@
 #include <linux/fs.h>
 #include <linux/scatterlist.h>
 #include <linux/sizes.h>
+#include <linux/timekeeping.h>
+#include <linux/debugfs.h>
+#include <linux/task_work.h>
 #include "io_uring.h"
 #include "rsrc.h"
 #include "refs.h"
@@ -30,6 +33,26 @@ unsigned int io_dma_cache_control __read_mostly = 1;
 static inline unsigned long io_dma_prep_flags(void)
 {
 	return READ_ONCE(io_dma_cache_control) ? DMA_PREP_CACHE_CONTROL : 0;
+}
+
+/*
+ * Busy-poll budget in microseconds for draining in-flight DMA
+ * completions from the CQ-wait path (io_dma_cq_wait_poll()) before the
+ * waiting task commits to sleeping. A DSA transfer for a typical read
+ * chunk completes in about 4 to 6us plus queueing. Sleeping instead
+ * costs a kworker schedule_work plus a wakeup, which is about 10us
+ * more when the poller is idle, just to be woken again. 0 disables
+ * the poll. This is tunable via debugfs io_uring_dma_cq_poll_us.
+ */
+static unsigned int io_dma_cq_poll_us __read_mostly = 20;
+
+void io_dma_debugfs_init(void)
+{
+	struct dentry *dir;
+
+	dir = debugfs_create_dir("io_uring_dma", NULL);
+
+	debugfs_create_u32("cq_poll_us", 0644, dir, &io_dma_cq_poll_us);
 }
 
 /* Datapath allocation takes from the pool first and then falls back
@@ -990,4 +1013,57 @@ out_disarm:
 	 */
 	atomic_set_release(&ctx->dma.poll_armed, 0);
 	return io_dma_pending(ctx) ? 1 : 0;
+}
+
+/*
+ * Called from io_cqring_wait_schedule() right before the task would
+ * block. If this ring has DMA tasks in flight, spin on their
+ * completion records for at most io_dma_cq_poll_us. Completions found
+ * here run __io_dma_task_complete() in this task's context. The CQE
+ * itself is posted by the poll task_work that this queues, so we
+ * report progress via the pending-work checks and let the wait loop
+ * run it.
+ *
+ * Returns true if the caller should skip sleeping and re-run its wait
+ * loop because task_work or CQEs are ready. Returns false to fall back
+ * to schedule(). This is a no-op for rings with no DMA channel.
+ */
+bool io_dma_cq_wait_poll(struct io_ring_ctx *ctx, struct io_wait_queue *iowq)
+{
+	unsigned int budget_us = READ_ONCE(io_dma_cq_poll_us);
+	u64 end_ns;
+
+	if (!budget_us || IS_ERR_OR_NULL(ctx->dma.chan))
+		return false;
+	if (!io_dma_pending(ctx))
+		return false;
+
+	end_ns = ktime_get_ns() + (u64)budget_us * NSEC_PER_USEC;
+	for (;;) {
+		__io_dma_poll(ctx);
+
+		if (task_work_pending(current) || io_local_work_pending(ctx) ||
+		    io_should_wake(iowq))
+			return true;
+		if (!io_dma_pending(ctx))
+			return false;
+		if (need_resched() || task_sigpending(current))
+			break;
+		if (ktime_get_ns() >= end_ns)
+			break;
+		cpu_relax();
+	}
+
+	/*
+	 * Abandoning the spin with tasks still pending must hand them to
+	 * the poll worker, because this caller is about to block and the
+	 * worker's own pending check can misread during another poller's
+	 * splice window: llist_del_all() has emptied the submit list
+	 * while the spliced tasks are still in walker-local variables,
+	 * so both lists look empty and the worker exits. With both
+	 * pollers gone nothing ever retires the remaining descriptors
+	 * and the waiter above sleeps forever.
+	 */
+	queue_work(system_unbound_wq, &ctx->dma.poll_work);
+	return false;
 }
