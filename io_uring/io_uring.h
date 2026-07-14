@@ -608,6 +608,7 @@ static inline bool io_dma_pending(struct io_ring_ctx *ctx)
 	       READ_ONCE(ctx->dma.poll_list) != NULL;
 }
 bool io_dma_cq_wait_poll(struct io_ring_ctx *ctx, struct io_wait_queue *iowq);
+void io_dma_dump_stuck(struct io_ring_ctx *ctx);
 /* Filemap DMA-WRITE gate/result accounting; see io_uring/dma.c. */
 enum {
 	IO_DMA_FMW_ENGAGED,

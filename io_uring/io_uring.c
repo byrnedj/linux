@@ -2444,6 +2444,8 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 	spin_lock_init(&ctx->dma.lock);
 	INIT_WORK(&ctx->dma.poll_work, io_dma_poll_workfn);
 	atomic_set(&ctx->dma.poll_armed, 0);
+	atomic_set(&ctx->dma.diag_refs_taken, 0);
+	atomic_set(&ctx->dma.diag_refs_dropped, 0);
 
 	/* Prefer a channel whose DSA device sits on the caller's NUMA
 	 * node: a cross-socket engine pays UPI hops on every descriptor
@@ -2713,6 +2715,7 @@ static __cold void io_ring_exit_work(struct work_struct *work)
 		io_req_caches_free(ctx);
 
 		if (WARN_ON_ONCE(time_after(jiffies, timeout))) {
+			io_dma_dump_stuck(ctx);
 			/* there is little hope left, don't run it too often */
 			interval = HZ * 60;
 			break;
