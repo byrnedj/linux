@@ -3445,6 +3445,7 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
 		 */
 		if (req->dma.dma_ref_held) {
 			req->dma.dma_ref_held = false;
+			atomic_inc(&req->ctx->dma.diag_refs_dropped);
 			if (req_ref_put_and_test(req))
 				io_free_req(req);
 		}
@@ -3470,6 +3471,8 @@ static void io_dma_irq_complete(void *param, const struct dmaengine_result *res)
 		     DMA_COMPLETE : DMA_ERROR;
 	unsigned long flags;
 
+	atomic_inc(&ctx->dma.diag_irq_completed);
+
 	/* Heavy resource release (unmaps, folio puts) outside the lock. */
 	io_dma_task_release_res(ctx, dev, dma);
 
@@ -3483,6 +3486,7 @@ static void io_dma_irq_complete(void *param, const struct dmaengine_result *res)
 		 * in-flight ref leaked, exactly as io_release_dma_chan does
 		 * for a hung task; confined to the degraded teardown path.
 		 */
+		atomic_inc(&ctx->dma.diag_irq_orphaned);
 		kmem_cache_free(dma_cachep, dma);
 	} else {
 		__io_dma_task_complete(dev, dma, status);
@@ -3543,6 +3547,7 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 			else
 				req_ref_get(req);
 			req->dma.dma_ref_held = true;
+			atomic_inc(&ctx->dma.diag_refs_taken);
 			spin_unlock_irqrestore(&ctx->dma.lock, flags);
 
 			if (!req->dma.irq_mode) {
@@ -3623,6 +3628,8 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 			 * Tasks are not on the pending lists; the callbacks complete
 			 * them.
 			 */
+			atomic_add(req->dma.dma_refcnt,
+				   &ctx->dma.diag_irq_submitted);
 			dma_async_issue_pending(ctx->dma.chan);
 		} else if (io_dma_pending(ctx)) {
 			if (io_dma_mode_wakes_thread(READ_ONCE(io_dma_completion_mode)) &&
@@ -3860,6 +3867,72 @@ out_disarm:
  * for rings with no DMA channel.
  */
 /*
+
+ * Teardown diagnostic, called from io_ring_exit_work() when the ring's
+ * references fail to drop within the timeout. The dump distinguishes the
+ * wedge classes before teardown proceeds anyway:
+ *
+ *  - task(s) on the pending lists: a poll-mode descriptor stuck DMA_IN_PROGRESS.
+ *    The head task is the wedged one (__io_dma_poll() stops at the first
+ *    incomplete cookie); anything behind it may just be queued behind the
+ *    wedge.
+ *  - empty list but nr_req_allocated > 0: either an IRQ-mode descriptor
+ *    whose interrupt never arrived (interrupt cookies are invisible to
+ *    polling by design -- idxd_dma_tx_status() returns DMA_IN_PROGRESS for
+ *    them until the IRQ handler invalidates the cookie), or a ctx reference
+ *    held by something other than DMA.
+ */
+void io_dma_dump_stuck(struct io_ring_ctx *ctx)
+{
+	struct io_dma_task *dma;
+	int count = 0, shown = 0;
+
+	pr_err("io_uring DMA teardown stuck: ctx=%p nr_req_allocated=%u mode=%s chan=%s poll_armed=%d\n",
+	       ctx, ctx->nr_req_allocated,
+	       io_dma_comp_mode_names[READ_ONCE(io_dma_completion_mode)],
+	       IS_ERR_OR_NULL(ctx->dma.chan) ? "none" :
+			dma_chan_name(ctx->dma.chan),
+	       atomic_read(&ctx->dma.poll_armed));
+
+	/*
+	 * irq_submitted vs irq_completed says whether every doorbell'd RCI
+	 * descriptor got its interrupt callback; refs_taken vs refs_dropped
+	 * says whether every in-flight DMA req ref was released. Which pair
+	 * is imbalanced locates the wedge: delivery (idxd/hardware) vs the
+	 * ref-drop path in __io_dma_task_complete().
+	 */
+	pr_err("io_uring DMA teardown stuck: irq_submitted=%d irq_completed=%d irq_orphaned=%d refs_taken=%d refs_dropped=%d\n",
+	       atomic_read(&ctx->dma.diag_irq_submitted),
+	       atomic_read(&ctx->dma.diag_irq_completed),
+	       atomic_read(&ctx->dma.diag_irq_orphaned),
+	       atomic_read(&ctx->dma.diag_refs_taken),
+	       atomic_read(&ctx->dma.diag_refs_dropped));
+
+	if (IS_ERR_OR_NULL(ctx->dma.chan))
+		return;
+
+	/* poll_list belongs to the (quiesced-by-now) poller and submit_list
+	 * is lock-free; this walk is racy by design -- it only feeds a
+	 * diagnostic dump on an already-wedged teardown. */
+	for (dma = READ_ONCE(ctx->dma.poll_list); dma; dma = dma->next) {
+		count++;
+		if (shown < 8) {
+			struct io_kiocb *req = dma->req;
+
+			pr_err("  task=%p cookie=0x%08x len=%u batch=%d req=%p refcnt=%u irq_mode=%d ref_held=%d mshot_if=%d aux=%d terminal=%d\n",
+			       dma, dma->cookie, dma->len, dma->is_batch, req,
+			       req->dma.dma_refcnt, req->dma.irq_mode,
+			       req->dma.dma_ref_held, req->dma.mshot_in_flight,
+			       req->dma.pending_aux_cqe, req->dma.dma_terminal);
+			shown++;
+		}
+	}
+
+	pr_err("io_uring DMA teardown stuck: %d task(s) on poll_list, submit_list %sempty\n",
+	       count, llist_empty(&ctx->dma.submit_list) ? "" : "NON-");
+}
+
+/*
  * Bounded inline wait for one request's in-flight DMA, called from the issue
  * path right after its descriptors were submitted (uring_lock held, ring
  * task). If the hardware finishes within the budget, the completion runs
@@ -3894,6 +3967,7 @@ bool io_dma_inline_wait(struct io_kiocb *req, unsigned int budget_us)
 			break;
 		cpu_relax();
 	} while (ktime_get_ns() < end_ns);
+
 
 	/* Leaving the polling loop: anything still parked (this req's or
 	 * another's) needs a persistent poller scheduled. */
