@@ -338,6 +338,17 @@ struct io_dma_channel {
 	 */
 	bool			releasing;
 
+	/* Teardown diagnostics, dumped by io_dma_dump_stuck(): descriptor
+	 * doorbells vs. interrupt callbacks received, and in-flight DMA req
+	 * refs taken vs. dropped. Balanced counters mean the wedge is not in
+	 * completion delivery.
+	 */
+	atomic_t		diag_irq_submitted;
+	atomic_t		diag_irq_completed;
+	atomic_t		diag_irq_orphaned;
+	atomic_t		diag_refs_taken;
+	atomic_t		diag_refs_dropped;
+
 	spinlock_t		lock;
 	struct io_dma_task	*head;
 	struct io_dma_task	*tail;
