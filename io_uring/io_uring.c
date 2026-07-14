@@ -2410,6 +2410,20 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 	dma_cap_zero(mask);
 	dma_cap_set(DMA_MEMCPY, mask);
 
+	/*
+	 * Init the submit/poll machinery before acquisition: a failed
+	 * acquisition unwinds ring creation through generic teardown,
+	 * which must find these initialized.
+	 */
+	init_llist_head(&ctx->dma.submit_list);
+	ctx->dma.poll_list = NULL;
+	ctx->dma.poll_list_tail = NULL;
+	spin_lock_init(&ctx->dma.lock);
+	INIT_WORK(&ctx->dma.poll_work, io_dma_poll_workfn);
+	atomic_set(&ctx->dma.poll_armed, 0);
+	atomic_set(&ctx->dma.diag_refs_taken, 0);
+	atomic_set(&ctx->dma.diag_refs_dropped, 0);
+
 	/* Prefer a channel whose DSA device sits on the caller's NUMA
 	 * node.  A cross-socket engine pays UPI hops on every descriptor
 	 * fetch and data move, which shows up as bimodal throughput
@@ -2434,12 +2448,6 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 		 io_dma_shared_cnt,
 		 current->comm, task_pid_nr(current), task_tgid_nr(current), ctx);
 
-	init_llist_head(&ctx->dma.submit_list);
-	ctx->dma.poll_list = NULL;
-	ctx->dma.poll_list_tail = NULL;
-	spin_lock_init(&ctx->dma.lock);
-	INIT_WORK(&ctx->dma.poll_work, io_dma_poll_workfn);
-	atomic_set(&ctx->dma.poll_armed, 0);
 	io_dma_init_freelist(ctx, p);
 
 	return 0;
@@ -2664,6 +2672,7 @@ static __cold void io_ring_exit_work(struct work_struct *work)
 		io_req_caches_free(ctx);
 
 		if (WARN_ON_ONCE(time_after(jiffies, timeout))) {
+			io_dma_dump_stuck(ctx);
 			/* there is little hope left, don't run it too often */
 			interval = HZ * 60;
 			break;

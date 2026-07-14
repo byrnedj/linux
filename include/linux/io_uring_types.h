@@ -323,6 +323,13 @@ struct io_dma_channel {
 	struct work_struct	poll_work;
 	atomic_t		poll_armed;
 
+
+	/* Teardown diagnostics, dumped by io_dma_dump_stuck(). These count
+	 * the in-flight DMA req refs taken and dropped. Balanced counters
+	 * mean the wedge is not in the ref protocol.
+	 */
+	atomic_t		diag_refs_taken;
+	atomic_t		diag_refs_dropped;
 	spinlock_t		lock;
 
 	/* Pending pollable tasks are split for a lock-free producer and
