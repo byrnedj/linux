@@ -141,6 +141,53 @@ static void io_dma_chunks_record(unsigned int n)
 	atomic64_inc(&io_dma_chunks_hist[n]);
 }
 
+/*
+ * Why a DMA-eligible recv (>= threshold, channel present) fell back to a CPU
+ * copy. Small/threshold copies are normal and not counted. Dumped with the
+ * latency stats, cleared by latency_reset.
+ */
+enum {
+	IO_DMA_FB_NOCHAN,	/* ring has no DSA channel (grab failed at
+				 * ring creation, e.g. lost the race against
+				 * a dying ring's async channel release) */
+	IO_DMA_FB_NONKVEC,	/* >= threshold but source iter not a kvec */
+	IO_DMA_FB_ITER,		/* unsupported destination iterator */
+	IO_DMA_FB_DST,		/* destination DMA address unresolved */
+	IO_DMA_FB_EAGAIN,	/* dmaengine prep failed (descriptor pool) */
+	IO_DMA_FB_ENOMEM,	/* task or scatterlist allocation failed */
+	IO_DMA_FB_EFAULT,	/* DMA map or submit failed */
+	IO_DMA_FB_OTHER,
+	IO_DMA_FB_NR,
+};
+static const char * const io_dma_fb_names[IO_DMA_FB_NR] = {
+	"no_channel", "nonkvec_src", "dst_iter", "dst_resolve", "prep_eagain",
+	"alloc_nomem", "map_fault", "other",
+};
+static atomic64_t io_dma_fb[IO_DMA_FB_NR];
+
+static void io_dma_fb_record(unsigned int reason)
+{
+	atomic64_inc(&io_dma_fb[reason]);
+}
+
+static void io_dma_fb_record_err(ssize_t err)
+{
+	switch (err) {
+	case -EAGAIN:
+		io_dma_fb_record(IO_DMA_FB_EAGAIN);
+		break;
+	case -ENOMEM:
+		io_dma_fb_record(IO_DMA_FB_ENOMEM);
+		break;
+	case -EFAULT:
+		io_dma_fb_record(IO_DMA_FB_EFAULT);
+		break;
+	default:
+		io_dma_fb_record(IO_DMA_FB_OTHER);
+		break;
+	}
+}
+
 static unsigned int io_dma_lat_bin(size_t len)
 {
 	unsigned int i;
@@ -189,6 +236,11 @@ static int io_dma_lat_show(struct seq_file *m, void *v)
 		seq_printf(m, "  %u%-10s %12llu\n", i,
 			   i == IO_DMA_CHUNKS_HIST - 1 ? "+" : "",
 			   atomic64_read(&io_dma_chunks_hist[i]));
+
+	seq_puts(m, "cpu_fallbacks:\n");
+	for (i = 0; i < IO_DMA_FB_NR; i++)
+		seq_printf(m, "  %-12s %12llu\n", io_dma_fb_names[i],
+			   atomic64_read(&io_dma_fb[i]));
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(io_dma_lat);
@@ -214,6 +266,8 @@ static ssize_t io_dma_lat_reset_write(struct file *file,
 	io_dma_lat_reset(&io_dma_lat_call);
 	for (i = 0; i < IO_DMA_CHUNKS_HIST; i++)
 		atomic64_set(&io_dma_chunks_hist[i], 0);
+	for (i = 0; i < IO_DMA_FB_NR; i++)
+		atomic64_set(&io_dma_fb[i], 0);
 	return count;
 }
 
@@ -909,6 +963,8 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	 * still-linked skb and corrupt the queue.
 	 */
 	if (IS_ERR_OR_NULL(ctx->dma.chan)) {
+		if (len >= READ_ONCE(io_dma_cpu_threshold))
+			io_dma_fb_record(IO_DMA_FB_NOCHAN);
 		req->dma.cb_fn = cb_fn;
 		req->dma.cb_arg = cb_arg;
 		return io_dma_cpu_copy(dst_iter, src_iter, len);
@@ -922,6 +978,8 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	 * can release the source data after TCP has unlinked the SKB.
 	 */
 	if (!len || len < threshold || !iov_iter_is_kvec(src_iter)) {
+		if (len >= threshold)
+			io_dma_fb_record(IO_DMA_FB_NONKVEC);
 		req->dma.cb_fn = cb_fn;
 		req->dma.cb_arg = cb_arg;
 		return io_dma_cpu_copy(dst_iter, src_iter, len);
@@ -934,14 +992,17 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	 * iterator positions.
 	 */
 	if (iov_iter_is_bvec(dst_iter)) {
-		if (!(req->flags & REQ_F_BUF_NODE) || !req->buf_node)
+		if (!(req->flags & REQ_F_BUF_NODE) || !req->buf_node) {
+			io_dma_fb_record(IO_DMA_FB_ITER);
 			goto cpu_fallback;
+		}
 		dst_base_addr = req->dma.dst_user_addr;
 	} else if (iter_is_ubuf(dst_iter)) {
 		dst_base_addr = (u64)dst_iter->ubuf + dst_iter->iov_offset;
 	} else if (iter_is_iovec(dst_iter)) {
 		dst_base_addr = (u64)iter_iov_addr(dst_iter);
 	} else {
+		io_dma_fb_record(IO_DMA_FB_ITER);
 		goto cpu_fallback;
 	}
 
@@ -1003,8 +1064,10 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 		 */
 		dst_dma = io_dma_dst_addr(req, dst_iter, dst_base_addr,
 					  total_dma, &folio_remain);
-		if (!dst_dma)
+		if (!dst_dma) {
+			io_dma_fb_record(IO_DMA_FB_DST);
 			goto cpu_fallback_rest;
+		}
 		chunk_len = min_t(size_t, seg_avail, folio_remain);
 
 		/*
@@ -1029,8 +1092,10 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 		if (nr_entries == IO_DMA_BATCH_MAX) {
 			batch_ret = io_dma_recv_flush(req, dev, ctx->dma.chan,
 						      entries, nr_entries);
-			if (batch_ret < 0)
+			if (batch_ret < 0) {
+				io_dma_fb_record_err(batch_ret);
 				goto cpu_fallback_rest;
+			}
 			nr_entries = 0;
 		}
 	}
@@ -1039,8 +1104,10 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	if (nr_entries) {
 		batch_ret = io_dma_recv_flush(req, dev, ctx->dma.chan,
 					      entries, nr_entries);
-		if (batch_ret < 0)
+		if (batch_ret < 0) {
+			io_dma_fb_record_err(batch_ret);
 			goto cpu_fallback_rest;
+		}
 		nr_entries = 0;
 	}
 
