@@ -854,10 +854,11 @@ int io_register_pbuf_ring(struct io_ring_ctx *ctx, void __user *arg)
 	if (reg.flags & IOU_PBUF_RING_INC)
 		bl->flags |= IOBL_INC;
 
-	/* DMA pre-map the data buffer region if requested. If no DMA channel
-	 * is available on this ctx, silently skip the pre-map and let the
-	 * recv path fall back to CPU copy (io_recv already gates on
-	 * IS_ERR_OR_NULL(ctx->dma.chan) before setting msg_io_iocb).
+	/* DMA pre-map the data buffer region if requested. This requires a
+	 * ring created with IORING_SETUP_DMA: registering a DMA buffer ring
+	 * on a channel-less ring used to silently skip the pre-map and
+	 * CPU-copy every recv, which is indistinguishable from working DMA
+	 * except by throughput. Fail loudly instead.
 	 */
 	if (reg.flags & IOU_PBUF_RING_DMA) {
 		u64 data_addr = reg.resv[0];
@@ -870,15 +871,16 @@ int io_register_pbuf_ring(struct io_ring_ctx *ctx, void __user *arg)
 			goto fail;
 		}
 		if (IS_ERR_OR_NULL(ctx->dma.chan)) {
-			pr_info_ratelimited("io_uring DMA: no channel available, buffer ring registered without DMA pre-map (CPU fallback)\n");
-		} else {
-			ret = io_pbuf_dma_map(bl, ctx->dma.chan->device->dev,
-					      data_addr, data_size);
-			if (ret) {
-				pr_err("io_uring DMA: io_pbuf_dma_map failed ret=%d addr=%llx size=%llx\n",
-				       ret, data_addr, data_size);
-				goto fail;
-			}
+			pr_info_ratelimited("io_uring DMA: IOU_PBUF_RING_DMA on a ring without a DMA channel (create the ring with IORING_SETUP_DMA)\n");
+			ret = -ENODEV;
+			goto fail;
+		}
+		ret = io_pbuf_dma_map(bl, ctx->dma.chan->device->dev,
+				      data_addr, data_size);
+		if (ret) {
+			pr_err("io_uring DMA: io_pbuf_dma_map failed ret=%d addr=%llx size=%llx\n",
+			       ret, data_addr, data_size);
+			goto fail;
 		}
 	}
 
