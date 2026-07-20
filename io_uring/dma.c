@@ -836,14 +836,43 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 	 * Use ctx (not req) below — __io_dma_poll may complete the
 	 * request and free it, so req must not be dereferenced after.
 	 */
-	if (atomic_read(&ctx->dma.poll_armed) == 0)
+	if (ret == -EIOCBQUEUED) {
+		/*
+		 * This req's tasks were just queued and the issuer is about to
+		 * return with the req handed off. Do NOT complete them inline
+		 * here: a fast transfer (especially a single batched
+		 * descriptor) can finish synchronously, and
+		 * __io_dma_task_complete() would then complete this same req
+		 * while the issuer is still unwinding. Defer all completion to
+		 * a clean context: the poll_work kworker.
+		 */
+		if (READ_ONCE(ctx->dma.head)) {
+			/*
+			 * Unbound, NOT schedule_work(): the per-CPU
+			 * pool would run the poller on THIS (the
+			 * submitter's) CPU, so detection while the app
+			 * computes depends on the kworker winning a
+			 * wakeup-preemption fight with the app thread.
+			 * That fight is fragile -- measured: an inline
+			 * CQ-wait drain shifting the kworkers' runtime
+			 * profile was enough to make preemption stop
+			 * happening, leaving completions undetected for
+			 * the whole app compute slice (~83us) instead
+			 * of ~10us. An unbound worker lands on an idle
+			 * CPU and detects in parallel with the app.
+			 */
+			queue_work(system_unbound_wq,
+				   &ctx->dma.poll_work);
+		}
+	} else if (atomic_read(&ctx->dma.poll_armed) == 0) {
+		/*
+		 * No task was queued for this req (e.g. CPU fallback). Draining
+		 * other reqs' already-queued tasks inline is safe — completion
+		 * for a different req is ordinary async wakeup, not re-entrancy
+		 * on the req currently being issued.
+		 */
 		__io_dma_poll(ctx);
-
-	/* If DMA tasks are still pending after the synchronous poll,
-	 * schedule the poll work to keep draining completions.
-	 */
-	if (ret == -EIOCBQUEUED && READ_ONCE(ctx->dma.head))
-		schedule_work(&ctx->dma.poll_work);
+	}
 
 	return ret;
 }
