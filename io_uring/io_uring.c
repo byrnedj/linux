@@ -3256,10 +3256,19 @@ static __cold int io_uring_create(struct io_ctx_config *config)
 		goto err;
 
 	p->features = IORING_FEAT_FLAGS;
-	ret = io_allocate_dma_chan(ctx, p);
-	if (ret) {
-		pr_info("io_uring was unable to allocate a DMA channel. Offloads unavailable.\n");
-		ret = 0;
+	/*
+	 * DMA-engine channels are a finite hardware resource (one dmaengine
+	 * channel per DSA WQ), so they are strictly opt-in: only rings created
+	 * with IORING_SETUP_DMA take one. Unconditional acquisition would
+	 * spend channels on rings that never DMA and race the asynchronous
+	 * channel release of any ring being torn down, silently degrading
+	 * the loser to CPU copies. An app that asks and cannot be served
+	 * fails loudly here instead.
+	 */
+	if (p->flags & IORING_SETUP_DMA) {
+		ret = io_allocate_dma_chan(ctx, p);
+		if (ret)
+			goto err;
 	}
 
 	if (copy_to_user(config->uptr, p, sizeof(*p))) {
