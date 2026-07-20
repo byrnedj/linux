@@ -1962,7 +1962,22 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 			    ctx->dma.compl_thread)
 				wake_up(&ctx->dma.compl_wait);
 			else
-				schedule_work(&ctx->dma.poll_work);
+				/*
+				 * Unbound, NOT schedule_work(): the per-CPU
+				 * pool would run the poller on THIS (the
+				 * submitter's) CPU, so detection while the app
+				 * computes depends on the kworker winning a
+				 * wakeup-preemption fight with the app thread.
+				 * That fight is fragile -- measured: an inline
+				 * CQ-wait drain shifting the kworkers' runtime
+				 * profile was enough to make preemption stop
+				 * happening, leaving completions undetected for
+				 * the whole app compute slice (~83us) instead
+				 * of ~10us. An unbound worker lands on an idle
+				 * CPU and detects in parallel with the app.
+				 */
+				queue_work(system_unbound_wq,
+					   &ctx->dma.poll_work);
 		}
 	} else if (atomic_read(&ctx->dma.poll_armed) == 0) {
 		/*
