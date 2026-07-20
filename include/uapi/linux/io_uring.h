@@ -251,6 +251,14 @@ enum io_uring_sqe_flags_bit {
  * values and keep it set to 0. Any other value is undefined behaviour.
  */
 #define IORING_SETUP_SQ_REWIND		(1U << 20)
+/*
+ * Acquire a DMA-engine (e.g. Intel DSA) channel for this ring at creation,
+ * enabling DMA-offloaded recv/read copies into registered or provided
+ * buffers. Channels are a finite hardware resource; without this flag the
+ * ring takes none and all copies use the CPU. Ring creation fails with
+ * -ENODEV if no channel is available.
+ */
+#define IORING_SETUP_DMA		(1U << 21)
 
 enum io_uring_op {
 	IORING_OP_NOP,
