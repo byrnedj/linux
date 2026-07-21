@@ -2982,6 +2982,7 @@ found_ok_skb:
 						}
 					}
 					if (!kvec_len) {
+						io_uring_dma_fb_tcp_kvec();
 						err = skb_copy_datagram_msg(skb, offset,
 									    msg, used);
 					} else {
@@ -3009,7 +3010,15 @@ found_ok_skb:
 				} else {
 					/* Pure CPU copy: either no iocb, or a partial
 					 * skb read that must keep the skb on the queue.
+					 * The partial case is a DMA-offload miss worth
+					 * counting: the whole-skb ownership handoff
+					 * cannot cover an skb whose tail a later
+					 * recvmsg still needs, and at large skb sizes
+					 * these misses are the dominant remaining
+					 * CPU-copy volume.
 					 */
+					if (msg->msg_io_iocb)
+						io_uring_dma_fb_partial_skb(used);
 					err = skb_copy_datagram_msg(skb, offset, msg, used);
 				}
 				if (err) {
