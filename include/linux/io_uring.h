@@ -44,6 +44,8 @@ ssize_t io_uring_copy_to_iter(struct kiocb *iocb, struct iov_iter *dst_iter,
 			void (*cb_fn)(struct kiocb *, void *, int), void *cb_arg,
 			unsigned long flags);
 struct kvec *io_uring_recv_kvec(struct kiocb *iocb, unsigned int nr);
+void io_uring_dma_fb_partial_skb(size_t len);
+void io_uring_dma_fb_tcp_kvec(void);
 #else
 static inline void io_uring_task_cancel(void)
 {
@@ -76,6 +78,12 @@ static inline ssize_t io_uring_copy_to_iter(struct kiocb *iocb, struct iov_iter 
 static inline struct kvec *io_uring_recv_kvec(struct kiocb *iocb, unsigned int nr)
 {
 	return NULL;
+}
+static inline void io_uring_dma_fb_partial_skb(size_t len)
+{
+}
+static inline void io_uring_dma_fb_tcp_kvec(void)
+{
 }
 #endif
 

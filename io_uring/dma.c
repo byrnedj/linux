@@ -156,12 +156,17 @@ enum {
 	IO_DMA_FB_EAGAIN,	/* dmaengine prep failed (descriptor pool) */
 	IO_DMA_FB_ENOMEM,	/* task or scatterlist allocation failed */
 	IO_DMA_FB_EFAULT,	/* DMA map or submit failed */
+	IO_DMA_FB_PARTIAL_SKB,	/* recv did not fully consume the skb, so the
+				 * whole-skb ownership handoff to the DMA
+				 * engine is not possible (tcp.c) */
+	IO_DMA_FB_TCP_KVEC,	/* skb->kvec description failed (alloc or
+				 * KVEC_MAX truncation, tcp.c) */
 	IO_DMA_FB_OTHER,
 	IO_DMA_FB_NR,
 };
 static const char * const io_dma_fb_names[IO_DMA_FB_NR] = {
 	"no_channel", "nonkvec_src", "dst_iter", "dst_resolve", "prep_eagain",
-	"alloc_nomem", "map_fault", "other",
+	"alloc_nomem", "map_fault", "partial_skb", "tcp_kvec", "other",
 };
 static atomic64_t io_dma_fb[IO_DMA_FB_NR];
 
@@ -169,6 +174,27 @@ static void io_dma_fb_record(unsigned int reason)
 {
 	atomic64_inc(&io_dma_fb[reason]);
 }
+
+extern unsigned int io_dma_cpu_threshold;	/* defined below */
+
+/*
+ * tcp_recvmsg_locked()'s fallback sites live in net/ipv4/tcp.c and cannot
+ * reach the static counters directly. The partial-skb variant takes the
+ * would-have-been copy size so the sub-threshold gate (small copies are
+ * normal, not fallbacks) stays in one place, next to the threshold.
+ */
+void io_uring_dma_fb_partial_skb(size_t len)
+{
+	if (len >= READ_ONCE(io_dma_cpu_threshold))
+		io_dma_fb_record(IO_DMA_FB_PARTIAL_SKB);
+}
+EXPORT_SYMBOL_GPL(io_uring_dma_fb_partial_skb);
+
+void io_uring_dma_fb_tcp_kvec(void)
+{
+	io_dma_fb_record(IO_DMA_FB_TCP_KVEC);
+}
+EXPORT_SYMBOL_GPL(io_uring_dma_fb_tcp_kvec);
 
 static void io_dma_fb_record_err(ssize_t err)
 {
