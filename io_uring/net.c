@@ -1330,21 +1330,31 @@ retry_multishot:
 	kmsg->msg.msg_inq = -1;
 
 	/*
-	 * Only offload to DSA when the recv is already poll-armed
-	 * (REQ_F_POLLED). The DMA completion drives the req through poll
-	 * ownership (io_poll_kick), which is only valid once
-	 * __io_arm_poll_handler() has initialized poll_refs and added the req
-	 * to the cancel-hash; on the first inline issue poll is not yet armed,
-	 * so DMA there would later hash_del() an uninitialized node. Both
-	 * one-shot and multishot are supported: __io_dma_task_complete()
-	 * completes through poll ownership (terminal via dma_terminal for
-	 * one-shot / errors, aux-CQE re-arm for multishot success), so the
-	 * single poll-hash removal is preserved either way. A not-yet-armed
-	 * recv falls through to a normal copy and arms poll on -EAGAIN;
+	 * DSA offload eligibility:
+	 *
+	 * One-shot recv may offload from ANY issue context, including the
+	 * first inline issue. Its DMA completion is the !REQ_F_APOLL_MULTISHOT
+	 * branch of __io_dma_task_complete(): a plain task_work terminal
+	 * completion (io_req_set_res + io_req_task_complete) that touches no
+	 * poll state, so it cannot care whether poll was ever armed — the
+	 * poll-armed one-shot case already runs it with its EPOLLONESHOT
+	 * apoll torn down. Gating one-shot on REQ_F_POLLED made offload
+	 * engagement depend on socket occupancy at issue time: under load a
+	 * one-shot recv nearly always finds data on the inline issue and
+	 * silently took the plain copy path (~130 DMA ops per 160k messages
+	 * measured).
+	 *
+	 * Multishot must still be poll-armed: its completion is driven
+	 * through poll ownership (io_poll_kick) to post aux CQEs and re-arm,
+	 * which is only valid once __io_arm_poll_handler() has initialized
+	 * poll_refs and added the req to the cancel-hash — on an unarmed req
+	 * that path would hash_del() an uninitialized node. A not-yet-armed
+	 * multishot falls through to a normal copy and arms poll on -EAGAIN;
 	 * subsequent poll-driven issues then offload.
 	 */
 	if (force_nonblock && !IS_ERR_OR_NULL(req->ctx->dma.chan) &&
-	    (req->flags & REQ_F_POLLED)) {
+	    ((req->flags & REQ_F_POLLED) ||
+	     !(sr->flags & IORING_RECV_MULTISHOT))) {
 		/* DSA offload path: arm DMA; copy routes via io_uring_copy_to_iter. */
 		kmsg->msg.msg_io_iocb = req;
 		io_uring_dma_prep(req);
