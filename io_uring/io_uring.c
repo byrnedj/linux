@@ -2260,11 +2260,52 @@ static void io_release_dma_chan(struct io_ring_ctx *ctx)
 	ctx->dma.chan = NULL;
 }
 
-static bool io_dma_chan_filter_node(struct dma_chan *chan, void *param)
-{
-	int node = *(int *)param;
+#define IO_DMA_MAX_DEVS	16
 
-	return dev_to_node(chan->device->dev) == node;
+struct io_dma_chan_filter {
+	int node;		/* required device node, or NUMA_NO_NODE */
+	int target_dev;		/* ordinal (among matches) of the device to accept */
+	int seen_devs;
+	struct dma_device *last_dev;
+};
+
+static bool io_dma_chan_filter_fn(struct dma_chan *chan, void *param)
+{
+	struct io_dma_chan_filter *f = param;
+
+	if (f->node != NUMA_NO_NODE &&
+	    dev_to_node(chan->device->dev) != f->node)
+		return false;
+	/* candidates arrive grouped by device; count device transitions */
+	if (chan->device != f->last_dev) {
+		f->last_dev = chan->device;
+		f->seen_devs++;
+	}
+	return f->seen_devs - 1 == f->target_dev;
+}
+
+static struct dma_chan *io_dma_request_spread(dma_cap_mask_t *mask, int node)
+{
+	static atomic_t io_dma_chan_rr;
+	unsigned int rr = atomic_inc_return(&io_dma_chan_rr);
+	struct dma_chan *chan;
+	int i;
+
+	/* Round-robin across DSA devices, not just channels: first-fit
+	 * put every ring on channels of the same device, serializing all
+	 * DMA through one engine while its siblings idled.  Ordinals
+	 * past the real device count just fail the walk and we advance. */
+	for (i = 0; i < IO_DMA_MAX_DEVS; i++) {
+		struct io_dma_chan_filter f = {
+			.node = node,
+			.target_dev = (rr + i) % IO_DMA_MAX_DEVS,
+		};
+
+		chan = dma_request_channel(*mask, io_dma_chan_filter_fn, &f);
+		if (chan)
+			return chan;
+	}
+	return NULL;
 }
 
 static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
@@ -2282,10 +2323,9 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 	 * fetch and data move, which shows up as bimodal throughput
 	 * depending on which channel the ring happened to win.  Fall
 	 * back to any-node only when the local node is exhausted. */
-	ctx->dma.chan = dma_request_channel(mask, io_dma_chan_filter_node,
-					    &node);
+	ctx->dma.chan = io_dma_request_spread(&mask, node);
 	if (!ctx->dma.chan)
-		ctx->dma.chan = dma_request_chan_by_mask(&mask);
+		ctx->dma.chan = io_dma_request_spread(&mask, NUMA_NO_NODE);
 	if (IS_ERR_OR_NULL(ctx->dma.chan)) {
 		rc = ctx->dma.chan ? PTR_ERR(ctx->dma.chan) : -ENODEV;
 		pr_err("io_uring DMA: no channel available: %d requester=%s[%d] tgid=%d\n",
