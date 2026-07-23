@@ -2232,35 +2232,7 @@ static void io_release_dma_chan(struct io_ring_ctx *ctx)
 			 * The lingering req is a bounded leak confined to the
 			 * already-degraded hung-hardware path, which is preferable.
 			 */
-			if (dma->is_batch) {
-				u8 i;
-
-				for (i = 0; i < dma->batch_nr; i++) {
-					if (!ctx->dma.use_phys_addrs)
-						dma_unmap_page(dev,
-							dma->batch_entries[i].src_dma,
-							dma->batch_entries[i].src_len,
-							DMA_TO_DEVICE);
-					folio_put(dma->batch_entries[i].folio);
-				}
-				kfree(dma->batch_entries);
-			} else {
-				if (dma->src_map_len && !ctx->dma.use_phys_addrs) {
-					if (dma->src_is_page)
-						dma_unmap_page(dev,
-							dma->src_map_addr,
-							dma->src_map_len,
-							DMA_TO_DEVICE);
-					else
-						dma_unmap_single(dev,
-							dma->src_map_addr,
-							dma->src_map_len,
-							DMA_TO_DEVICE);
-				}
-				if (dma->src_folio)
-					folio_put(dma->src_folio);
-			}
-
+			io_dma_task_release_res(ctx, dev, dma);
 			kmem_cache_free(dma_cachep, dma);
 			dma = next;
 			cond_resched();
