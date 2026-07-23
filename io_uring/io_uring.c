@@ -2179,8 +2179,30 @@ static void io_release_dma_chan(struct io_ring_ctx *ctx)
 	int ret;
 
 	if (!IS_ERR_OR_NULL(ctx->dma.chan)) {
+		struct llist_node *node;
+
+		/* Quiesce the kworker poller before walking the lists it
+		 * owns; the compl kthread was stopped above. */
+		cancel_work_sync(&ctx->dma.poll_work);
+
 		dev = ctx->dma.chan->device->dev;
-		dma = ctx->dma.head;
+
+		/* Pull any tasks still parked on the lock-free submit list
+		 * onto the poll list so one walk below drains everything.
+		 * The llist is newest-first; prepending preserves nothing
+		 * here worth keeping in order -- this is the hung-hardware
+		 * path and every task gets the same treatment. */
+		node = llist_del_all(&ctx->dma.submit_list);
+		while (node) {
+			struct io_dma_task *t =
+				llist_entry(node, struct io_dma_task, llnode);
+
+			node = node->next;
+			t->next = ctx->dma.poll_list;
+			ctx->dma.poll_list = t;
+		}
+
+		dma = ctx->dma.poll_list;
 		while (dma) {
 			next = dma->next;
 
@@ -2197,11 +2219,18 @@ static void io_release_dma_chan(struct io_ring_ctx *ctx)
 				pr_warn("Hung DMA offload task %p\n", dma);
 
 			/*
-			 * Release per-task resources (unmap, folio refs)
-			 * without dereferencing dma->req: the req may already
-			 * have been freed by cancel since ctx teardown runs
-			 * after refs drop. Mirrors __io_dma_task_complete's
-			 * cleanup minus the req-scope work.
+			 * Release per-task resources (unmap, folio refs) only.
+			 * Normal completion drains the pending lists via
+			 * __io_dma_poll() in the exit loop, so a task reaching
+			 * this drain is one whose DMA never completed (hung
+			 * hardware; see the "Hung DMA" warn above). The in-flight
+			 * DMA reference (io_dma_submit_queued_tasks) keeps dma->req
+			 * alive here, but we intentionally do NOT drop that ref or
+			 * complete the req: that would need io_free_req(), whose
+			 * task_work falls back onto this ctx's fallback_work while
+			 * the ctx is being torn down -> teardown use-after-free.
+			 * The lingering req is a bounded leak confined to the
+			 * already-degraded hung-hardware path, which is preferable.
 			 */
 			if (dma->is_batch) {
 				u8 i;
@@ -2237,9 +2266,8 @@ static void io_release_dma_chan(struct io_ring_ctx *ctx)
 			cond_resched();
 		}
 
-		ctx->dma.head = NULL;
-		ctx->dma.tail = NULL;
-		cancel_work_sync(&ctx->dma.poll_work);
+		ctx->dma.poll_list = NULL;
+		ctx->dma.poll_list_tail = NULL;
 
 		/* Free the parked io_dma_task pool back to slab. */
 		while (ctx->dma.free_list) {
@@ -2351,8 +2379,9 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 		 dev_to_node(ctx->dma.chan->device->dev), node,
 		 current->comm, task_pid_nr(current), task_tgid_nr(current), ctx);
 
-	ctx->dma.head = NULL;
-	ctx->dma.tail = NULL;
+	init_llist_head(&ctx->dma.submit_list);
+	ctx->dma.poll_list = NULL;
+	ctx->dma.poll_list_tail = NULL;
 	spin_lock_init(&ctx->dma.lock);
 	INIT_WORK(&ctx->dma.poll_work, io_dma_poll_workfn);
 	atomic_set(&ctx->dma.poll_armed, 0);
@@ -2559,7 +2588,7 @@ static __cold void io_ring_exit_work(struct work_struct *work)
 			 * refs to ctx indefinitely during teardown.
 			 */
 			if (!IS_ERR_OR_NULL(ctx->dma.chan) &&
-			    READ_ONCE(ctx->dma.head))
+			    io_dma_pending(ctx))
 				__io_dma_poll(ctx);
 			cond_resched();
 		} while (io_uring_try_cancel_requests(ctx, NULL, true, false));

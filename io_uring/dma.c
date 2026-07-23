@@ -203,7 +203,7 @@ void io_dma_poll_workfn(struct work_struct *w)
 	do {
 		__io_dma_poll(ctx);
 		cpu_relax();
-	} while (READ_ONCE(ctx->dma.head));
+	} while (io_dma_pending(ctx));
 }
 
 /* TODO: Laid out like io_rw because we have to get back from this kiocb to the io_kiocb. */
@@ -779,9 +779,9 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 			 * become reachable by any completer. The hardware
 			 * doorbell was already rung by the submit path
 			 * (io_dma_filemap_read()), so the instant the tasks
-			 * are published to ctx->dma.head below a concurrent
-			 * drain -- the poll_work kworker or io_ring_exit_work
-			 * -- can reach dma_refcnt == 0 in
+			 * are published to the submit_list below a
+			 * concurrent drain -- the poll_work kworker or
+			 * io_ring_exit_work -- can reach dma_refcnt == 0 in
 			 * __io_dma_task_complete(). Were the ref taken after
 			 * publishing, that drain would complete the req, see
 			 * dma_ref_held == false and drop nothing, and this path
@@ -809,20 +809,32 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 			else
 				req_ref_get(req);
 			req->dma.dma_ref_held = true;
+			spin_unlock_irqrestore(&ctx->dma.lock, flags);
 
 			/*
-			 * Splice the req's task list onto ctx->dma.head.
-			 * Every task on the list was fully submitted with
-			 * a valid cookie (tasks are linked only after
-			 * dmaengine_submit() succeeds), so the pollers can
-			 * consume the list as-is.
+			 * Publish the req's tasks to the lock-free
+			 * submit_list -- AFTER the ref-take above, so no
+			 * drain can reach dma_refcnt == 0 before the
+			 * in-flight ref exists.  Every task was fully
+			 * submitted with a valid cookie (tasks are linked
+			 * only after dmaengine_submit() succeeds), so the
+			 * poller can consume them as-is.  Publishing in
+			 * chain order makes the llist a LIFO of a FIFO; the
+			 * consumer reverses it back (submissions are
+			 * serialized by uring_lock, so no other producer
+			 * interleaves).
 			 */
-			if (ctx->dma.tail == NULL)
-				ctx->dma.head = req->dma.dma_tasks;
-			else
-				ctx->dma.tail->next = req->dma.dma_tasks;
-			ctx->dma.tail = req->dma.dma_tasks_tail;
-			spin_unlock_irqrestore(&ctx->dma.lock, flags);
+			struct io_dma_task *t = req->dma.dma_tasks;
+
+			while (t) {
+				/* read ->next BEFORE publishing: a
+				 * published task can complete and be
+				 * freed immediately */
+				struct io_dma_task *nxt = t->next;
+
+				llist_add(&t->llnode, &ctx->dma.submit_list);
+				t = nxt;
+			}
 
 			req->dma.dma_tasks = NULL;
 			req->dma.dma_tasks_tail = NULL;
@@ -846,7 +858,7 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 		 * while the issuer is still unwinding. Defer all completion to
 		 * a clean context: the poll_work kworker.
 		 */
-		if (READ_ONCE(ctx->dma.head)) {
+		if (io_dma_pending(ctx)) {
 			/*
 			 * Unbound, NOT schedule_work(): the per-CPU
 			 * pool would run the poller on THIS (the
@@ -891,41 +903,86 @@ int __io_dma_poll(struct io_ring_ctx *ctx)
 	if (IS_ERR_OR_NULL(ctx->dma.chan))
 		goto out_disarm;
 
-	dma_async_issue_pending(ctx->dma.chan);
-
+	/*
+	 * No doorbell here: pollable descriptors reach the hardware at
+	 * dmaengine_submit() time (see idxd_dma_tx_submit), and every
+	 * submitter rings for its own tasks from the issue path, under
+	 * uring_lock. Nothing on the pending lists needs a kick.
+	 */
 	dev = ctx->dma.chan->device->dev;
 
-	spin_lock_irqsave(&ctx->dma.lock, flags);
-	dma = ctx->dma.head;
+	/*
+	 * Splice newly submitted tasks onto the consumer-owned poll_list.
+	 * Only the armed poller (poll_armed) touches poll_list, so no lock:
+	 * the llist arrives newest-first, reversing it restores submission
+	 * order, and appending at the tail keeps the whole list in cookie
+	 * order -- which the early-break below relies on (per-channel
+	 * completion is in-order).
+	 */
+	{
+		struct llist_node *node = llist_del_all(&ctx->dma.submit_list);
+		struct io_dma_task *fifo_head = NULL, *fifo_tail = NULL;
+
+		while (node) {
+			struct io_dma_task *t =
+				llist_entry(node, struct io_dma_task, llnode);
+
+			node = node->next;
+			t->next = fifo_head;	/* prepend reverses LIFO->FIFO */
+			if (!fifo_head)
+				fifo_tail = t;
+			fifo_head = t;
+		}
+		if (fifo_head) {
+			if (ctx->dma.poll_list_tail)
+				ctx->dma.poll_list_tail->next = fifo_head;
+			else
+				WRITE_ONCE(ctx->dma.poll_list, fifo_head);
+			ctx->dma.poll_list_tail = fifo_tail;
+		}
+	}
+
+	dma = ctx->dma.poll_list;
 	count = 0;
 	pr_debug("poll: head=%p\n", dma);
 	while (dma != NULL) {
 		next = dma->next;
 
+		/* No lock around the hardware poll: the cookie state is the
+		 * dmaengine's own (safe lockless), and holding ctx->dma.lock
+		 * across the whole walk is what made submitters fight the
+		 * poller for it (measured 3.6% of node cycles in
+		 * queued_spin_lock_slowpath under 60KB sets). */
 		ret = dmaengine_async_is_tx_complete(ctx->dma.chan,
 						     dma->cookie);
 		if (ret == DMA_IN_PROGRESS)
 			break;
 
 		/* Unlink before completing (complete may free dma) */
+		WRITE_ONCE(ctx->dma.poll_list, next);
+		if (!next)
+			ctx->dma.poll_list_tail = NULL;
+
+		/* ctx->dma.lock still serializes the completion itself:
+		 * the non-atomic dma_refcnt / dma_ref_held handshake with
+		 * the submitter's ref-take and the IRQ completion path
+		 * depends on it.  The hold is now just this one call. */
+		spin_lock_irqsave(&ctx->dma.lock, flags);
 		__io_dma_task_complete(dev, dma, ret);
+		spin_unlock_irqrestore(&ctx->dma.lock, flags);
 
 		count++;
 		dma = next;
 	}
 
-	/* Remove all the entries we've processed */
-	ctx->dma.head = dma;
-	if (!dma)
-		ctx->dma.tail = NULL;
-	spin_unlock_irqrestore(&ctx->dma.lock, flags);
-
 	pr_debug("poll: completed=%d remaining=%s\n",
-		 count, ctx->dma.head ? "yes" : "no");
+		 count, io_dma_pending(ctx) ? "yes" : "no");
 
 out_disarm:
-	atomic_set(&ctx->dma.poll_armed, 0);
-	return ctx->dma.head ? 1 : 0;
+	/* Release ordering hands poll_list (written lock-free above) to
+	 * whichever thread arms the poller next. */
+	atomic_set_release(&ctx->dma.poll_armed, 0);
+	return io_dma_pending(ctx) ? 1 : 0;
 }
 
 /*
@@ -938,7 +995,7 @@ out_disarm:
  *
  * Returns true if the caller should skip sleeping and re-run its wait loop
  * (task_work/CQEs are ready), false to fall through to schedule(). IRQ-mode
- * tasks never appear on ctx->dma.head, so this is a no-op for them, as it is
+ * tasks never appear on the pending lists, so this is a no-op for them, as it
  * for rings with no DMA channel.
  */
 bool io_dma_cq_wait_poll(struct io_ring_ctx *ctx, struct io_wait_queue *iowq)
@@ -948,7 +1005,7 @@ bool io_dma_cq_wait_poll(struct io_ring_ctx *ctx, struct io_wait_queue *iowq)
 
 	if (!budget_us || IS_ERR_OR_NULL(ctx->dma.chan))
 		return false;
-	if (!READ_ONCE(ctx->dma.head))
+	if (!io_dma_pending(ctx))
 		return false;
 
 	end_ns = ktime_get_ns() + (u64)budget_us * NSEC_PER_USEC;
@@ -958,7 +1015,7 @@ bool io_dma_cq_wait_poll(struct io_ring_ctx *ctx, struct io_wait_queue *iowq)
 		if (task_work_pending(current) || io_local_work_pending(ctx) ||
 		    io_should_wake(iowq))
 			return true;
-		if (!READ_ONCE(ctx->dma.head))
+		if (!io_dma_pending(ctx))
 			return false;
 		if (need_resched() || task_sigpending(current))
 			return false;

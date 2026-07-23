@@ -594,6 +594,15 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 			    u64 dst_user_addr, size_t want);
 extern struct kmem_cache *dma_cachep;
 int __io_dma_poll(struct io_ring_ctx *ctx);
+
+/* Any pollable DMA tasks in flight?  poll_list belongs to the armed
+ * poller; reading it here is a racy heuristic, which is all the wakeup
+ * and wait-loop checks need. */
+static inline bool io_dma_pending(struct io_ring_ctx *ctx)
+{
+	return !llist_empty(&ctx->dma.submit_list) ||
+	       READ_ONCE(ctx->dma.poll_list) != NULL;
+}
 bool io_dma_cq_wait_poll(struct io_ring_ctx *ctx, struct io_wait_queue *iowq);
 int kiocb_done(struct io_kiocb *req, ssize_t ret, struct io_br_sel *sel, unsigned int issue_flags);
 void io_submit_flush_completions(struct io_ring_ctx *ctx);
