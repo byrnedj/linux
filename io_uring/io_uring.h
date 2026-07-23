@@ -600,6 +600,8 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 extern struct kmem_cache *dma_cachep;
 void io_dma_cache_init(void);
 int __io_dma_poll(struct io_ring_ctx *ctx);
+void io_dma_task_release_res(struct io_ring_ctx *ctx, struct device *dev,
+			     struct io_dma_task *dma);
 
 /* Any pollable DMA tasks in flight?  poll_list belongs to the armed
  * poller; reading it here is a racy heuristic, which is all the wakeup
