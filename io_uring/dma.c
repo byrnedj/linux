@@ -1764,20 +1764,20 @@ put_folios:
 	return total_read ? total_read : error;
 }
 
-static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
-				   int ret)
+/*
+ * Release a completed (or aborted) task's source resources: DMA unmaps --
+ * IOVA frees and IOTLB work under an IOMMU -- and folio references.  This
+ * is the expensive half of completion and needs no ctx->dma.lock; callers
+ * run it before taking the lock for __io_dma_task_complete() so the lock
+ * hold shrinks to the refcount handshake.
+ */
+void io_dma_task_release_res(struct io_ring_ctx *ctx, struct device *dev,
+			     struct io_dma_task *dma)
 {
-	struct io_kiocb *req;
-	u32 task_len;
-
-	req = dma->req;
-	task_len = dma->len;
-
-	/* Clean up source DMA mappings and folio references */
 	if (dma->is_batch) {
-		io_dma_batch_cleanup(req->ctx, dev, dma);
+		io_dma_batch_cleanup(ctx, dev, dma);
 	} else {
-		if (dma->src_map_len && !req->ctx->dma.use_phys_addrs) {
+		if (dma->src_map_len && !ctx->dma.use_phys_addrs) {
 			if (dma->src_is_page)
 				dma_unmap_page(dev, dma->src_map_addr,
 					       dma->src_map_len,
@@ -1790,6 +1790,20 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
 		if (dma->src_folio)
 			folio_put(dma->src_folio);
 	}
+}
+
+/*
+ * Caller must hold ctx->dma.lock and must have already released the task's
+ * source resources via io_dma_task_release_res().
+ */
+static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
+				   int ret)
+{
+	struct io_kiocb *req;
+	u32 task_len;
+
+	req = dma->req;
+	task_len = dma->len;
 
 	if (ret == DMA_COMPLETE) {
 		if (dma->submit_ns)
@@ -1883,35 +1897,6 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
 	}
 }
 
-/*
- * Release a task's resources without completing the req. Used by the IRQ
- * callback during channel release (ctx->dma.releasing): idxd aborts any
- * still-in-flight descriptor and invokes the callback, but completing the req
- * that late would need io_free_req() whose task_work falls back onto the
- * tearing-down ctx -> UAF (see io_release_dma_chan). So unmap + free the task
- * and leave the req's in-flight ref leaked, exactly as io_release_dma_chan
- * does for a hung task. Confined to the already-degraded teardown path.
- */
-static void io_dma_task_release_orphan(struct io_ring_ctx *ctx,
-				       struct device *dev,
-				       struct io_dma_task *dma)
-{
-	if (dma->is_batch) {
-		io_dma_batch_cleanup(ctx, dev, dma);
-	} else {
-		if (dma->src_map_len && !ctx->dma.use_phys_addrs) {
-			if (dma->src_is_page)
-				dma_unmap_page(dev, dma->src_map_addr,
-					       dma->src_map_len, DMA_TO_DEVICE);
-			else
-				dma_unmap_single(dev, dma->src_map_addr,
-						 dma->src_map_len, DMA_TO_DEVICE);
-		}
-		if (dma->src_folio)
-			folio_put(dma->src_folio);
-	}
-	kmem_cache_free(dma_cachep, dma);
-}
 
 /*
  * IRQ-mode completion. Runs in idxd's threaded IRQ (process context, no idxd
@@ -1933,10 +1918,21 @@ static void io_dma_irq_complete(void *param, const struct dmaengine_result *res)
 
 	atomic_inc(&ctx->dma.diag_irq_completed);
 
+	/* Heavy resource release (unmaps, folio puts) outside the lock. */
+	io_dma_task_release_res(ctx, dev, dma);
+
 	spin_lock_irqsave(&ctx->dma.lock, flags);
 	if (ctx->dma.releasing) {
+		/*
+		 * Channel release in progress: idxd aborted this descriptor.
+		 * Completing the req this late would need io_free_req() whose
+		 * task_work falls back onto the tearing-down ctx -> UAF (see
+		 * io_release_dma_chan). Free the task and leave the req's
+		 * in-flight ref leaked, exactly as io_release_dma_chan does
+		 * for a hung task; confined to the degraded teardown path.
+		 */
 		atomic_inc(&ctx->dma.diag_irq_orphaned);
-		io_dma_task_release_orphan(ctx, dev, dma);
+		kmem_cache_free(dma_cachep, dma);
 	} else {
 		__io_dma_task_complete(dev, dma, status);
 	}
@@ -2214,10 +2210,11 @@ int __io_dma_poll(struct io_ring_ctx *ctx)
 		if (!next)
 			ctx->dma.poll_list_tail = NULL;
 
-		/* ctx->dma.lock still serializes the completion itself:
-		 * the non-atomic dma_refcnt / dma_ref_held handshake with
-		 * the submitter's ref-take and the IRQ completion path
-		 * depends on it.  The hold is now just this one call. */
+		/* Heavy resource release (IOMMU unmaps, folio puts) runs
+		 * unlocked; ctx->dma.lock then covers only the refcount
+		 * handshake with the submitter's ref-take and the IRQ
+		 * completion path. */
+		io_dma_task_release_res(ctx, dev, dma);
 		spin_lock_irqsave(&ctx->dma.lock, flags);
 		__io_dma_task_complete(dev, dma, ret);
 		spin_unlock_irqrestore(&ctx->dma.lock, flags);
