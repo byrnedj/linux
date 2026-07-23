@@ -339,8 +339,18 @@ struct io_dma_channel {
 	bool			releasing;
 
 	spinlock_t		lock;
-	struct io_dma_task	*head;
-	struct io_dma_task	*tail;
+
+	/* Pending pollable tasks, split for lock-free producer/consumer:
+	 * submitters publish to submit_list (llist, no lock -- the ->lock
+	 * hold they still take for the in-flight ref is a few instructions,
+	 * not the whole poller walk), and the single armed poller
+	 * (poll_armed) splices it into poll_list, a consumer-owned FIFO it
+	 * walks with no lock at all.  poll_list is handed between poller
+	 * threads by the poll_armed acquire/release pair.
+	 */
+	struct llist_head	submit_list;
+	struct io_dma_task	*poll_list;
+	struct io_dma_task	*poll_list_tail;
 
 	/* Preallocated io_dma_task freelist, sized to ring depth.
 	 * Separate lock: __io_dma_task_complete() runs both under and
@@ -408,6 +418,7 @@ struct io_dma_batch_entry {
 
 struct io_dma_task {
 	struct io_kiocb		*req;
+	struct llist_node	llnode;		/* ctx submit_list linkage */
 	dma_cookie_t		cookie;
 	dma_addr_t		src_dma;	/* DMA-mapped source address */
 	dma_addr_t		dst_dma;	/* pre-mapped dest DMA address */
