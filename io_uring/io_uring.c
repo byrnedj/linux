@@ -2297,20 +2297,36 @@ static void io_release_dma_chan(struct io_ring_ctx *ctx)
 	ctx->dma.chan = NULL;
 }
 
+static bool io_dma_chan_filter_node(struct dma_chan *chan, void *param)
+{
+	int node = *(int *)param;
+
+	return dev_to_node(chan->device->dev) == node;
+}
+
 static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 				struct io_uring_params *p)
 {
 	dma_cap_mask_t mask;
+	int node = numa_node_id();
 	int rc = 0;
 
 	dma_cap_zero(mask);
 	dma_cap_set(DMA_MEMCPY, mask);
 
-	ctx->dma.chan = dma_request_chan_by_mask(&mask);
-	if (IS_ERR(ctx->dma.chan)) {
-		rc = PTR_ERR(ctx->dma.chan);
-		pr_err("dma_request_chan_by_mask() failed: %d (%pe) requester=%s[%d] tgid=%d\n",
-		       rc, ctx->dma.chan, current->comm,
+	/* Prefer a channel whose DSA device sits on the caller's NUMA
+	 * node: a cross-socket engine pays UPI hops on every descriptor
+	 * fetch and data move, which shows up as bimodal throughput
+	 * depending on which channel the ring happened to win.  Fall
+	 * back to any-node only when the local node is exhausted. */
+	ctx->dma.chan = dma_request_channel(mask, io_dma_chan_filter_node,
+					    &node);
+	if (!ctx->dma.chan)
+		ctx->dma.chan = dma_request_chan_by_mask(&mask);
+	if (IS_ERR_OR_NULL(ctx->dma.chan)) {
+		rc = ctx->dma.chan ? PTR_ERR(ctx->dma.chan) : -ENODEV;
+		pr_err("io_uring DMA: no channel available: %d requester=%s[%d] tgid=%d\n",
+		       rc, current->comm,
 		       task_pid_nr(current), task_tgid_nr(current));
 		ctx->dma.chan = NULL;
 		goto failed;
@@ -2326,9 +2342,10 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 	}
 
 	dev_info(ctx->dma.chan->device->dev,
-		 "io_uring DMA: acquired channel %s (%s addressing) requester=%s[%d] tgid=%d ctx=%p\n",
+		 "io_uring DMA: acquired channel %s (%s addressing, node %d, caller node %d) requester=%s[%d] tgid=%d ctx=%p\n",
 		 dma_chan_name(ctx->dma.chan),
 		 ctx->dma.use_phys_addrs ? "physical" : "IOMMU-mapped",
+		 dev_to_node(ctx->dma.chan->device->dev), node,
 		 current->comm, task_pid_nr(current), task_tgid_nr(current), ctx);
 
 	ctx->dma.head = NULL;
