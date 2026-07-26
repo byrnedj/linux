@@ -677,7 +677,7 @@ static ssize_t io_dma_cpu_copy(struct iov_iter *dst_iter,
  */
 static dma_addr_t io_dma_dst_addr(struct io_kiocb *req,
 				  struct iov_iter *dst_iter,
-				  u64 dst_base_addr, size_t offset,
+				  u64 dst_addr,
 				  size_t *folio_remain)
 {
 	struct io_ring_ctx *ctx = req->ctx;
@@ -690,7 +690,7 @@ static dma_addr_t io_dma_dst_addr(struct io_kiocb *req,
 		if (!(req->flags & REQ_F_BUF_NODE) || !req->buf_node)
 			return 0;
 		imu = req->buf_node->buf;
-		dst_dma = io_reg_buf_dma_addr(imu, dst_base_addr + offset);
+		dst_dma = io_reg_buf_dma_addr(imu, dst_addr);
 		folio_shift = imu->folio_shift;
 	} else {
 		struct io_buffer_list *bl;
@@ -698,7 +698,7 @@ static dma_addr_t io_dma_dst_addr(struct io_kiocb *req,
 		bl = xa_load(&ctx->io_bl_xa, req->dma.buf_group);
 		if (!bl || !bl->dma_addrs)
 			return 0;
-		dst_dma = io_kbuf_dma_addr(bl, dst_base_addr + offset);
+		dst_dma = io_kbuf_dma_addr(bl, dst_addr);
 		folio_shift = bl->dma_folio_shift;
 	}
 
@@ -871,6 +871,9 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	size_t len, total_dma;
 	unsigned int threshold;
 	u64 dst_base_addr;
+	const struct iovec *dst_iov = NULL;
+	unsigned long dst_seg_idx = 0;
+	size_t dst_seg_off = 0;
 	unsigned int nr_entries = 0;
 	unsigned int call_chunks = 0;
 	u64 call_t0;
@@ -895,10 +898,15 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	}
 
 	/*
-	 * Compute destination base address once.  DMA addresses are
-	 * resolved arithmetically as dst_base_addr + offset, independent
-	 * of iterator state, so the inner loop doesn't need to track
-	 * iterator positions.
+	 * Compute the destination base address once. bvec (registered buffer)
+	 * and ubuf destinations are virtually contiguous, so chunk addresses
+	 * resolve arithmetically as dst_base_addr + offset, independent of
+	 * iterator state. An iovec destination is NOT contiguous — a
+	 * RECVSEND_BUNDLE recv maps one iovec segment per provided buffer,
+	 * and consecutive segments are arbitrary chunks of the mapped region —
+	 * so the inner loop walks the segments with a cursor instead
+	 * (dst_iov/dst_seg_off below) and additionally clamps every chunk to
+	 * its segment.
 	 */
 	if (iov_iter_is_bvec(dst_iter)) {
 		if (!(req->flags & REQ_F_BUF_NODE) || !req->buf_node)
@@ -907,7 +915,9 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	} else if (iter_is_ubuf(dst_iter)) {
 		dst_base_addr = (u64)dst_iter->ubuf + dst_iter->iov_offset;
 	} else if (iter_is_iovec(dst_iter)) {
-		dst_base_addr = (u64)iter_iov_addr(dst_iter);
+		dst_iov = iter_iov(dst_iter);
+		dst_seg_off = dst_iter->iov_offset;
+		dst_base_addr = 0;
 	} else {
 		goto cpu_fallback;
 	}
@@ -933,8 +943,8 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	 * flushed when full (IO_DMA_BATCH_MAX) and once at the end.
 	 *
 	 * Each entry also carries its CPU-reachable source (src_kaddr) and
-	 * destination offset (dst_off) so the error path can CPU-copy a chunk
-	 * that was collected but not yet submitted to hardware. At
+	 * destination user VA (dst_uaddr) so the error path can CPU-copy a
+	 * chunk that was collected but not yet submitted to hardware. At
 	 * IO_DMA_BATCH_MAX == 16 the array is small enough to live on the stack,
 	 * which avoids a per-recv allocation on the hot path.
 	 */
@@ -955,9 +965,10 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	 * could move for ~free — the dominant cost in the submit path.
 	 */
 	while (total_dma < len) {
-		size_t seg_avail, folio_remain, chunk_len;
+		size_t seg_avail, folio_remain, chunk_len, dst_seg_remain;
 		void *src_kaddr;
 		dma_addr_t dst_dma;
+		u64 dst_uaddr;
 
 		seg_avail = iter_iov_len(src_iter);
 		if (!seg_avail)
@@ -965,14 +976,40 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 		seg_avail = min_t(size_t, seg_avail, len - total_dma);
 		src_kaddr = (void *)iter_iov_addr(src_iter);
 
+		/*
+		 * Resolve this chunk's destination user VA. Contiguous
+		 * destinations (registered buffer, ubuf) are base + offset;
+		 * an iovec destination (bundle: one segment per provided
+		 * buffer) is walked segment by segment, clamping each chunk
+		 * so it never spans two non-adjacent buffers.
+		 */
+		if (dst_iov) {
+			while (dst_seg_off >= dst_iov[dst_seg_idx].iov_len) {
+				dst_seg_off -= dst_iov[dst_seg_idx].iov_len;
+				if (++dst_seg_idx >= dst_iter->nr_segs) {
+					/* len was clamped to the iter count,
+					 * so running out of segments means a
+					 * malformed iovec; recover on CPU. */
+					goto cpu_fallback_rest;
+				}
+			}
+			dst_uaddr = (u64)dst_iov[dst_seg_idx].iov_base +
+				    dst_seg_off;
+			dst_seg_remain = dst_iov[dst_seg_idx].iov_len -
+					 dst_seg_off;
+		} else {
+			dst_uaddr = dst_base_addr + total_dma;
+			dst_seg_remain = len - total_dma;
+		}
+
 		/* Resolve the destination folio and clamp the chunk to it so no
 		 * single transfer crosses an IOMMU mapping.
 		 */
-		dst_dma = io_dma_dst_addr(req, dst_iter, dst_base_addr,
-					  total_dma, &folio_remain);
+		dst_dma = io_dma_dst_addr(req, dst_iter, dst_uaddr,
+					  &folio_remain);
 		if (!dst_dma)
 			goto cpu_fallback_rest;
-		chunk_len = min_t(size_t, seg_avail, folio_remain);
+		chunk_len = min3(seg_avail, folio_remain, dst_seg_remain);
 
 		/*
 		 * Record the chunk; the source is mapped later, once per batch
@@ -982,7 +1019,7 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 		 */
 		entries[nr_entries].dst_dma = dst_dma;
 		entries[nr_entries].src_kaddr = src_kaddr;
-		entries[nr_entries].dst_off = total_dma;
+		entries[nr_entries].dst_uaddr = dst_uaddr;
 		entries[nr_entries].src_len = chunk_len;
 		entries[nr_entries].folio = NULL;
 		entries[nr_entries].src_is_page = false;
@@ -990,6 +1027,7 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 		call_chunks++;
 
 		total_dma += chunk_len;
+		dst_seg_off += chunk_len;
 		iov_iter_advance(src_iter, chunk_len);
 
 		/* Flush a full batch and keep collecting. */
@@ -1041,7 +1079,7 @@ cpu_fallback_rest:
 	if (nr_entries) {
 		for (i = 0; i < nr_entries; i++) {
 			void __user *dst_ua = (void __user *)
-				(dst_base_addr + entries[i].dst_off);
+				entries[i].dst_uaddr;
 			unsigned long unc = copy_to_user(dst_ua,
 							 entries[i].src_kaddr,
 							 entries[i].src_len);
