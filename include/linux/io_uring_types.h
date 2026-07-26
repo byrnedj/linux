@@ -417,8 +417,11 @@ struct io_dma_batch_entry {
 						 * recv error path CPU-copy a chunk
 						 * collected but not yet submitted */
 	struct folio		*folio;		/* page cache folio ref, or NULL */
-	size_t			dst_off;	/* offset into the dst buffer, for
-						 * the same recv error-path CPU copy */
+	u64			dst_uaddr;	/* dst user VA of this chunk, for
+						 * the same recv error-path CPU copy
+						 * (a bundle dst is a multi-segment
+						 * iovec, so a linear offset cannot
+						 * name the destination) */
 	u32			src_len;	/* source mapping length */
 	bool			src_is_page;	/* src mapped via dma_map_page()
 						 * (folio source) vs dma_map_single()
