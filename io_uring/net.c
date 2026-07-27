@@ -1247,6 +1247,13 @@ int io_recv(struct io_kiocb *req, unsigned int issue_flags)
 	int ret, min_ret = 0;
 	bool force_nonblock = issue_flags & IO_URING_F_NONBLOCK;
 	bool mshot_finished;
+	/*
+	 * Cap for the inline multishot DMA drain below: without it a fast
+	 * sender keeping the socket non-empty would pin this task_work on
+	 * one channel and starve the ring's other requests. 16 matches
+	 * netty's per-readiness read cap on the epoll transport.
+	 */
+	unsigned int drain_left = 16;
 
 	sock = sock_from_file(req->file);
 	if (unlikely(!sock))
@@ -1439,6 +1446,43 @@ retry_multishot:
 				 * async_data will be freed by io_clean_op when
 				 * the request completes after DMA finishes.
 				 */
+				/*
+				 * Inline multishot drain: if the socket has
+				 * more data queued, wait out this cycle's
+				 * copy (~6-15us on DSA), post its aux CQE
+				 * ourselves, and immediately run another
+				 * buffer+recv+offload cycle in this same
+				 * poll task_work -- epoll's wake-once,
+				 * drain-until-empty cadence instead of one
+				 * task_work round trip per ~64KB arrival.
+				 * The per-request DMA state holds a single
+				 * in-flight cycle, so the drain serializes
+				 * on each completion; the flush helper
+				 * resets the multishot bookkeeping
+				 * (io_mshot_prep_retry) exactly as the
+				 * io_recv prelude would on the next wake.
+				 * pending_aux_cqe distinguishes success
+				 * from a DMA error (dma_terminal), which
+				 * falls through to the deferred teardown.
+				 * The drain ends on empty socket, budget
+				 * expiry, need_resched, or CQ overflow.
+				 */
+				if ((req->flags & REQ_F_APOLL_MULTISHOT) &&
+				    kmsg->msg.msg_inq > 0 && drain_left &&
+				    io_dma_inline_wait(req,
+					READ_ONCE(io_dma_drain_wait_us)) &&
+				    req->dma.pending_aux_cqe &&
+				    io_dma_flush_pending_aux_cqe(req)) {
+					drain_left--;
+					atomic64_inc(&io_dma_drain_cycles);
+					goto retry_multishot;
+				}
+				/*
+				 * Optional single-cycle inline wait (see
+				 * io_dma_inline_wait(); default 0).
+				 */
+				io_dma_inline_wait(req,
+					READ_ONCE(io_dma_inline_wait_us));
 				return IOU_ISSUE_SKIP_COMPLETE;
 			}
 			ret = ret2;
