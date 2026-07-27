@@ -99,7 +99,16 @@ static unsigned int io_dma_cq_poll_us __read_mostly = 20;
  *    0 disables. Both tunable via debugfs for A/B.
  */
 unsigned int io_dma_reap_on_enter __read_mostly = 1;
-static unsigned int io_dma_inline_wait_us __read_mostly = 10;
+/*
+ * Default 0: A/B on netty echo + Spark shuffle showed the wait mostly
+ * expires (the copy often outlives the budget once queueing is counted)
+ * and the burned issue-context time cost ~4% echo throughput, while the
+ * cells it did catch didn't move end-to-end latency -- the residual
+ * io_uring-vs-epoll gap lives upstream of completion detection (one poll
+ * task_work cycle per ~64KB arrival vs epoll's wake-once-drain-loop).
+ * Kept as a knob for workloads with slower arrival cadence.
+ */
+static unsigned int io_dma_inline_wait_us __read_mostly = 0;
 
 /* For io_recv() (net.c) to capture the recv-only IRQ mode at prep time. */
 bool io_dma_irq_mode(void)
