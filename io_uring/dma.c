@@ -108,7 +108,21 @@ unsigned int io_dma_reap_on_enter __read_mostly = 1;
  * task_work cycle per ~64KB arrival vs epoll's wake-once-drain-loop).
  * Kept as a knob for workloads with slower arrival cadence.
  */
-static unsigned int io_dma_inline_wait_us __read_mostly = 0;
+unsigned int io_dma_inline_wait_us __read_mostly = 0;
+
+/*
+ * Budget for each inter-cycle wait of the multishot inline drain
+ * (io_recv): after a recv's DMA is submitted, if the socket still has
+ * queued data, wait out this cycle's copy, post its aux CQE, and
+ * immediately run another buffer+recv+offload cycle in the same poll
+ * task_work -- epoll's wake-once-drain-until-empty cadence instead of
+ * one task_work round trip per ~64KB arrival. A DSA recv copy detects
+ * in ~6-15us, so 20us lets most drains proceed. 0 disables the drain.
+ */
+unsigned int io_dma_drain_wait_us __read_mostly = 20;
+
+/* Extra recv+offload cycles run by the inline drain (mechanism check). */
+atomic64_t io_dma_drain_cycles = ATOMIC64_INIT(0);
 
 /* For io_recv() (net.c) to capture the recv-only IRQ mode at prep time. */
 bool io_dma_irq_mode(void)
@@ -298,6 +312,8 @@ static int io_dma_lat_show(struct seq_file *m, void *v)
 	for (i = 0; i < IO_DMA_FB_NR; i++)
 		seq_printf(m, "  %-12s %12llu\n", io_dma_fb_names[i],
 			   atomic64_read(&io_dma_fb[i]));
+	seq_printf(m, "drain_cycles: %12llu\n",
+		   atomic64_read(&io_dma_drain_cycles));
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(io_dma_lat);
@@ -325,6 +341,7 @@ static ssize_t io_dma_lat_reset_write(struct file *file,
 		atomic64_set(&io_dma_chunks_hist[i], 0);
 	for (i = 0; i < IO_DMA_FB_NR; i++)
 		atomic64_set(&io_dma_fb[i], 0);
+	atomic64_set(&io_dma_drain_cycles, 0);
 	return count;
 }
 
@@ -454,6 +471,8 @@ void io_dma_debugfs_init(void)
 			   &io_dma_reap_on_enter);
 	debugfs_create_u32("io_uring_dma_inline_wait_us", 0644, NULL,
 			   &io_dma_inline_wait_us);
+	debugfs_create_u32("io_uring_dma_drain_wait_us", 0644, NULL,
+			   &io_dma_drain_wait_us);
 	debugfs_create_u32("io_uring_dma_cq_poll_us", 0644, NULL,
 			   &io_dma_cq_poll_us);
 	debugfs_create_file("io_uring_dma_cpu_latency_us", 0644, NULL, NULL,
@@ -2336,10 +2355,9 @@ out_disarm:
  *
  * Returns true if the request's DMA completed within the budget.
  */
-bool io_dma_inline_wait(struct io_kiocb *req)
+bool io_dma_inline_wait(struct io_kiocb *req, unsigned int budget_us)
 {
 	struct io_ring_ctx *ctx = req->ctx;
-	unsigned int budget_us = READ_ONCE(io_dma_inline_wait_us);
 	u64 end_ns;
 
 	if (!budget_us || req->dma.irq_mode || IS_ERR_OR_NULL(ctx->dma.chan))
