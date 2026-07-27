@@ -117,9 +117,14 @@ unsigned int io_dma_inline_wait_us __read_mostly = 0;
  * immediately run another buffer+recv+offload cycle in the same poll
  * task_work -- epoll's wake-once-drain-until-empty cadence instead of
  * one task_work round trip per ~64KB arrival. A DSA recv copy detects
- * in ~6-15us, so 20us lets most drains proceed. 0 disables the drain.
+ * in ~6-15us, so ~20us lets most drains proceed. Default 0 (off): on
+ * loopback the drain engaged on ~87% of Spark shuffle chunks yet moved
+ * neither elapsed nor fetch-wait, and cost ~4% on saturated echo -- the
+ * serialization tax buys nothing there because per-chunk recv delivery
+ * cadence is not the latency driver. Kept as a knob for real-NIC
+ * arrival patterns.
  */
-unsigned int io_dma_drain_wait_us __read_mostly = 20;
+unsigned int io_dma_drain_wait_us __read_mostly;
 
 /* Extra recv+offload cycles run by the inline drain (mechanism check). */
 atomic64_t io_dma_drain_cycles = ATOMIC64_INIT(0);
