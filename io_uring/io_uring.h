@@ -612,6 +612,21 @@ static inline bool io_dma_pending(struct io_ring_ctx *ctx)
 	       READ_ONCE(ctx->dma.poll_list) != NULL;
 }
 bool io_dma_cq_wait_poll(struct io_ring_ctx *ctx, struct io_wait_queue *iowq);
+bool io_dma_inline_wait(struct io_kiocb *req);
+extern unsigned int io_dma_reap_on_enter;
+
+/*
+ * One opportunistic completion-detection pass on the ring task's own kernel
+ * entry (io_uring_enter). Detecting here instead of on the kworker lets the
+ * poll task_work that posts the CQE run before this enter returns -- no
+ * extra wakeup. Cheap when idle: two lockless emptiness checks.
+ */
+static inline void io_dma_reap_inline(struct io_ring_ctx *ctx)
+{
+	if (READ_ONCE(io_dma_reap_on_enter) &&
+	    !IS_ERR_OR_NULL(ctx->dma.chan) && io_dma_pending(ctx))
+		__io_dma_poll(ctx);
+}
 bool io_dma_irq_mode(void);
 void io_dma_compl_thread_start(struct io_ring_ctx *ctx);
 void io_dma_compl_thread_stop(struct io_ring_ctx *ctx);

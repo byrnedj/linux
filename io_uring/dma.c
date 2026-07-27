@@ -75,6 +75,28 @@ static unsigned int io_dma_completion_mode __read_mostly = IO_DMA_COMP_KWORKER;
  */
 static unsigned int io_dma_cq_poll_us __read_mostly = 20;
 
+/*
+ * Keep DMA completion detection on the ring task where possible, instead of
+ * bouncing every completion through the kworker poller plus a second
+ * task_work wakeup:
+ *
+ *  - io_dma_reap_on_enter: run one __io_dma_poll() pass at io_uring_enter()
+ *    (after SQE submission and before CQ-wait). A busy event loop is in the
+ *    kernel constantly, so most completions are then detected by the one
+ *    task that may post CQEs directly, and the poll task_work they queue
+ *    runs before the enter returns -- no extra wakeup at all. The kworker
+ *    remains the backstop for idle rings.
+ *
+ *  - io_dma_inline_wait_us: bounded busy-wait right after a recv's
+ *    descriptors are submitted (io_recv's deferred-completion path). A
+ *    typical DSA recv copy completes in ~5-15us; waiting it out while still
+ *    in the issue context means the completion's task_work runs in the same
+ *    kernel entry and the CQE posts epoll-style, with zero added wakeups.
+ *    0 disables. Both tunable via debugfs for A/B.
+ */
+unsigned int io_dma_reap_on_enter __read_mostly = 1;
+static unsigned int io_dma_inline_wait_us __read_mostly = 10;
+
 /* For io_recv() (net.c) to capture the recv-only IRQ mode at prep time. */
 bool io_dma_irq_mode(void)
 {
@@ -335,6 +357,10 @@ void io_dma_debugfs_init(void)
 			    &io_dma_lat_reset_fops);
 	debugfs_create_file("io_uring_dma_completion_mode", 0644, NULL, NULL,
 			    &io_dma_comp_mode_fops);
+	debugfs_create_u32("io_uring_dma_reap_on_enter", 0644, NULL,
+			   &io_dma_reap_on_enter);
+	debugfs_create_u32("io_uring_dma_inline_wait_us", 0644, NULL,
+			   &io_dma_inline_wait_us);
 	debugfs_create_u32("io_uring_dma_cq_poll_us", 0644, NULL,
 			   &io_dma_cq_poll_us);
 	debugfs_create_file("io_uring_dma_cpu_latency_us", 0644, NULL, NULL,
@@ -2157,6 +2183,46 @@ out_disarm:
  * tasks never appear on the pending lists, so this is a no-op for them, as it
  * for rings with no DMA channel.
  */
+/*
+ * Bounded inline wait for one request's in-flight DMA, called from the issue
+ * path right after its descriptors were submitted (uring_lock held, ring
+ * task). If the hardware finishes within the budget, the completion runs
+ * here -- __io_dma_poll() -> __io_dma_task_complete() -- and the task_work
+ * it queues (poll kick or terminal complete) executes before this kernel
+ * entry returns, so the CQE posts with no additional wakeup: the chain is
+ * epoll's plus the hardware wait. On budget expiry the kworker/irq
+ * completers take over as usual.
+ *
+ * dma_refcnt is written under ctx->dma.lock by the completer; the lockless
+ * read here is only a termination heuristic -- every exit path leaves the
+ * deferred completion machinery fully in charge of correctness.
+ *
+ * Returns true if the request's DMA completed within the budget.
+ */
+bool io_dma_inline_wait(struct io_kiocb *req)
+{
+	struct io_ring_ctx *ctx = req->ctx;
+	unsigned int budget_us = READ_ONCE(io_dma_inline_wait_us);
+	u64 end_ns;
+
+	if (!budget_us || req->dma.irq_mode || IS_ERR_OR_NULL(ctx->dma.chan))
+		return false;
+	if (!READ_ONCE(req->dma.dma_refcnt))
+		return true;
+
+	end_ns = ktime_get_ns() + (u64)budget_us * NSEC_PER_USEC;
+	do {
+		__io_dma_poll(ctx);
+		if (!READ_ONCE(req->dma.dma_refcnt))
+			return true;
+		if (need_resched())
+			break;
+		cpu_relax();
+	} while (ktime_get_ns() < end_ns);
+
+	return !READ_ONCE(req->dma.dma_refcnt);
+}
+
 bool io_dma_cq_wait_poll(struct io_ring_ctx *ctx, struct io_wait_queue *iowq)
 {
 	unsigned int budget_us = READ_ONCE(io_dma_cq_poll_us);

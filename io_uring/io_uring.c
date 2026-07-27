@@ -2908,6 +2908,14 @@ SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
 			mutex_unlock(&ctx->uring_lock);
 			goto out;
 		}
+		/*
+		 * Reap in-flight DMA completions before running local work:
+		 * completions detected here queue their poll task_work, which
+		 * the local-work run below then executes, posting the CQEs in
+		 * this same enter instead of after a kworker + wakeup round
+		 * trip.
+		 */
+		io_dma_reap_inline(ctx);
 		if (flags & IORING_ENTER_GETEVENTS) {
 			if (ctx->int_flags & IO_RING_F_SYSCALL_IOPOLL)
 				goto iopoll_locked;
@@ -2940,6 +2948,14 @@ iopoll_locked:
 		} else {
 			struct ext_arg ext_arg = { .argsz = argsz };
 
+			/*
+			 * GETEVENTS-only enter (no submission ran above):
+			 * detect finished DMA on this task before waiting, so
+			 * the wait loop's task_work run posts those CQEs
+			 * instead of sleeping on the kworker's schedule.
+			 */
+			if (!to_submit)
+				io_dma_reap_inline(ctx);
 			ret2 = io_get_ext_arg(ctx, flags, argp, &ext_arg);
 			if (likely(!ret2))
 				ret2 = io_cqring_wait(ctx, min_complete, flags,
