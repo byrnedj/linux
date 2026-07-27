@@ -87,15 +87,28 @@ static unsigned int io_dma_cq_poll_us __read_mostly = 20;
  *    runs before the enter returns -- no extra wakeup at all. The kworker
  *    remains the backstop for idle rings.
  *
- *  - io_dma_inline_wait_us: bounded busy-wait right after a recv's
- *    descriptors are submitted (io_recv's deferred-completion path). A
- *    typical DSA recv copy completes in ~5-15us; waiting it out while still
- *    in the issue context means the completion's task_work runs in the same
- *    kernel entry and the CQE posts epoll-style, with zero added wakeups.
- *    0 disables. Both tunable via debugfs for A/B.
+ *    Tunable via debugfs.
  */
 unsigned int io_dma_reap_on_enter __read_mostly = 1;
-static unsigned int io_dma_inline_wait_us __read_mostly = 10;
+
+/*
+ * Budget for each inter-cycle wait of the multishot inline drain
+ * (io_recv): after a recv's DMA is submitted, if the socket still has
+ * queued data, wait out this cycle's copy, post its aux CQE, and
+ * immediately run another buffer+recv+offload cycle in the same poll
+ * task_work -- epoll's wake-once-drain-until-empty cadence instead of
+ * one task_work round trip per ~64KB arrival. A DSA recv copy detects
+ * in ~6-15us, so ~20us lets most drains proceed. Default 0 (off): on
+ * loopback the drain engaged on ~87% of Spark shuffle chunks yet moved
+ * neither elapsed nor fetch-wait, and cost ~4% on saturated echo -- the
+ * serialization tax buys nothing there because per-chunk recv delivery
+ * cadence is not the latency driver. Kept as a knob for real-NIC
+ * arrival patterns.
+ */
+unsigned int io_dma_drain_wait_us __read_mostly;
+
+/* Extra recv+offload cycles run by the inline drain (mechanism check). */
+atomic64_t io_dma_drain_cycles = ATOMIC64_INIT(0);
 
 /* For io_recv() (net.c) to capture the recv-only IRQ mode at prep time. */
 bool io_dma_irq_mode(void)
@@ -359,8 +372,8 @@ void io_dma_debugfs_init(void)
 			    &io_dma_comp_mode_fops);
 	debugfs_create_u32("io_uring_dma_reap_on_enter", 0644, NULL,
 			   &io_dma_reap_on_enter);
-	debugfs_create_u32("io_uring_dma_inline_wait_us", 0644, NULL,
-			   &io_dma_inline_wait_us);
+	debugfs_create_u32("io_uring_dma_drain_wait_us", 0644, NULL,
+			   &io_dma_drain_wait_us);
 	debugfs_create_u32("io_uring_dma_cq_poll_us", 0644, NULL,
 			   &io_dma_cq_poll_us);
 	debugfs_create_file("io_uring_dma_cpu_latency_us", 0644, NULL, NULL,
@@ -984,11 +997,10 @@ ssize_t io_uring_copy_to_iter(struct kiocb *kiocb, struct iov_iter *dst_iter,
 	 * Every segment of a DMA'd transfer rides in the batch, including ones
 	 * smaller than the threshold: the whole-transfer threshold gate above
 	 * already routes small recvs to a full CPU copy, so a transfer that
-	 * reaches here is worth DSA, and a sub-threshold segment is just one more
-	 * sub-descriptor in a batch we are already paying to build. Deferring
-	 * such segments to a CPU copy_to_user() pass (as an earlier design did)
-	 * burned ~2us of submit-thread time per recv copying data the engine
-	 * could move for ~free — the dominant cost in the submit path.
+	 * reaches here is worth DSA, and a sub-threshold segment is just one
+	 * more sub-descriptor in a batch already being built. Deferring such
+	 * segments to a CPU copy_to_user() pass would spend submit-thread
+	 * time copying data the engine can move as part of the batch.
 	 */
 	while (total_dma < len) {
 		size_t seg_avail, folio_remain, chunk_len, dst_seg_remain;
@@ -2199,10 +2211,9 @@ out_disarm:
  *
  * Returns true if the request's DMA completed within the budget.
  */
-bool io_dma_inline_wait(struct io_kiocb *req)
+bool io_dma_inline_wait(struct io_kiocb *req, unsigned int budget_us)
 {
 	struct io_ring_ctx *ctx = req->ctx;
-	unsigned int budget_us = READ_ONCE(io_dma_inline_wait_us);
 	u64 end_ns;
 
 	if (!budget_us || req->dma.irq_mode || IS_ERR_OR_NULL(ctx->dma.chan))

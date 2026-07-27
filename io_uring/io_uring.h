@@ -612,8 +612,10 @@ static inline bool io_dma_pending(struct io_ring_ctx *ctx)
 	       READ_ONCE(ctx->dma.poll_list) != NULL;
 }
 bool io_dma_cq_wait_poll(struct io_ring_ctx *ctx, struct io_wait_queue *iowq);
-bool io_dma_inline_wait(struct io_kiocb *req);
+bool io_dma_inline_wait(struct io_kiocb *req, unsigned int budget_us);
 extern unsigned int io_dma_reap_on_enter;
+extern unsigned int io_dma_drain_wait_us;
+extern atomic64_t io_dma_drain_cycles;
 
 /*
  * One opportunistic completion-detection pass on the ring task's own kernel
