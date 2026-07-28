@@ -220,6 +220,23 @@ static const char * const io_dma_fb_names[IO_DMA_FB_NR] = {
 };
 static atomic64_t io_dma_fb[IO_DMA_FB_NR];
 
+/*
+ * Filemap (READ_FIXED page-cache) DMA path accounting: the path falls
+ * back to the normal buffered read on ANY failure, silently, so a
+ * per-reason count is the only way to see whether it engages at all.
+ * Recorded from the io_read gate (io_uring/rw.c).
+ */
+static const char * const io_dma_fm_names[IO_DMA_FM_NR] = {
+	"engaged", "shmem", "not_bvec", "direct", "no_dma_addrs",
+	"eagain", "enomem", "efault", "other",
+};
+static atomic64_t io_dma_fm[IO_DMA_FM_NR];
+
+void io_dma_fm_record(unsigned int reason)
+{
+	atomic64_inc(&io_dma_fm[reason]);
+}
+
 static void io_dma_fb_record(unsigned int reason)
 {
 	atomic64_inc(&io_dma_fb[reason]);
@@ -319,6 +336,10 @@ static int io_dma_lat_show(struct seq_file *m, void *v)
 			   atomic64_read(&io_dma_fb[i]));
 	seq_printf(m, "drain_cycles: %12llu\n",
 		   atomic64_read(&io_dma_drain_cycles));
+	seq_puts(m, "filemap:\n");
+	for (i = 0; i < IO_DMA_FM_NR; i++)
+		seq_printf(m, "  %-12s %12llu\n", io_dma_fm_names[i],
+			   atomic64_read(&io_dma_fm[i]));
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(io_dma_lat);
@@ -347,6 +368,8 @@ static ssize_t io_dma_lat_reset_write(struct file *file,
 	for (i = 0; i < IO_DMA_FB_NR; i++)
 		atomic64_set(&io_dma_fb[i], 0);
 	atomic64_set(&io_dma_drain_cycles, 0);
+	for (i = 0; i < IO_DMA_FM_NR; i++)
+		atomic64_set(&io_dma_fm[i], 0);
 	return count;
 }
 
