@@ -133,7 +133,7 @@ idxd_dma_prep_interrupt(struct dma_chan *c, unsigned long flags)
 
 	op_flag_setup(flags, &desc_flags);
 	desc = idxd_alloc_desc(wq, IDXD_OP_BLOCK);
-	if (IS_ERR(desc))
+	if (IS_ERR_OR_NULL(desc))
 		return NULL;
 
 	idxd_prep_desc_common(wq, desc->hw, DSA_OPCODE_NOOP,
@@ -159,7 +159,7 @@ idxd_dma_submit_memcpy(struct dma_chan *c, dma_addr_t dma_dest,
 
 	op_flag_setup(flags, &desc_flags);
 	desc = dmachan_alloc_desc(c, IDXD_OP_BLOCK);
-	if (IS_ERR(desc))
+	if (IS_ERR_OR_NULL(desc))
 		return NULL;
 
 	idxd_prep_desc_common(wq, desc->hw, DSA_OPCODE_MEMMOVE,
