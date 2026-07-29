@@ -1718,7 +1718,10 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 	struct io_dma_batch_entry *entries;
 	unsigned int nr_entries = 0;
 	ssize_t total_read = 0;
+	ssize_t submitted = 0;
+	size_t batch_bytes = 0;
 	size_t dst_offset = 0;
+	loff_t start_pos = iocb->ki_pos;
 	loff_t isize;
 	int i, error = 0;
 	bool writably_mapped;
@@ -1738,8 +1741,10 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 		return -ENOMEM;
 
 	isize = i_size_read(inode);
-	if (unlikely(iocb->ki_pos >= isize))
+	if (unlikely(iocb->ki_pos >= isize)) {
+		kfree(entries);
 		return 0;
+	}
 
 	folio_batch_init(&fbatch);
 
@@ -1836,6 +1841,7 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 
 				copied += chunk;
 				dst_offset += chunk;
+				batch_bytes += chunk;
 
 				/* Flush batch if full */
 				if (nr_entries == IO_DMA_BATCH_MAX) {
@@ -1848,6 +1854,8 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 						error = ret;
 						goto put_folios;
 					}
+					submitted += batch_bytes;
+					batch_bytes = 0;
 				}
 			}
 
@@ -1867,8 +1875,13 @@ flush_and_put:
 			ret = io_dma_flush_batch(req, dev, chan,
 				entries, nr_entries);
 			nr_entries = 0;
-			if (ret < 0 && !error)
-				error = ret;
+			if (ret < 0) {
+				if (!error)
+					error = ret;
+			} else {
+				submitted += batch_bytes;
+				batch_bytes = 0;
+			}
 		}
 put_folios:
 		for (i = 0; i < folio_batch_count(&fbatch); i++)
@@ -1882,7 +1895,18 @@ put_folios:
 		dma_async_issue_pending(chan);
 
 	kfree(entries);
-	return total_read ? total_read : error;
+
+	/*
+	 * Only bytes whose batch was successfully handed to the DMA engine
+	 * may be claimed.  total_read (and ki_pos) run ahead of the flushes
+	 * during collection; a failed flush leaves those trailing bytes
+	 * uncopied, so clamp the result -- and the file position -- to what
+	 * was actually submitted.  Claiming unsubmitted bytes returns
+	 * uninitialized destination memory to userspace.
+	 */
+	if (unlikely(submitted != total_read))
+		iocb->ki_pos = start_pos + submitted;
+	return submitted ? submitted : error;
 }
 
 /*
