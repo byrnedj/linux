@@ -1705,7 +1705,7 @@ static ssize_t io_dma_flush_batch(struct io_kiocb *req,
  * with dma_refcnt > 0 to drain the queued DMA tasks.
  */
 ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
-			    u64 dst_user_addr)
+			    u64 dst_user_addr, size_t want)
 {
 	struct io_ring_ctx *ctx = req->ctx;
 	struct file *filp = iocb->ki_filp;
@@ -1757,8 +1757,14 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 		if (unlikely(iocb->ki_pos >= i_size_read(inode)))
 			break;
 
-		/* How many bytes remain in the destination buffer */
-		count = imu->len - dst_offset;
+		/*
+		 * How many bytes remain in the REQUEST.  The registered
+		 * buffer (imu) is usually larger than the read: clamping to
+		 * imu->len instead of the requested count made a short
+		 * READ_FIXED overrun its length and fill the whole buffer
+		 * (then trip -EFAULT at the buffer-end dst lookup).
+		 */
+		count = want - dst_offset;
 		if (!count)
 			break;
 
@@ -1887,7 +1893,7 @@ put_folios:
 		for (i = 0; i < folio_batch_count(&fbatch); i++)
 			folio_put(fbatch.folios[i]);
 		folio_batch_init(&fbatch);
-	} while (dst_offset < imu->len && iocb->ki_pos < isize && !error);
+	} while (dst_offset < want && iocb->ki_pos < isize && !error);
 
 	file_accessed(filp);
 

@@ -983,7 +983,8 @@ static int __io_read(struct io_kiocb *req, struct io_br_sel *sel,
 			io_uring_dma_prep(req);
 			req->dma.dst_user_addr = rw->addr;
 
-			ret = io_dma_filemap_read(req, kiocb, rw->addr);
+			ret = io_dma_filemap_read(req, kiocb, rw->addr,
+						  iov_iter_count(&io->iter));
 
 			if (ret > 0)
 				io_dma_fm_record(IO_DMA_FM_ENGAGED);
