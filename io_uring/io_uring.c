@@ -2188,6 +2188,8 @@ static __cold void io_req_caches_free(struct io_ring_ctx *ctx)
 	__io_req_caches_free(ctx);
 }
 
+static void io_dma_shared_put(struct dma_chan *chan);
+
 static void io_release_dma_chan(struct io_ring_ctx *ctx)
 {
 	unsigned long dma_sync_wait_timeout = jiffies + msecs_to_jiffies(5000);
@@ -2295,7 +2297,7 @@ static void io_release_dma_chan(struct io_ring_ctx *ctx)
 		pr_info("io_uring DMA: releasing channel %s requester=%s[%d] tgid=%d ctx=%p\n",
 			dma_chan_name(ctx->dma.chan), current->comm,
 			task_pid_nr(current), task_tgid_nr(current), ctx);
-		dma_release_channel(ctx->dma.chan);
+		io_dma_shared_put(ctx->dma.chan);
 	}
 	ctx->dma.chan = NULL;
 }
@@ -2348,6 +2350,95 @@ static struct dma_chan *io_dma_request_spread(dma_cap_mask_t *mask, int node)
 	return NULL;
 }
 
+/*
+ * Shared-channel pool: rings no longer own a dmaengine channel exclusively.
+ * DSA WQs are configured shared (ENQCMD submission), so one channel can carry
+ * descriptors from many rings; a full WQ surfaces as a synchronous submit
+ * error and the submitter CPU-falls-back.  Allocation is first-come
+ * first-served: each ring grabs a fresh channel while the engine still has
+ * one (device-spread, node-local preferred), and once the engine is
+ * exhausted, later rings share existing channels round-robin.  Entries are
+ * refcounted; the dmaengine channel is released when the last ring detaches.
+ */
+#define IO_DMA_SHARED_MAX	64
+struct io_dma_shared_chan {
+	struct dma_chan *chan;
+	int refcnt;
+};
+static struct io_dma_shared_chan io_dma_shared[IO_DMA_SHARED_MAX];
+static int io_dma_shared_cnt;
+static unsigned int io_dma_shared_rr;
+static DEFINE_MUTEX(io_dma_shared_mutex);
+
+static struct dma_chan *io_dma_shared_pick(int node)
+{
+	int i, idx;
+
+	for (i = 0; i < io_dma_shared_cnt; i++) {
+		idx = (io_dma_shared_rr + i) % io_dma_shared_cnt;
+		if (node == NUMA_NO_NODE ||
+		    dev_to_node(io_dma_shared[idx].chan->device->dev) == node) {
+			io_dma_shared_rr = idx + 1;
+			io_dma_shared[idx].refcnt++;
+			return io_dma_shared[idx].chan;
+		}
+	}
+	return NULL;
+}
+
+static struct dma_chan *io_dma_shared_get(dma_cap_mask_t *mask, int node)
+{
+	struct dma_chan *chan;
+
+	mutex_lock(&io_dma_shared_mutex);
+
+	/* 1) fresh node-local channel */
+	if (io_dma_shared_cnt < IO_DMA_SHARED_MAX) {
+		chan = io_dma_request_spread(mask, node);
+		if (chan)
+			goto register_fresh;
+	}
+	/* 2) share a node-local channel round-robin */
+	chan = io_dma_shared_pick(node);
+	if (chan)
+		goto out;
+	/* 3) fresh channel on any node */
+	if (io_dma_shared_cnt < IO_DMA_SHARED_MAX) {
+		chan = io_dma_request_spread(mask, NUMA_NO_NODE);
+		if (chan)
+			goto register_fresh;
+	}
+	/* 4) share any channel, any node */
+	chan = io_dma_shared_pick(NUMA_NO_NODE);
+	goto out;
+
+register_fresh:
+	io_dma_shared[io_dma_shared_cnt++] =
+		(struct io_dma_shared_chan){ .chan = chan, .refcnt = 1 };
+out:
+	mutex_unlock(&io_dma_shared_mutex);
+	return chan;
+}
+
+static void io_dma_shared_put(struct dma_chan *chan)
+{
+	int i;
+
+	mutex_lock(&io_dma_shared_mutex);
+	for (i = 0; i < io_dma_shared_cnt; i++) {
+		if (io_dma_shared[i].chan != chan)
+			continue;
+		if (--io_dma_shared[i].refcnt == 0) {
+			dma_release_channel(chan);
+			io_dma_shared[i] = io_dma_shared[--io_dma_shared_cnt];
+			if (io_dma_shared_rr > (unsigned int)io_dma_shared_cnt)
+				io_dma_shared_rr = 0;
+		}
+		break;
+	}
+	mutex_unlock(&io_dma_shared_mutex);
+}
+
 static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 				struct io_uring_params *p)
 {
@@ -2361,11 +2452,10 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 	/* Prefer a channel whose DSA device sits on the caller's NUMA
 	 * node: a cross-socket engine pays UPI hops on every descriptor
 	 * fetch and data move, which shows up as bimodal throughput
-	 * depending on which channel the ring happened to win.  Fall
-	 * back to any-node only when the local node is exhausted. */
-	ctx->dma.chan = io_dma_request_spread(&mask, node);
-	if (!ctx->dma.chan)
-		ctx->dma.chan = io_dma_request_spread(&mask, NUMA_NO_NODE);
+	 * depending on which channel the ring happened to win.  Fresh
+	 * channels are handed out first-come first-served; once the
+	 * engine is exhausted, rings share channels round-robin. */
+	ctx->dma.chan = io_dma_shared_get(&mask, node);
 	if (IS_ERR_OR_NULL(ctx->dma.chan)) {
 		rc = ctx->dma.chan ? PTR_ERR(ctx->dma.chan) : -ENODEV;
 		pr_err("io_uring DMA: no channel available: %d requester=%s[%d] tgid=%d\n",
@@ -2385,10 +2475,11 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 	}
 
 	dev_info(ctx->dma.chan->device->dev,
-		 "io_uring DMA: acquired channel %s (%s addressing, node %d, caller node %d) requester=%s[%d] tgid=%d ctx=%p\n",
+		 "io_uring DMA: acquired channel %s (%s addressing, node %d, caller node %d, pool %d chans) requester=%s[%d] tgid=%d ctx=%p\n",
 		 dma_chan_name(ctx->dma.chan),
 		 ctx->dma.use_phys_addrs ? "physical" : "IOMMU-mapped",
 		 dev_to_node(ctx->dma.chan->device->dev), node,
+		 io_dma_shared_cnt,
 		 current->comm, task_pid_nr(current), task_tgid_nr(current), ctx);
 
 	init_llist_head(&ctx->dma.submit_list);
