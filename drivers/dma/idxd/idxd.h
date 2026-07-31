@@ -234,6 +234,13 @@ struct idxd_wq {
 	struct idxd_dma_chan *idxd_chan;
 	u32 outstanding;
 	struct llist_head free_llist;
+	/*
+	 * Serializes llist_del_first() on free_llist: multiple io_uring rings
+	 * can share one channel (shared WQs), so the descriptor pool has
+	 * multiple concurrent consumers, which bare llist_del_first() does not
+	 * allow. Producers (idxd_free_desc) stay lockless.
+	 */
+	spinlock_t free_lock;
 	int chan_count;
 	struct idxd_dma_chan *ichans;
 	char name[WQ_NAME_SIZE + 1];
