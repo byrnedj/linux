@@ -1011,7 +1011,10 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 	if (dma_submit_error(dma->cookie)) {
 		kfree(heap_entries);
 		io_dma_task_free(req->ctx, dma);
-		return -EFAULT;
+		/* Shared-WQ portal full (ENQCMD retry exhausted) or any other
+		 * submit failure: retryable -- callers CPU-fallback on -EAGAIN.
+		 */
+		return -EAGAIN;
 	}
 
 	/* Take folio refs for DMA duration (page-cache sources only; skb kvec
@@ -1512,7 +1515,7 @@ static ssize_t io_dma_submit_batch_sg(struct io_kiocb *req, struct device *dev,
 		if (!src_inline)
 			kfree(src_sg);
 		io_dma_task_free(req->ctx, dma);
-		return -EFAULT;
+		return -EAGAIN;	/* full shared WQ etc.: CPU-copy fallback */
 	}
 
 	io_dma_task_link(req, dma);
@@ -1607,7 +1610,7 @@ static ssize_t io_dma_submit_single_entry(struct io_kiocb *req,
 		if (entry->src_is_page)
 			folio_put(entry->folio);
 		io_dma_task_free(req->ctx, dma);
-		return -EFAULT;
+		return -EAGAIN;	/* full shared WQ etc.: CPU-copy fallback */
 	}
 
 	io_dma_task_link(req, dma);
