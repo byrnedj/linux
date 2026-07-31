@@ -192,6 +192,7 @@ int idxd_wq_alloc_resources(struct idxd_wq *wq)
 		goto fail_alloc_descs;
 
 	init_llist_head(&wq->free_llist);
+	spin_lock_init(&wq->free_lock);
 	for (i = 0; i < num_descs; i++) {
 		struct idxd_desc *desc = wq->descs[i];
 
