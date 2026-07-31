@@ -27,7 +27,9 @@ struct idxd_desc *idxd_alloc_desc(struct idxd_wq *wq, enum idxd_op_type optype)
 	if (idxd->state != IDXD_DEV_ENABLED)
 		return ERR_PTR(-EIO);
 
+	spin_lock(&wq->free_lock);
 	entry = llist_del_first(&wq->free_llist);
+	spin_unlock(&wq->free_lock);
 	if (entry == NULL)
 		return ERR_PTR(-EAGAIN);
 
