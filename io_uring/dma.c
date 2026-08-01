@@ -2316,9 +2316,9 @@ int __io_dma_poll(struct io_ring_ctx *ctx)
 	 * Splice newly submitted tasks onto the consumer-owned poll_list.
 	 * Only the armed poller (poll_armed) touches poll_list, so no lock:
 	 * the llist arrives newest-first, reversing it restores submission
-	 * order, and appending at the tail keeps the whole list in cookie
-	 * order -- which the early-break below relies on (per-channel
-	 * completion is in-order).
+	 * order.  (Completion is NOT in-order -- DSA WQs are fed by multiple
+	 * engines -- so the walk below scans the whole list, not just the
+	 * head.)
 	 */
 	{
 		struct llist_node *node = llist_del_all(&ctx->dma.submit_list);
@@ -2343,38 +2343,59 @@ int __io_dma_poll(struct io_ring_ctx *ctx)
 		}
 	}
 
-	dma = ctx->dma.poll_list;
-	count = 0;
-	pr_debug("poll: head=%p\n", dma);
-	while (dma != NULL) {
-		next = dma->next;
+	{
+		struct io_dma_task *prev = NULL;
 
-		/* No lock around the hardware poll: the cookie state is the
-		 * dmaengine's own (safe lockless), and holding ctx->dma.lock
-		 * across the whole walk is what made submitters fight the
-		 * poller for it (measured 3.6% of node cycles in
-		 * queued_spin_lock_slowpath under 60KB sets). */
-		ret = dmaengine_async_is_tx_complete(ctx->dma.chan,
-						     dma->cookie);
-		if (ret == DMA_IN_PROGRESS)
-			break;
+		dma = ctx->dma.poll_list;
+		count = 0;
+		pr_debug("poll: head=%p\n", dma);
+		while (dma != NULL) {
+			next = dma->next;
 
-		/* Unlink before completing (complete may free dma) */
-		WRITE_ONCE(ctx->dma.poll_list, next);
-		if (!next)
-			ctx->dma.poll_list_tail = NULL;
+			/* No lock around the hardware poll: the cookie state
+			 * is the dmaengine's own (safe lockless), and holding
+			 * ctx->dma.lock across the whole walk is what made
+			 * submitters fight the poller for it (measured 3.6% of
+			 * node cycles in queued_spin_lock_slowpath under 60KB
+			 * sets). */
+			ret = dmaengine_async_is_tx_complete(ctx->dma.chan,
+							     dma->cookie);
+			if (ret == DMA_IN_PROGRESS) {
+				/*
+				 * Keep walking: DSA groups feed each WQ from
+				 * multiple engines, so completion is NOT
+				 * in-order.  Stopping at the first in-flight
+				 * entry head-of-line-blocked every completed
+				 * task behind it -- reaped chunks (and the
+				 * netty DMA slab they pin) stayed held for
+				 * the head's full latency.  Each extra check
+				 * is one completion-record read.
+				 */
+				prev = dma;
+				dma = next;
+				continue;
+			}
 
-		/* Heavy resource release (IOMMU unmaps, folio puts) runs
-		 * unlocked; ctx->dma.lock then covers only the refcount
-		 * handshake with the submitter's ref-take and the IRQ
-		 * completion path. */
-		io_dma_task_release_res(ctx, dev, dma);
-		spin_lock_irqsave(&ctx->dma.lock, flags);
-		__io_dma_task_complete(dev, dma, ret);
-		spin_unlock_irqrestore(&ctx->dma.lock, flags);
+			/* Unlink before completing (complete may free dma) */
+			if (prev)
+				prev->next = next;
+			else
+				WRITE_ONCE(ctx->dma.poll_list, next);
+			if (!next)
+				ctx->dma.poll_list_tail = prev;
 
-		count++;
-		dma = next;
+			/* Heavy resource release (IOMMU unmaps, folio puts)
+			 * runs unlocked; ctx->dma.lock then covers only the
+			 * refcount handshake with the submitter's ref-take
+			 * and the IRQ completion path. */
+			io_dma_task_release_res(ctx, dev, dma);
+			spin_lock_irqsave(&ctx->dma.lock, flags);
+			__io_dma_task_complete(dev, dma, ret);
+			spin_unlock_irqrestore(&ctx->dma.lock, flags);
+
+			count++;
+			dma = next;
+		}
 	}
 
 	pr_debug("poll: completed=%d remaining=%s\n",
