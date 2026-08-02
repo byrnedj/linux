@@ -2,6 +2,7 @@
 
 #include <linux/io_uring_types.h>
 #include <linux/io_uring.h>
+#include <linux/delay.h>
 #include <linux/uio.h>
 #include <linux/dma-mapping.h>
 #include <linux/spinlock.h>
@@ -74,6 +75,18 @@ static unsigned int io_dma_completion_mode __read_mostly = IO_DMA_COMP_KWORKER;
  * debugfs io_uring_dma_cq_poll_us.
  */
 static unsigned int io_dma_cq_poll_us __read_mostly = 20;
+
+/*
+ * Inline spin budget (microseconds) for the DMA filemap-write wait. The
+ * write path is synchronous per request; a typical request's batch
+ * completes in tens of microseconds, so sleeping immediately trades a
+ * ~100us usleep wakeup for ~35us of engine time and halves throughput
+ * at small request sizes. Spin (with cond_resched) for up to this long
+ * before backing off to sleeping -- the backoff still protects the
+ * many-rings contention case. 0 sleeps immediately. Tunable via
+ * debugfs io_uring_dma_fmw_spin_us.
+ */
+static unsigned int io_dma_fmw_spin_us __read_mostly = 60;
 
 /*
  * Keep DMA completion detection on the ring task where possible, instead of
@@ -190,6 +203,18 @@ static void io_dma_lat_record(struct io_dma_lat_stats *s, size_t len, u64 ns)
 	atomic64_add(ns, &s->sum_ns[b]);
 }
 
+/* Filemap DMA-WRITE accounting (gate in io_write, io_uring/rw.c). */
+static const char * const io_dma_fmw_names[IO_DMA_FMW_NR] = {
+	"engaged", "no_aops", "not_bvec", "direct", "no_dma_addrs",
+	"eagain", "cpu_redo", "error",
+};
+static atomic64_t io_dma_fmw[IO_DMA_FMW_NR];
+
+void io_dma_fmw_record(unsigned int reason)
+{
+	atomic64_inc(&io_dma_fmw[reason]);
+}
+
 static void io_dma_lat_show_one(struct seq_file *m, const char *name,
 				struct io_dma_lat_stats *s)
 {
@@ -213,6 +238,11 @@ static int io_dma_lat_show(struct seq_file *m, void *v)
 
 	io_dma_lat_show_one(m, "dma", &io_dma_lat_dma);
 	io_dma_lat_show_one(m, "cpu", &io_dma_lat_cpu);
+
+	seq_puts(m, "filemap_write:\n");
+	for (i = 0; i < IO_DMA_FMW_NR; i++)
+		seq_printf(m, "  %-12s %12llu\n", io_dma_fmw_names[i],
+			   atomic64_read(&io_dma_fmw[i]));
 	io_dma_lat_show_one(m, "dma_call", &io_dma_lat_call);
 
 	seq_puts(m, "dma_chunks_per_call:\n");
@@ -242,6 +272,8 @@ static ssize_t io_dma_lat_reset_write(struct file *file,
 
 	io_dma_lat_reset(&io_dma_lat_dma);
 	io_dma_lat_reset(&io_dma_lat_cpu);
+	for (i = 0; i < IO_DMA_FMW_NR; i++)
+		atomic64_set(&io_dma_fmw[i], 0);
 	io_dma_lat_reset(&io_dma_lat_call);
 	for (i = 0; i < IO_DMA_CHUNKS_HIST; i++)
 		atomic64_set(&io_dma_chunks_hist[i], 0);
@@ -376,6 +408,8 @@ void io_dma_debugfs_init(void)
 			   &io_dma_drain_wait_us);
 	debugfs_create_u32("io_uring_dma_cq_poll_us", 0644, NULL,
 			   &io_dma_cq_poll_us);
+	debugfs_create_u32("io_uring_dma_fmw_spin_us", 0644, NULL,
+			   &io_dma_fmw_spin_us);
 	debugfs_create_file("io_uring_dma_cpu_latency_us", 0644, NULL, NULL,
 			    &io_dma_cpu_lat_fops);
 }
@@ -1737,6 +1771,332 @@ put_folios:
 	if (unlikely(submitted != total_read))
 		iocb->ki_pos = start_pos + submitted;
 	return submitted ? submitted : error;
+}
+
+/*
+ * DMA-offloaded buffered write for registered buffers (WRITE_FIXED):
+ * replaces generic_perform_write()'s copy_folio_from_iter() with DSA
+ * copies from the pre-mapped registered buffer into the page-cache
+ * folios obtained from aops->write_begin().
+ *
+ * DELIBERATELY SYNCHRONOUS: the caller path runs in io-wq process
+ * context (buffered regular-file writes always punt there), and
+ * inode_lock plus the per-folio write_begin/write_end protocol make a
+ * deferred-CQE design a lifetime minefield.  Waiting inline keeps every
+ * VFS invariant identical to the generic path; the win is the removed
+ * CPU memcpy, not latency.
+ *
+ * Failure ladder:
+ *  - prep/submit failure or a DMA_ERROR completion, with every submitted
+ *    cookie reaped: CPU-RE-COPY every chunk (same src -> same dst is
+ *    idempotent) and commit normally ("cpu_redo").
+ *  - completion timeout (device wedged): unmap the dst ranges so a late
+ *    DMA write faults in the IOMMU instead of hitting reclaimed memory,
+ *    skip write_end, and deliberately LEAK the affected folios (locked +
+ *    referenced) -- a wedged range beats silent corruption.  Returns -EIO.
+ */
+#define IO_DMA_FMW_WAIT_MS	5000
+
+struct io_dma_fmw_folio {
+	struct folio *folio;
+	void *fsdata;
+	loff_t pos;
+	unsigned int len;
+	dma_addr_t dst_dma;	/* 0: phys-addr mode, nothing to unmap */
+	unsigned int map_len;
+};
+
+/*
+ * Poll every outstanding cookie to completion.  Sets *redo on any
+ * DMA_ERROR.  Returns 0, or -ETIMEDOUT with cookies possibly still in
+ * flight (the caller must treat every dst as poisoned).
+ *
+ * Spin only briefly: DSA transfers normally complete in single-digit
+ * microseconds, but under contention (many rings sharing the WQ
+ * descriptor pools) completion can take milliseconds -- and hundreds of
+ * io-wq workers busy-polling here saturated whole sockets and starved
+ * application heartbeats at O(100) shared rings.  Back off to sleeping
+ * once the fast path misses.
+ */
+static int io_dma_fmw_wait(struct dma_chan *chan, dma_cookie_t *cookies,
+			   unsigned int *nr, bool *redo)
+{
+	unsigned long deadline = jiffies + msecs_to_jiffies(IO_DMA_FMW_WAIT_MS);
+	u64 spin_end = ktime_get_ns() +
+		READ_ONCE(io_dma_fmw_spin_us) * NSEC_PER_USEC;
+	unsigned int i, spins;
+
+	for (i = 0; i < *nr; i++) {
+		enum dma_status st;
+
+		spins = 0;
+		while ((st = dmaengine_async_is_tx_complete(chan, cookies[i]))
+		       == DMA_IN_PROGRESS) {
+			if (time_after(jiffies, deadline)) {
+				*nr = 0;
+				return -ETIMEDOUT;
+			}
+			if (ktime_get_ns() < spin_end) {
+				cpu_relax();
+				if (!(++spins & 63))
+					cond_resched();
+			} else {
+				usleep_range(50, 150);
+			}
+		}
+		if (st != DMA_COMPLETE)
+			*redo = true;
+	}
+	*nr = 0;
+	return 0;
+}
+
+ssize_t io_dma_filemap_write(struct io_kiocb *req, struct kiocb *iocb,
+			     struct iov_iter *from, u64 src_user_addr)
+{
+	struct io_ring_ctx *ctx = req->ctx;
+	struct file *file = iocb->ki_filp;
+	struct address_space *mapping = file->f_mapping;
+	const struct address_space_operations *aops = mapping->a_ops;
+	struct inode *inode = mapping->host;
+	struct io_mapped_ubuf *imu = req->buf_node->buf;
+	struct dma_chan *chan = ctx->dma.chan;
+	struct device *dev = chan->device->dev;
+	size_t max_chunk = mapping_max_folio_size(mapping);
+	struct io_dma_fmw_folio *fol = NULL;
+	dma_cookie_t *cookies = NULL;
+	unsigned int nr_fol = 0, nr_cookies = 0, max_fol, max_cookies, i;
+	ssize_t want, written = 0, err = 0;
+	bool redo = false;
+	bool surrendered = false;
+	unsigned int prep_fails = 0;
+	int wedged = 0;
+
+	inode_lock(inode);
+	want = generic_write_checks(iocb, from);
+	if (want <= 0) {
+		inode_unlock(inode);
+		return want;
+	}
+	err = file_remove_privs(file);
+	if (!err)
+		err = file_update_time(file);
+	if (err)
+		goto out_unlock;
+
+	max_fol = DIV_ROUND_UP(want, PAGE_SIZE) + 1;
+	/* one entry per src-folio crossing per chunk; PAGE_SIZE granularity
+	 * over-provisions safely */
+	max_cookies = max_fol + DIV_ROUND_UP(want, 1UL << imu->folio_shift) + 8;
+	fol = kvmalloc_array(max_fol, sizeof(*fol), GFP_KERNEL);
+	cookies = kvmalloc_array(max_cookies, sizeof(*cookies), GFP_KERNEL);
+	if (!fol || !cookies) {
+		err = -EAGAIN;	/* fall back to the normal write path */
+		goto out_unlock;
+	}
+
+	while (written < want && nr_fol < max_fol) {
+		loff_t pos = iocb->ki_pos + written;
+		size_t bytes = min_t(size_t,
+				     max_chunk - (pos & (max_chunk - 1)),
+				     want - written);
+		size_t offset, sub;
+		dma_addr_t dst_dma;
+		struct folio *folio;
+		void *fsdata;
+		int status;
+
+		status = aops->write_begin(iocb, mapping, pos, bytes,
+					   &folio, &fsdata);
+		if (unlikely(status < 0)) {
+			if (!written)
+				err = status;
+			break;
+		}
+		offset = offset_in_folio(folio, pos);
+		/*
+		 * Cover the locked folio to its end (or the write's end):
+		 * ending a chunk mid-folio would make the next iteration's
+		 * write_begin() wait forever on the folio lock this batch
+		 * already holds.  Large folios (e.g. a rewrite of ranges
+		 * cached by earlier big writes) exceed the quantum-sized
+		 * request hint, so the returned folio, not the hint, decides
+		 * the chunk; descriptors below still split at source-folio
+		 * boundaries and the quantum.
+		 */
+		bytes = min_t(size_t, want - written,
+			      folio_size(folio) - offset);
+
+		if (surrendered) {
+			/* Sustained descriptor exhaustion: stop touching the
+			 * DMA engine for the rest of this write and let the
+			 * CPU-redo pass commit everything. Beats paying a
+			 * drain-wait per chunk while dozens of other rings
+			 * hold the pools empty. */
+			dst_dma = 0;
+			redo = true;
+			goto record;
+		}
+		if (ctx->dma.use_phys_addrs) {
+			dst_dma = 0;
+		} else {
+			dst_dma = dma_map_page(dev, folio_page(folio, 0),
+					       offset, bytes, DMA_FROM_DEVICE);
+			if (dma_mapping_error(dev, dst_dma)) {
+				/* commit this chunk via CPU-redo instead */
+				dst_dma = 0;
+				redo = true;
+				goto record;
+			}
+		}
+
+		/* split at source registered-buffer folio boundaries */
+		for (sub = 0; sub < bytes; ) {
+			u64 uaddr = src_user_addr + written + sub;
+			size_t src_remain = (1UL << imu->folio_shift) -
+				(uaddr & ((1UL << imu->folio_shift) - 1));
+			size_t len = min3(bytes - sub, src_remain, max_chunk);
+			struct dma_async_tx_descriptor *tx;
+			dma_addr_t src_dma, dst;
+			dma_cookie_t ck;
+
+			if (ctx->dma.use_phys_addrs) {
+				src_dma = io_reg_buf_phys_addr(imu, uaddr);
+				dst = page_to_phys(folio_page(folio, 0)) +
+					offset + sub;
+			} else {
+				src_dma = io_reg_buf_dma_addr(imu, uaddr);
+				dst = dst_dma + sub;
+			}
+			if (unlikely(!src_dma)) {
+				redo = true;	/* CPU-redo covers the chunk */
+				break;
+			}
+
+			tx = dmaengine_prep_dma_memcpy(chan, dst, src_dma, len,
+						       io_dma_prep_flags());
+			if (!tx) {
+				/* pool exhausted: drain in-flight, retry once */
+				dma_async_issue_pending(chan);
+				wedged = io_dma_fmw_wait(chan, cookies,
+							 &nr_cookies, &redo);
+				if (wedged)
+					goto collect_done;
+				tx = dmaengine_prep_dma_memcpy(chan, dst,
+						src_dma, len,
+						io_dma_prep_flags());
+			}
+			if (!tx) {
+				io_dma_fmw_record(IO_DMA_FMW_EAGAIN);
+				redo = true;
+				/* Two drain-and-retry failures in one write
+				 * means the pools are held empty by other
+				 * rings: surrender the remainder to CPU. */
+				if (++prep_fails >= 2) {
+					surrendered = true;
+					break;	/* redo covers this chunk */
+				}
+			} else {
+				ck = dmaengine_submit(tx);
+				if (dma_submit_error(ck))
+					redo = true;
+				else
+					cookies[nr_cookies++] = ck;
+				if (nr_cookies == max_cookies) {
+					dma_async_issue_pending(chan);
+					wedged = io_dma_fmw_wait(chan, cookies,
+							&nr_cookies, &redo);
+					if (wedged)
+						goto collect_done;
+				}
+			}
+			sub += len;
+		}
+record:
+		fol[nr_fol++] = (struct io_dma_fmw_folio){
+			.folio = folio, .fsdata = fsdata, .pos = pos,
+			.len = bytes, .dst_dma = dst_dma, .map_len = bytes,
+		};
+		written += bytes;
+	}
+
+collect_done:
+	if (!wedged) {
+		dma_async_issue_pending(chan);
+		wedged = io_dma_fmw_wait(chan, cookies, &nr_cookies, &redo);
+	}
+
+	/* Unmap dst IOVAs. After a timeout this also FENCES late DMA writes:
+	 * they fault in the IOMMU instead of landing in reclaimed memory. */
+	for (i = 0; i < nr_fol; i++)
+		if (fol[i].dst_dma)
+			dma_unmap_page(dev, fol[i].dst_dma, fol[i].map_len,
+				       DMA_FROM_DEVICE);
+
+	if (unlikely(wedged)) {
+		/* Folio contents unknown and a stray write may still land:
+		 * leak the locked folios rather than expose them. */
+		pr_warn_ratelimited("io_uring DMA write: wedged after %dms, leaking %u folios (%s)\n",
+				    IO_DMA_FMW_WAIT_MS, nr_fol,
+				    dma_chan_name(chan));
+		io_dma_fmw_record(IO_DMA_FMW_ERROR);
+		written = 0;
+		err = -EIO;
+		goto out_unlock;
+	}
+
+	if (unlikely(redo)) {
+		/* Re-copy every chunk by CPU: same source bytes to the same
+		 * folio ranges, so overlap with completed DMA is idempotent.
+		 * The iter was never advanced during collection. */
+		for (i = 0; i < nr_fol; i++) {
+			size_t n = copy_folio_from_iter(fol[i].folio,
+					offset_in_folio(fol[i].folio, fol[i].pos),
+					fol[i].len, from);
+			if (unlikely(n != fol[i].len)) {
+				written = fol[i].pos - iocb->ki_pos + n;
+				break;
+			}
+		}
+		io_dma_fmw_record(IO_DMA_FMW_CPU_REDO);
+	} else {
+		iov_iter_advance(from, written);
+	}
+
+	/* Commit in ascending order: dirty + unlock + i_size updates. */
+	{
+		ssize_t committed = 0;
+
+		for (i = 0; i < nr_fol; i++) {
+			size_t claim = min_t(size_t, fol[i].len,
+					     written - committed);
+			int done;
+
+			done = aops->write_end(iocb, mapping, fol[i].pos,
+					       fol[i].len, claim,
+					       fol[i].folio, fol[i].fsdata);
+			if (unlikely(done < 0)) {
+				if (!committed)
+					err = done;
+				break;
+			}
+			committed += done;
+			if ((size_t)done < fol[i].len)
+				break;
+			balance_dirty_pages_ratelimited(mapping);
+		}
+		written = committed;
+	}
+
+	if (written > 0)
+		iocb->ki_pos += written;
+out_unlock:
+	inode_unlock(inode);
+	kvfree(fol);
+	kvfree(cookies);
+	if (written > 0)
+		return generic_write_sync(iocb, written) ?: written;
+	return err;
 }
 
 /*
