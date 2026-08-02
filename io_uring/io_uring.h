@@ -629,6 +629,22 @@ enum {
 	IO_DMA_FM_NR,
 };
 void io_dma_fm_record(unsigned int reason);
+
+/* Filemap DMA-WRITE gate/result accounting; see io_uring/dma.c. */
+enum {
+	IO_DMA_FMW_ENGAGED,
+	IO_DMA_FMW_NO_AOPS,	/* fs has no write_begin/end (e.g. XFS iomap) */
+	IO_DMA_FMW_NOT_BVEC,
+	IO_DMA_FMW_DIRECT,
+	IO_DMA_FMW_NO_DMA_ADDRS,
+	IO_DMA_FMW_EAGAIN,
+	IO_DMA_FMW_CPU_REDO,	/* DMA timeout/error -> idempotent CPU re-copy */
+	IO_DMA_FMW_ERROR,
+	IO_DMA_FMW_NR,
+};
+void io_dma_fmw_record(unsigned int reason);
+ssize_t io_dma_filemap_write(struct io_kiocb *req, struct kiocb *iocb,
+			     struct iov_iter *from, u64 src_user_addr);
 extern unsigned int io_dma_reap_on_enter;
 extern unsigned int io_dma_inline_wait_us;
 extern unsigned int io_dma_drain_wait_us;
