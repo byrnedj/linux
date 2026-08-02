@@ -1989,6 +1989,10 @@ struct file_operations {
  * with no per-read protocol work.
  */
 #define FOP_DMA_READ		((__force fop_flags_t)(1 << 8))
+/* Buffered writes may be served by the io_uring DMA copy offload, which
+ * drives ->write_begin/->write_end directly and bypasses ->write_iter.
+ */
+#define FOP_DMA_WRITE		((__force fop_flags_t)(1 << 9))
 
 /* Wrap a directory iterator that needs exclusive inode access */
 int wrap_directory_iterator(struct file *, struct dir_context *,

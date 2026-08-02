@@ -1288,12 +1288,61 @@ int io_write(struct io_kiocb *req, unsigned int issue_flags)
 		return -EAGAIN;
 	kiocb->ki_flags |= IOCB_WRITE;
 
-	if (likely(req->file->f_op->write_iter))
-		ret2 = req->file->f_op->write_iter(kiocb, &io->iter);
-	else if (req->file->f_op->write)
-		ret2 = loop_rw_iter(WRITE, rw, &io->iter);
-	else
-		ret2 = -EINVAL;
+	/* DMA-offloaded buffered write for registered buffers. This runs
+	 * only in the blocking io-wq pass, where buffered regular-file
+	 * writes always punt, so io_dma_filemap_write() may sleep. It
+	 * falls back to the normal path on -EAGAIN and every reason is
+	 * counted in the debugfs "filemap_write:" section.
+	 */
+	ret2 = -EAGAIN;
+	if (!force_nonblock && !IS_ERR_OR_NULL(req->ctx->dma.chan) &&
+	    (req->flags & REQ_F_ISREG) &&
+	    (req->flags & REQ_F_BUF_NODE) && req->buf_node) {
+		const struct address_space_operations *aops =
+			req->file->f_mapping->a_ops;
+
+		if (!req->buf_node->buf->dma_addrs) {
+			io_dma_fmw_record(IO_DMA_FMW_NO_DMA_ADDRS);
+		} else if (!iov_iter_is_bvec(&io->iter)) {
+			io_dma_fmw_record(IO_DMA_FMW_NOT_BVEC);
+		} else if (kiocb->ki_flags & IOCB_DIRECT) {
+			io_dma_fmw_record(IO_DMA_FMW_DIRECT);
+		} else if (!(req->file->f_op->fop_flags & FOP_DMA_WRITE) ||
+			   !aops->write_begin || !aops->write_end) {
+			/* The offload drives write_begin and write_end
+			 * directly and skips ->write_iter, which loses the
+			 * per-write protocol work of network filesystems
+			 * and the extra checks of others. Filesystems opt
+			 * in; iomap filesystems (XFS) have no write_begin
+			 * and take the normal path regardless.
+			 */
+			io_dma_fmw_record(IO_DMA_FMW_NO_AOPS);
+		} else {
+			/* The same reissue rule as the read path applies.
+			 * The source registered-buffer base must track the
+			 * iter.
+			 */
+			ret2 = io_dma_filemap_write(req, kiocb, &io->iter,
+						    rw->addr + io->bytes_done);
+			if (ret2 > 0)
+				io_dma_fmw_record(IO_DMA_FMW_ENGAGED);
+			else if (ret2 == -EAGAIN)
+				io_dma_fmw_record(IO_DMA_FMW_EAGAIN);
+			else if (ret2 < 0)
+				io_dma_fmw_record(IO_DMA_FMW_ERROR);
+		}
+	}
+	/* Anything other than -EAGAIN was handled by the DMA path,
+	 * including short writes and errors.
+	 */
+	if (ret2 == -EAGAIN) {
+		if (likely(req->file->f_op->write_iter))
+			ret2 = req->file->f_op->write_iter(kiocb, &io->iter);
+		else if (req->file->f_op->write)
+			ret2 = loop_rw_iter(WRITE, rw, &io->iter);
+		else
+			ret2 = -EINVAL;
+	}
 
 	/*
 	 * Raw bdev writes will return -EOPNOTSUPP for IOCB_NOWAIT. Just
