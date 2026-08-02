@@ -1302,6 +1302,17 @@ static int ext4_write_begin(const struct kiocb *iocb,
 	if (unlikely(ret))
 		return ret;
 
+	/*
+	 * ext4 starts a transaction before it locks a folio, so a task
+	 * that holds up a commit can sleep on a folio of this file. A
+	 * caller that holds other folios of the file locked must therefore
+	 * not start a handle, which can wait for that commit. Fail the call
+	 * before the handle starts, and the caller retries the range with
+	 * no folio held.
+	 */
+	if (iocb && (iocb->ki_flags & IOCB_FOLIOS_LOCKED))
+		return -EAGAIN;
+
 	trace_ext4_write_begin(inode, pos, len);
 	/*
 	 * Reserve one block more for addition to orphan list in case
@@ -3098,7 +3109,7 @@ static int ext4_dax_writepages(struct address_space *mapping,
 	return ret;
 }
 
-static int ext4_nonda_switch(struct super_block *sb)
+static int __ext4_nonda_switch(struct super_block *sb, bool push)
 {
 	s64 free_clusters, dirty_clusters;
 	struct ext4_sb_info *sbi = EXT4_SB(sb);
@@ -3118,7 +3129,7 @@ static int ext4_nonda_switch(struct super_block *sb)
 	/*
 	 * Start pushing delalloc when 1/2 of free blocks are dirty.
 	 */
-	if (dirty_clusters && (free_clusters < 2 * dirty_clusters))
+	if (push && dirty_clusters && (free_clusters < 2 * dirty_clusters))
 		try_to_writeback_inodes_sb(sb, WB_REASON_FS_FREE_SPACE);
 
 	if (2 * free_clusters < 3 * dirty_clusters ||
@@ -3132,6 +3143,11 @@ static int ext4_nonda_switch(struct super_block *sb)
 	return 0;
 }
 
+static int ext4_nonda_switch(struct super_block *sb)
+{
+	return __ext4_nonda_switch(sb, true);
+}
+
 static int ext4_da_write_begin(const struct kiocb *iocb,
 			       struct address_space *mapping,
 			       loff_t pos, unsigned len,
@@ -3141,6 +3157,16 @@ static int ext4_da_write_begin(const struct kiocb *iocb,
 	struct folio *folio;
 	pgoff_t index;
 	struct inode *inode = mapping->host;
+	/*
+	 * The caller holds other folios of this file locked. A task that
+	 * sleeps on one of them can hold up a commit, which the writeback
+	 * push, the non-delalloc fallback's handle start and the -ENOSPC
+	 * retry's forced commit can each wait for. So the push is skipped,
+	 * ext4_write_begin() fails the fallback, and an -ENOSPC goes back
+	 * to the caller without the retry. The caller retries the range
+	 * with no folio held.
+	 */
+	bool locked = iocb && (iocb->ki_flags & IOCB_FOLIOS_LOCKED);
 
 	ret = ext4_emergency_state(inode->i_sb);
 	if (unlikely(ret))
@@ -3148,7 +3174,8 @@ static int ext4_da_write_begin(const struct kiocb *iocb,
 
 	index = pos >> PAGE_SHIFT;
 
-	if (ext4_nonda_switch(inode->i_sb) || ext4_verity_in_progress(inode)) {
+	if (__ext4_nonda_switch(inode->i_sb, !locked) ||
+	    ext4_verity_in_progress(inode)) {
 		*fsdata = (void *)FALL_BACK_TO_NONDELALLOC;
 		return ext4_write_begin(iocb, mapping, pos,
 					len, foliop, fsdata);
@@ -3186,7 +3213,7 @@ retry:
 		if (pos + len > inode->i_size)
 			ext4_truncate_failed_write(inode);
 
-		if (ret == -ENOSPC &&
+		if (ret == -ENOSPC && !locked &&
 		    ext4_should_retry_alloc(inode->i_sb, &retries))
 			goto retry;
 		return ret;
@@ -4020,6 +4047,23 @@ void ext4_set_aops(struct inode *inode)
 		inode->i_mapping->a_ops = &ext4_da_aops;
 	else
 		inode->i_mapping->a_ops = &ext4_aops;
+}
+
+/*
+ * Returns true when ->write_begin of this inode would start a journal
+ * handle. Every write_begin but delayed allocation's does, and delayed
+ * allocation's does too while low free space keeps it in its
+ * non-delalloc fallback. The test reads the inode's own aops rather
+ * than the mount option, since an inode cached across a remount that
+ * enabled delalloc keeps the aops it was set up with. Like
+ * ext4_da_write_begin(), it can start writeback and wait for it when
+ * dirty clusters crowd the free ones, so call it only where write_begin
+ * could run.
+ */
+bool ext4_write_begin_opens_handle(struct inode *inode)
+{
+	return inode->i_mapping->a_ops != &ext4_da_aops ||
+	       ext4_nonda_switch(inode->i_sb);
 }
 
 /*

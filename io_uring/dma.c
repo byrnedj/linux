@@ -2,6 +2,8 @@
 
 #include <linux/io_uring_types.h>
 #include <linux/io_uring.h>
+#include <linux/backing-dev.h>
+#include <linux/delay.h>
 #include <linux/uio.h>
 #include <linux/dma-mapping.h>
 #include <linux/spinlock.h>
@@ -49,6 +51,103 @@ static inline unsigned long io_dma_prep_flags(void)
 static unsigned int io_dma_cq_poll_us __read_mostly = 20;
 
 /*
+ * Inline spin budget in microseconds for the DMA filemap-write wait.
+ * The write path is synchronous per request. A typical request's batch
+ * completes in tens of microseconds, so sleeping immediately trades a
+ * usleep wakeup of about 100us for about 35us of engine time and
+ * halves throughput at small request sizes. We spin with cond_resched
+ * for up to this long before backing off to sleeping. The backoff
+ * still protects the many-rings contention case. 0 sleeps immediately.
+ * This is tunable via debugfs io_uring_dma/fmw_spin_us.
+ */
+static unsigned int io_dma_fmw_spin_us __read_mostly = 60;
+
+/*
+ * How long the DMA filemap-write wait gives the device before it
+ * declares the transfer wedged, leaks the destination mappings and
+ * fails the write. Tunable via debugfs io_uring_dma/fmw_wait_ms, which
+ * refuses values below IO_DMA_FMW_WAIT_MIN_MS. A wedge leaks the folios
+ * the device may still write and loses what they held, so the timeout
+ * must stay well above what a healthy but contended queue takes. At 0
+ * the deadline is the next tick, and at a few milliseconds the sleep
+ * back-off and the queueing of many rings on one work queue already
+ * reach it.
+ */
+#define IO_DMA_FMW_WAIT_MIN_MS	100
+static unsigned int io_dma_fmw_wait_ms __read_mostly = 5000;
+
+static int io_dma_fmw_wait_ms_get(void *data, u64 *val)
+{
+	*val = READ_ONCE(io_dma_fmw_wait_ms);
+	return 0;
+}
+
+static int io_dma_fmw_wait_ms_set(void *data, u64 val)
+{
+	if (val > U32_MAX)
+		return -ERANGE;
+	if (val < IO_DMA_FMW_WAIT_MIN_MS)
+		return -EINVAL;
+	WRITE_ONCE(io_dma_fmw_wait_ms, val);
+	return 0;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(io_dma_fmw_wait_ms_fops, io_dma_fmw_wait_ms_get,
+			 io_dma_fmw_wait_ms_set, "%llu\n");
+
+/*
+ * Filemap DMA-write gate and result counters. These are surfaced
+ * through the io_uring_dma/latency debugfs stats file and zeroed by
+ * its _reset companion.
+ */
+static const char * const io_dma_fmw_names[IO_DMA_FMW_NR] = {
+	[IO_DMA_FMW_ENGAGED] = "engaged",
+	[IO_DMA_FMW_UNSUPPORTED] = "unsupported",
+	[IO_DMA_FMW_NOT_BVEC] = "not_bvec",
+	[IO_DMA_FMW_DIRECT] = "direct",
+	[IO_DMA_FMW_NO_DMA_ADDRS] = "no_dma_addrs",
+	[IO_DMA_FMW_EAGAIN] = "eagain",
+	[IO_DMA_FMW_CPU_REDO] = "cpu_redo",
+	[IO_DMA_FMW_ERROR] = "error",
+	[IO_DMA_FMW_FS_DECLINE] = "fs_decline",
+};
+static atomic64_t io_dma_fmw[IO_DMA_FMW_NR];
+
+void io_dma_fmw_record(unsigned int reason)
+{
+	atomic64_inc(&io_dma_fmw[reason]);
+}
+
+static int io_dma_lat_show(struct seq_file *m, void *v)
+{
+	unsigned int i;
+
+	seq_puts(m, "filemap_write:\n");
+	for (i = 0; i < IO_DMA_FMW_NR; i++)
+		seq_printf(m, "  %-12s %12llu\n", io_dma_fmw_names[i],
+			   atomic64_read(&io_dma_fmw[i]));
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(io_dma_lat);
+
+static ssize_t io_dma_lat_reset_write(struct file *file,
+				      const char __user *ubuf,
+				      size_t count, loff_t *ppos)
+{
+	unsigned int i;
+
+	for (i = 0; i < IO_DMA_FMW_NR; i++)
+		atomic64_set(&io_dma_fmw[i], 0);
+	return count;
+}
+
+static const struct file_operations io_dma_lat_reset_fops = {
+	.owner		= THIS_MODULE,
+	.open		= simple_open,
+	.write		= io_dma_lat_reset_write,
+	.llseek		= noop_llseek,
+};
+
+/*
  * Devices a ring stripes over, one channel each. One channel reaches one
  * device, four engines of sixteen; a single-stream op striped across the
  * devices reaches them all. A ring takes no more devices than a buffer
@@ -69,7 +168,13 @@ void io_dma_debugfs_init(void)
 	dir = debugfs_create_dir("io_uring_dma", NULL);
 
 	debugfs_create_u32("cq_poll_us", 0644, dir, &io_dma_cq_poll_us);
+	debugfs_create_u32("fmw_spin_us", 0644, dir, &io_dma_fmw_spin_us);
+	debugfs_create_file_unsafe("fmw_wait_ms", 0644, dir, NULL,
+				   &io_dma_fmw_wait_ms_fops);
 	debugfs_create_u32("stripe_chans", 0644, dir, &io_dma_stripe_chans);
+	debugfs_create_file("latency", 0444, dir, NULL, &io_dma_lat_fops);
+	debugfs_create_file("latency_reset", 0200, dir, NULL,
+			    &io_dma_lat_reset_fops);
 }
 
 /* Datapath allocation takes from the pool first and then falls back
@@ -789,6 +894,775 @@ put_folios:
 	if (unlikely(submitted != total_read))
 		iocb->ki_pos = start_pos + submitted;
 	return submitted ? submitted : error;
+}
+
+/*
+ * DMA-offloaded buffered write for registered buffers (WRITE_FIXED).
+ * This replaces generic_perform_write()'s copy_folio_from_iter() with
+ * DSA copies from the pre-mapped registered buffer into the page-cache
+ * folios obtained from aops->write_begin().
+ *
+ * The write path is deliberately synchronous. The caller path runs in
+ * io-wq process context because buffered regular-file writes always
+ * punt there, and inode_lock plus the per-folio write_begin and
+ * write_end protocol make a deferred-CQE design a lifetime minefield.
+ * Waiting inline keeps every VFS invariant identical to the generic
+ * path. The win is the removed CPU memcpy and not latency.
+ *
+ * The failure ladder is as follows. On a prep or submit failure or a
+ * DMA_ERROR completion, with every submitted cookie reaped, we CPU
+ * re-copy every chunk and commit normally (counted as "cpu_redo").
+ * This is safe because copying the same src to the same dst is
+ * idempotent. On a completion timeout the device is wedged. We skip
+ * write_end for the folios the device may write and deliberately leak
+ * them referenced, together with their dst mappings, so that a late
+ * DMA write can only land in memory the kernel still owns. Unmapping
+ * would free the IOVA for the next mapping to reuse. Where the
+ * filesystem can take a folio out of its page cache, as memory failure
+ * does, the leaked folios are taken out and unlocked, so no task waits
+ * on them and later I/O of the range goes to the disk instead of the
+ * torn copy. tmpfs keeps them locked. The write then returns -EIO, or
+ * a short write when groups before the wedged one committed.
+ */
+
+struct io_dma_fmw_folio {
+	struct folio *folio;
+	void *fsdata;
+	loff_t pos;
+	unsigned int len;
+	bool redo;		/* some of it was not handed to the device */
+	bool targeted;		/* a descriptor for it was submitted */
+	bool lost;		/* the disk may lack what it held */
+	dma_addr_t dst_dma;	/* 0 means nothing to unmap */
+	unsigned int map_len;
+};
+
+/*
+ * Poll every outstanding cookie to completion.  Sets *redo on any
+ * DMA_ERROR.  Returns 0, or -ETIMEDOUT with cookies possibly still in
+ * flight, in which case the caller must treat every dst as poisoned.
+ *
+ * We spin only briefly.  DSA transfers normally complete in
+ * single-digit microseconds, but under contention with many rings
+ * sharing the WQ descriptor pools completion can take milliseconds.
+ * Hundreds of io-wq workers busy-polling here saturated whole sockets
+ * and starved application heartbeats at O(100) shared rings.
+ * Therefore we back off to sleeping once the fast path misses.
+ */
+static int io_dma_fmw_wait(struct dma_chan *chan, dma_cookie_t *cookies,
+			   unsigned int *nr, bool *redo)
+{
+	unsigned int wait_ms = READ_ONCE(io_dma_fmw_wait_ms);
+	unsigned long deadline = jiffies + msecs_to_jiffies(wait_ms);
+	u64 spin_end = ktime_get_ns() +
+		READ_ONCE(io_dma_fmw_spin_us) * NSEC_PER_USEC;
+	unsigned int i, spins;
+
+	for (i = 0; i < *nr; i++) {
+		enum dma_status st;
+
+		spins = 0;
+		while ((st = dmaengine_async_is_tx_complete(chan, cookies[i]))
+		       == DMA_IN_PROGRESS) {
+			if (time_after(jiffies, deadline)) {
+				*nr = 0;
+				return -ETIMEDOUT;
+			}
+			if (ktime_get_ns() < spin_end) {
+				cpu_relax();
+				if (!(++spins & 63))
+					cond_resched();
+			} else {
+				usleep_range(50, 150);
+			}
+		}
+		if (st != DMA_COMPLETE)
+			*redo = true;
+	}
+	*nr = 0;
+	return 0;
+}
+
+/* Writes at or below this size fall back to the CPU copy path */
+#define IO_DMA_MIN_WRITE_BYTES	SZ_64K
+
+/*
+ * Folios collected, submitted and committed as one group. Capping the
+ * group bounds the folio array, the number of folios held locked at
+ * once, and the range a wedged device can strand. None of those would
+ * otherwise be bounded by anything smaller than the request itself.
+ * On a filesystem that truncates failed writes a chunk that reaches past
+ * EOF is a group of its own, see the loop in io_dma_fmw_group().
+ * Folios can reach the mapping's maximum folio size, so a group also
+ * ends with the folio that brings it to IO_DMA_FMW_GROUP_BYTES or beyond.
+ * Without that, 256 folios of 2MB would hold 512MB locked and not yet
+ * dirty, which reclaim cannot free and the dirty throttle does not see.
+ * Each group end waits for the copies still in flight, so every group
+ * adds the latency of its last copies to the write.
+ */
+#define IO_DMA_FMW_GROUP_FOLIOS	256
+#define IO_DMA_FMW_GROUP_BYTES	SZ_32M
+
+/*
+ * Copy one chunk with the CPU and commit it, as generic_perform_write()
+ * does, while no other folio of the file is held. That is a chunk whose
+ * write_begin() opened a journal handle, which the write_end() closes,
+ * or a small chunk of a group capped at one folio. The source is a
+ * pinned registered-buffer bvec, so the copy cannot fault and needs no
+ * atomic variant. A committed chunk counts as eagain. A negative error
+ * ends the write, which counts as error when nothing was written and is
+ * a short write otherwise. Returns the bytes committed, 0 when
+ * write_end() took nothing, or a negative error.
+ */
+static ssize_t io_dma_fmw_cpu_chunk(struct kiocb *iocb,
+				    struct address_space *mapping,
+				    struct iov_iter *from, loff_t pos,
+				    size_t bytes, struct folio *folio,
+				    void *fsdata)
+{
+	size_t copied;
+	long status;
+
+	if (mapping_writably_mapped(mapping))
+		flush_dcache_folio(folio);
+	copied = copy_folio_from_iter(folio, offset_in_folio(folio, pos),
+				      bytes, from);
+	flush_dcache_folio(folio);
+	status = mapping->a_ops->write_end(iocb, mapping, pos, bytes, copied,
+					   folio, fsdata);
+	if (unlikely(status != copied))
+		iov_iter_revert(from, copied - max(status, 0L));
+	if (status > 0) {
+		balance_dirty_pages_ratelimited(mapping);
+		io_dma_fmw_record(IO_DMA_FMW_EAGAIN);
+	}
+	cond_resched();
+	return status;
+}
+
+/*
+ * Take a folio that a wedged group leaks out of the page cache, as memory
+ * failure takes out a poisoned one, then unlock it. The caller keeps the
+ * folio's reference and its destination mapping, so a late write still
+ * lands in memory the kernel owns, and no lookup can find the folio any
+ * more. A task asleep on its lock wakes and finds it truncated:
+ * writeback skips it, and readers, faults and page_mkwrite look the range
+ * up again and read it from the disk. What it held that the disk lacks
+ * is lost, which @lost says, and fsync() reports -EIO for that. The loss
+ * is recorded before the folio leaves the cache, as memory failure does,
+ * so that an fsync() that no longer finds the folio still reports it.
+ * The truncation needs the I/O of an earlier writeback ended. Returns
+ * false, with the folio still locked, where the filesystem keeps such a
+ * folio in its cache, as tmpfs does.
+ */
+static bool io_dma_fmw_drop(struct address_space *mapping,
+			    struct folio *folio, bool lost)
+{
+	const struct address_space_operations *aops = mapping->a_ops;
+
+	if (!aops->error_remove_folio)
+		return false;
+	folio_wait_writeback(folio);
+	if (lost)
+		mapping_set_error(mapping, -EIO);
+	if (aops->error_remove_folio(mapping, folio) || folio->mapping)
+		return false;
+	folio_unlock(folio);
+	return true;
+}
+
+/*
+ * Run one group of a DMA write: collect folios starting @base bytes
+ * into the write until the group is full or the write ends, submit the
+ * copies, wait for them, and commit. Returns the bytes committed, or a
+ * negative error when nothing was committed. On a device timeout the
+ * folios the device may still write are deliberately leaked, the others
+ * released, and -EIO is returned, so the caller must stop.
+ */
+static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
+				struct iov_iter *from, u64 src_user_addr,
+				size_t base, size_t room,
+				struct io_dma_fmw_folio *fol,
+				unsigned int *fol_cap,
+				dma_cookie_t *cookies,
+				unsigned int max_cookies)
+{
+	struct io_ring_ctx *ctx = req->ctx;
+	struct file *file = iocb->ki_filp;
+	struct address_space *mapping = file->f_mapping;
+	const struct address_space_operations *aops = mapping->a_ops;
+	struct io_mapped_ubuf *imu = req->buf_node->buf;
+	struct dma_chan *chan = ctx->dma.chan;
+	struct device *dev = chan->device->dev;
+	size_t max_chunk = mapping_max_folio_size(mapping);
+	/*
+	 * A group collects at most max_fol folios. The loop lowers the cap
+	 * to 1 for the rest of the write once a write_begin() opens a
+	 * journal handle, or fails a later chunk with -EAGAIN.
+	 */
+	unsigned int max_fol = *fol_cap;
+	/*
+	 * Only this write's write_end() moves i_size under inode_lock. The
+	 * ones that run before the group commits lie inside EOF, so the
+	 * value holds while the group collects.
+	 */
+	loff_t isize = i_size_read(mapping->host);
+	/*
+	 * A folio that was already dirty ends the group only on a mapping
+	 * that writes back, for the reason the loop gives. That depends on
+	 * the mapping alone, so it is read once.
+	 */
+	bool dirty_ends = mapping_can_writeback(mapping);
+	/*
+	 * ext4 answers a failed write past EOF by truncating the page cache
+	 * from EOF, which locks every folio there and so would wait forever
+	 * on one this group holds. On such a filesystem a chunk that reaches
+	 * past EOF is a group of its own, so that no folio of the file is
+	 * held while its write_begin() runs or while a journal handle it
+	 * opened is closed. tmpfs never truncates, and keeps batching its
+	 * appends.
+	 */
+	bool eof_alone = file->f_op->fop_flags & FOP_TRUNCATE_FAILED_WRITE;
+	unsigned int nr_fol = 0, nr_cookies = 0, i;
+	unsigned int prep_fails = 0;
+	/* redo: a completion could not be trusted, so every folio is
+	 * re-copied. any_redo: at least one folio was not fully handed to
+	 * the device and is re-copied on its own.
+	 */
+	bool redo = false, any_redo = false;
+	bool surrendered = false;
+	ssize_t collected = 0, committed = 0;
+	ssize_t err = 0;
+	int wedged = 0;
+
+	while (collected < room && nr_fol < max_fol &&
+	       collected < IO_DMA_FMW_GROUP_BYTES) {
+		loff_t pos = iocb->ki_pos + base + collected;
+		size_t bytes = min_t(size_t,
+				     max_chunk - (pos & (max_chunk - 1)),
+				     room - collected);
+		size_t offset, sub;
+		dma_addr_t dst_dma;
+		struct folio *folio;
+		void *fsdata;
+		bool chunk_redo = false, targeted = false, was_dirty, lost;
+		int status;
+
+		/*
+		 * The length is the hint and so at least the chunk, which
+		 * keeps the test conservative.
+		 */
+		if (eof_alone && nr_fol && pos + bytes > isize)
+			break;
+		/*
+		 * Once the group holds a folio, a write_begin() that starts
+		 * a journal handle, pushes writeback or forces a commit
+		 * would wait with that folio locked, against ext4's order
+		 * of transaction start before folio lock. A task that
+		 * sleeps on a held folio while it holds up a commit would
+		 * then deadlock with the write. Writeback does that when
+		 * another writeback cleaned a folio it looked up dirty and
+		 * this group took it clean, and so does a page fault in
+		 * ext4's non-delalloc branch. So a later chunk's
+		 * write_begin() runs under IOCB_FOLIOS_LOCKED, under which
+		 * ext4 skips its writeback push and fails the call where
+		 * it would start a handle or retry an allocation. The first
+		 * chunk of a group runs with nothing of the file held and
+		 * may do all three, as under generic_perform_write().
+		 */
+		if (nr_fol)
+			iocb->ki_flags |= IOCB_FOLIOS_LOCKED;
+		status = aops->write_begin(iocb, mapping, pos, bytes,
+					   &folio, &fsdata);
+		iocb->ki_flags &= ~IOCB_FOLIOS_LOCKED;
+		if (unlikely(status < 0)) {
+			/*
+			 * A failure on a later chunk ends the group, which
+			 * commits the folios collected before it, and the
+			 * next group retries the chunk with nothing held,
+			 * where ext4 falls back or retries the allocation.
+			 * A failure there ends the write short, as on the
+			 * stock path. Until then the group's earlier folios
+			 * stay locked, so reclaim has less to work with. On
+			 * a filesystem that truncates failed writes those
+			 * folios all lie inside EOF, so the truncation from
+			 * EOF never waits on one. ext4 returns -EAGAIN under
+			 * the flag only where it would have opened a handle,
+			 * so that lowers the cap as a handle does below.
+			 */
+			if (status == -EAGAIN && nr_fol)
+				*fol_cap = 1;
+			if (!collected)
+				err = status;
+			break;
+		}
+		/*
+		 * Cover the locked folio to its end or to the write's end.
+		 * That keeps the chunk inside the range write_begin() was
+		 * asked to prepare, which runs to the write's end or to the
+		 * next boundary of the mapping's maximum folio size,
+		 * whichever comes first. No folio crosses that boundary.
+		 * The chunk must not reach past the range. ext4 maps or
+		 * reserves blocks only inside it, and its writeback treats
+		 * a dirty block that was neither mapped nor reserved as a
+		 * hole and never writes it. tmpfs checks F_SEAL_GROW
+		 * against the same range. Short of the write's end the
+		 * chunk must not stop inside the folio either, or the next
+		 * iteration's write_begin() would wait forever on the
+		 * folio lock this group already holds. Descriptors below
+		 * still split at source-folio boundaries.
+		 */
+		offset = offset_in_folio(folio, pos);
+		bytes = min_t(size_t, room - collected,
+			      folio_size(folio) - offset);
+		/*
+		 * On a mapping that writes back, a folio that was already
+		 * dirty is tagged for writeback, and the flusher locks
+		 * tagged folios. Another write_begin() while the group
+		 * holds it locked can wait on that flusher (ext4 under low
+		 * free space, or a journal commit), which is a deadlock, so
+		 * such a folio ends its group below. shmem keeps its folios
+		 * dirty from their first write, fallocate() or swap-in until
+		 * swap-out without ever tagging them, and nothing writes
+		 * them back but reclaim, which skips locked folios. Testing
+		 * the flag alone would end a group at every folio a tmpfs
+		 * overwrite reaches.
+		 */
+		was_dirty = folio_test_dirty(folio) && dirty_ends;
+		/*
+		 * Whether the disk may lack what the folio holds, which a
+		 * wedge that drops the folio would lose. Writeback cannot
+		 * start while the group holds the lock, but one already in
+		 * flight can end during the wait with torn bytes on the
+		 * disk, so the state is taken now and not at the wedge.
+		 * Only a mapping that writes back has a disk to lack it.
+		 */
+		lost = dirty_ends &&
+		       (folio_test_dirty(folio) || folio_test_writeback(folio));
+		/*
+		 * A write_begin that leaves a journal handle open (ext4
+		 * delalloc falling back under low free space) expects its
+		 * matching write_end before the next write_begin. Batching
+		 * would nest handles with h_ref only and no credits, and a
+		 * wedge would leak the references and stall the journal.
+		 * So the handle is closed at once. ext4 declines a write up
+		 * front when its write_begin would open a handle, so in
+		 * practice this catches a fallback that starts during the
+		 * write. The check runs on every chunk because the fallback
+		 * is per write_begin, and this write's own delayed
+		 * allocations, or a concurrent writer, can bring free space
+		 * below dirty space plus the watermark mid-write.
+		 *
+		 * The first chunk of a group is copied with the CPU and
+		 * committed, as the stock path does, with no other folio of
+		 * the file held. ext4 fails the write_begin() of a later
+		 * chunk rather than open a handle there, see
+		 * IOCB_FOLIOS_LOCKED above, so a handle on a later chunk
+		 * comes only from a filesystem that ignores the flag. Such
+		 * a chunk ends its group. A write_end that copies nothing
+		 * closes its handle, with the chunk, the range the
+		 * filesystem prepared, as its length. The group commits the
+		 * folios collected before it, and the next group starts
+		 * with this chunk. On a filesystem that truncates failed
+		 * writes a chunk that reaches past EOF never joins a group
+		 * that holds folios, so this one lies inside EOF and that
+		 * write_end neither moves i_size nor truncates. Past EOF it
+		 * would truncate the file, fallocate preallocation
+		 * included.
+		 *
+		 * Either way the write goes on, so a fallback never ends it
+		 * short, but it runs one folio per group from here on. A
+		 * write that has met the fallback runs near the watermark,
+		 * where ext4 fails the write_begin() of a later chunk of a
+		 * batched group whenever the fallback holds, which would
+		 * end that group early.
+		 */
+		if (unlikely(current->journal_info)) {
+			*fol_cap = 1;
+			if (!nr_fol)
+				return io_dma_fmw_cpu_chunk(iocb, mapping, from,
+							    pos, bytes, folio,
+							    fsdata);
+			aops->write_end(iocb, mapping, pos, bytes, 0,
+					folio, fsdata);
+			break;
+		}
+		/*
+		 * Only the caps above make max_fol 1, since
+		 * io_dma_filemap_write() starts it at two folios or more. A
+		 * group of one folio pays a device round trip for that
+		 * folio alone, which at or below IO_DMA_MIN_WRITE_BYTES
+		 * costs more than the copy it replaces, so such a chunk is
+		 * copied with the CPU, as a write of that size is.
+		 */
+		if (unlikely(max_fol == 1) && bytes <= IO_DMA_MIN_WRITE_BYTES)
+			return io_dma_fmw_cpu_chunk(iocb, mapping, from, pos,
+						    bytes, folio, fsdata);
+
+		if (surrendered) {
+			/*
+			 * This is sustained descriptor exhaustion. We stop
+			 * touching the DMA engine for the rest of this
+			 * group, and the CPU-redo pass copies its remaining
+			 * chunks. This beats paying a drain-wait per chunk
+			 * while dozens of other rings hold the pools empty.
+			 */
+			dst_dma = 0;
+			chunk_redo = true;
+			goto record;
+		}
+		dst_dma = dma_map_page(dev, folio_page(folio, 0),
+				       offset, bytes, DMA_FROM_DEVICE);
+		if (dma_mapping_error(dev, dst_dma)) {
+			/* Commit this chunk via the CPU-redo pass instead. */
+			dst_dma = 0;
+			chunk_redo = true;
+			goto record;
+		}
+
+		/* Split at the source registered-buffer folio boundaries. */
+		for (sub = 0; sub < bytes; ) {
+			u64 uaddr = src_user_addr + base + collected + sub;
+			size_t src_seg_remain, len;
+			struct dma_async_tx_descriptor *tx;
+			dma_addr_t src_dma, dst;
+			dma_cookie_t ck;
+
+			src_dma = io_reg_buf_dma_addr(imu, uaddr,
+						      &src_seg_remain,
+						      dev);
+			dst = dst_dma + sub;
+			if (unlikely(!src_dma)) {
+				chunk_redo = true; /* The CPU re-copies this folio. */
+				break;
+			}
+			len = min3(bytes - sub, src_seg_remain, max_chunk);
+
+			tx = dmaengine_prep_dma_memcpy(chan, dst, src_dma, len,
+						       io_dma_prep_flags());
+			if (!tx) {
+				/* The pool is exhausted. Drain in-flight
+				 * work and retry once.
+				 */
+				dma_async_issue_pending(chan);
+				wedged = io_dma_fmw_wait(chan, cookies,
+							 &nr_cookies, &redo);
+				if (wedged)
+					goto record;
+				tx = dmaengine_prep_dma_memcpy(chan, dst,
+						src_dma, len,
+						io_dma_prep_flags());
+			}
+			if (!tx) {
+				io_dma_fmw_record(IO_DMA_FMW_EAGAIN);
+				chunk_redo = true;
+				/*
+				 * Two drain-and-retry failures in one group
+				 * mean the pools are held empty by other
+				 * rings, so the rest of the group goes to
+				 * the CPU.
+				 */
+				if (++prep_fails >= 2) {
+					surrendered = true;
+					break;	/* redo covers this chunk. */
+				}
+			} else {
+				ck = dmaengine_submit(tx);
+				if (dma_submit_error(ck)) {
+					chunk_redo = true;
+				} else {
+					cookies[nr_cookies++] = ck;
+					targeted = true;
+				}
+				if (nr_cookies == max_cookies) {
+					dma_async_issue_pending(chan);
+					wedged = io_dma_fmw_wait(chan, cookies,
+							&nr_cookies, &redo);
+					if (wedged)
+						goto record;
+				}
+			}
+			sub += len;
+		}
+record:
+		fol[nr_fol++] = (struct io_dma_fmw_folio){
+			.folio = folio, .fsdata = fsdata, .pos = pos,
+			.len = bytes, .dst_dma = dst_dma, .map_len = bytes,
+			.redo = chunk_redo, .targeted = targeted, .lost = lost,
+		};
+		/*
+		 * A wedge found while this folio's copies were submitted ends
+		 * the group here, with the folio recorded, so the wedge path
+		 * below sees every folio the group holds.
+		 */
+		if (unlikely(wedged))
+			break;
+		any_redo |= chunk_redo;
+		collected += bytes;
+		if (was_dirty || (eof_alone && pos + bytes > isize))
+			break;
+	}
+
+	if (!wedged) {
+		dma_async_issue_pending(chan);
+		wedged = io_dma_fmw_wait(chan, cookies, &nr_cookies, &redo);
+	}
+
+	/* Unmap the dst IOVAs, except after a timeout. An unmap frees the
+	 * IOVA, at once under a strict IOMMU and at the next flush-queue
+	 * drain otherwise, and the next mapping for the device can reuse
+	 * it. A late write from an abandoned descriptor would then go
+	 * through that valid translation into an unrelated page. So a
+	 * wedge leaks the mappings with the folios below, which stay
+	 * referenced, and a late write can only land there.
+	 */
+	for (i = 0; i < nr_fol; i++)
+		if (fol[i].dst_dma && likely(!wedged))
+			dma_unmap_page(dev, fol[i].dst_dma, fol[i].map_len,
+				       DMA_FROM_DEVICE);
+
+	if (unlikely(wedged)) {
+		unsigned int leaked = 0, dropped = 0;
+
+		/*
+		 * No descriptor of this write was submitted for such a folio,
+		 * so the device cannot write it. It is released as after a
+		 * failed copy, with nothing claimed, and keeps whatever it
+		 * held, but only where a zero claim cannot move i_size. On a
+		 * filesystem that truncates failed writes every such folio
+		 * lies inside EOF, since a chunk that reaches past EOF is a
+		 * group of its own and a group with nothing submitted cannot
+		 * wedge, so its write_end() neither starts a handle nor waits.
+		 * tmpfs batches appends past EOF, and its write_end() moves
+		 * i_size to the position even with nothing copied, which would
+		 * put the leaked folios below it inside EOF. A folio that
+		 * starts past EOF is leaked with them instead.
+		 */
+		for (i = 0; i < nr_fol; i++)
+			if (!fol[i].targeted && fol[i].pos <= isize)
+				aops->write_end(iocb, mapping, fol[i].pos,
+						fol[i].len, 0, fol[i].folio,
+						fol[i].fsdata);
+		/*
+		 * The others keep their reference and their mapping for good,
+		 * so that a late write can only land in memory the kernel
+		 * still owns. Their contents are unknown. A task can sleep on
+		 * the lock of any of them: writeback that looked it up, a
+		 * read of a range not uptodate, a fault, compaction, and
+		 * every later truncate or write of the file. And readers of
+		 * an uptodate one would copy the torn bytes. Where the
+		 * filesystem takes such a folio out of its page cache, see
+		 * io_dma_fmw_drop(), it is unlocked as well, and every task
+		 * asleep on it wakes and finds it gone. A reader or a pin that
+		 * took the folio before can still see the torn bytes, as after
+		 * a truncate. The highest goes first. ext4 writeback can hold
+		 * the bio of a lower folio unsubmitted while it sleeps on a
+		 * higher one, so waiting on a folio's writeback with a higher
+		 * folio still held could wait forever. A mapping that writes
+		 * back must drop the folio, see FOP_DMA_WRITE, or the next
+		 * writeback that looks it up would sleep on it for good.
+		 */
+		for (i = nr_fol; i-- > 0; ) {
+			if (!fol[i].targeted && fol[i].pos <= isize)
+				continue;
+			leaked++;
+			if (io_dma_fmw_drop(mapping, fol[i].folio, fol[i].lost))
+				dropped++;
+			else
+				WARN_ON_ONCE(dirty_ends);
+		}
+		pr_warn_ratelimited("io_uring DMA write: wedged after %ums, leaking %u folios, %u of them dropped from the page cache (%s)\n",
+				    READ_ONCE(io_dma_fmw_wait_ms), leaked, dropped,
+				    dma_chan_name(chan));
+		io_dma_fmw_record(IO_DMA_FMW_ERROR);
+		return -EIO;
+	}
+
+	if (unlikely(redo || any_redo)) {
+		/* Re-copy with the CPU: every folio after an untrusted
+		 * completion, otherwise only the folios the device was not
+		 * handed in full. The same source bytes go to the same
+		 * folio ranges, so overlap with completed DMA is
+		 * idempotent. The iter was never advanced during
+		 * collection, so it is walked over the folios in order.
+		 */
+		for (i = 0; i < nr_fol; i++) {
+			size_t n;
+
+			if (!redo && !fol[i].redo) {
+				iov_iter_advance(from, fol[i].len);
+				continue;
+			}
+			n = copy_folio_from_iter(fol[i].folio,
+					offset_in_folio(fol[i].folio, fol[i].pos),
+					fol[i].len, from);
+			if (unlikely(n != fol[i].len)) {
+				collected = fol[i].pos -
+					(iocb->ki_pos + base) + n;
+				break;
+			}
+		}
+		io_dma_fmw_record(IO_DMA_FMW_CPU_REDO);
+	}
+
+	/* Commit in ascending order with the dirty, unlock, and i_size
+	 * updates. Every collected folio must pass through write_end even
+	 * after a failure, with a zero claim, or the tail folios stay
+	 * locked and referenced forever.
+	 */
+	{
+		bool commit_failed = false;
+
+		for (i = 0; i < nr_fol; i++) {
+			size_t claim = commit_failed ? 0 :
+				min_t(size_t, fol[i].len,
+				      collected - committed);
+			int done;
+
+			done = aops->write_end(iocb, mapping, fol[i].pos,
+					       fol[i].len, claim,
+					       fol[i].folio, fol[i].fsdata);
+			if (commit_failed)
+				continue;
+			if (unlikely(done < 0)) {
+				if (!committed)
+					err = done;
+				commit_failed = true;
+				continue;
+			}
+			committed += done;
+			if ((size_t)done < fol[i].len) {
+				commit_failed = true;
+				continue;
+			}
+		}
+	}
+	/*
+	 * Throttle once per group, with every folio unlocked. Inside the
+	 * loop the later folios of a rewrite are dirty and locked, and
+	 * the flusher this waits for would block on them.
+	 */
+	if (committed)
+		balance_dirty_pages_ratelimited(mapping);
+
+	/* The CPU re-copy consumes the iter when it runs; otherwise
+	 * advance it over exactly what was committed. The two counts
+	 * cannot diverge: the source is a pinned registered-buffer
+	 * bvec, so copy_folio_from_iter() never copies short, every
+	 * claim therefore equals its chunk length, and write_end
+	 * with a full claim returns it whole or fails outright.
+	 */
+	if (!redo && !any_redo)
+		iov_iter_advance(from, committed);
+	return committed ? committed : err;
+}
+
+ssize_t io_dma_filemap_write(struct io_kiocb *req, struct kiocb *iocb,
+			     struct iov_iter *from, u64 src_user_addr)
+{
+	struct io_mapped_ubuf *imu = req->buf_node->buf;
+	struct file *file = iocb->ki_filp;
+	struct inode *inode = file->f_mapping->host;
+	struct io_dma_fmw_folio *fol = NULL;
+	dma_cookie_t *cookies = NULL;
+	unsigned int max_fol, max_cookies;
+	ssize_t want, written = 0, err = 0;
+
+	/* At or below this size the per-folio write_begin and write_end
+	 * machinery plus the descriptor overhead exceeds the memcpy it
+	 * replaces, so we take the CPU path.
+	 */
+	if (iov_iter_count(from) <= IO_DMA_MIN_WRITE_BYTES)
+		return -EAGAIN;
+
+	inode_lock(inode);
+	/*
+	 * The prologue of the filesystem's write_iter. A filesystem whose
+	 * checks go beyond the generic ones, such as ext4 with its immutable
+	 * test, its bitmap-format size limit and the zeroing of the old last
+	 * block on a write past EOF, runs them through ->dma_copy_checks();
+	 * the others get the generic sequence.
+	 */
+	if (file->f_op->dma_copy_checks) {
+		want = file->f_op->dma_copy_checks(iocb, from, WRITE);
+	} else {
+		want = generic_write_checks(iocb, from);
+		if (want > 0) {
+			err = file_modified(file);
+			if (err)
+				want = err;
+		}
+	}
+	if (want <= 0) {
+		inode_unlock(inode);
+		/*
+		 * The write path runs without IOCB_NOWAIT, so only a
+		 * filesystem declining the offload returns -EAGAIN here.
+		 */
+		if (want == -EAGAIN)
+			io_dma_fmw_record(IO_DMA_FMW_FS_DECLINE);
+		return want;
+	}
+
+	max_fol = min_t(unsigned long, IO_DMA_FMW_GROUP_FOLIOS,
+			DIV_ROUND_UP(want, PAGE_SIZE) + 1);
+	/* One entry per src-folio crossing per chunk. The collection loop
+	 * flushes whenever the array fills, so this sets the wait
+	 * granularity rather than bounding the transfer.
+	 */
+	max_cookies = max_fol + DIV_ROUND_UP(want, 1UL << imu->folio_shift) + 8;
+	max_cookies = min_t(unsigned int, max_cookies, 4 * max_fol + 8);
+	fol = kvmalloc_array(max_fol, sizeof(*fol), GFP_KERNEL);
+	cookies = kvmalloc_array(max_cookies, sizeof(*cookies), GFP_KERNEL);
+	if (!fol || !cookies) {
+		err = -EAGAIN;	/* Fall back to the normal write path. */
+		goto out_unlock;
+	}
+
+	/* One group at a time, so a large write neither allocates an array
+	 * proportional to its length nor holds every one of its folios
+	 * locked at once. Groups commit as they go, so a failure part way
+	 * through is a short write over the groups that already landed.
+	 */
+	while (written < want) {
+		ssize_t done;
+
+		/*
+		 * A fatal signal ends the write before the next group, as
+		 * it ends generic_perform_write() before the next chunk. A
+		 * write that starts with one pending copies nothing, and
+		 * one that runs a folio per group stops after the folio in
+		 * progress.
+		 */
+		if (fatal_signal_pending(current)) {
+			if (!written)
+				err = -EINTR;
+			break;
+		}
+		done = io_dma_fmw_group(req, iocb, from, src_user_addr,
+					written, want - written, fol,
+					&max_fol, cookies, max_cookies);
+		if (done <= 0) {
+			/* A zero-progress group falls back to the normal
+			 * write path rather than completing as a zero-byte
+			 * write.
+			 */
+			if (!written)
+				err = done ? done : -EAGAIN;
+			break;
+		}
+		written += done;
+	}
+
+	if (written > 0)
+		iocb->ki_pos += written;
+out_unlock:
+	inode_unlock(inode);
+	kvfree(fol);
+	kvfree(cookies);
+	if (written > 0)
+		return generic_write_sync(iocb, written) ?: written;
+	return err;
 }
 
 /*

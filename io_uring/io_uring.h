@@ -616,6 +616,24 @@ static inline bool io_dma_pending(struct io_ring_ctx *ctx)
 }
 bool io_dma_cq_wait_poll(struct io_ring_ctx *ctx, struct io_wait_queue *iowq,
 			 ktime_t deadline);
+/* Filemap DMA-write gate and result accounting. See io_uring/dma.c. */
+enum {
+	IO_DMA_FMW_ENGAGED,
+	IO_DMA_FMW_UNSUPPORTED,	/* no FOP_DMA_WRITE, or no write_begin/end */
+	IO_DMA_FMW_NOT_BVEC,
+	IO_DMA_FMW_DIRECT,
+	IO_DMA_FMW_NO_DMA_ADDRS,
+	IO_DMA_FMW_EAGAIN,	/* CPU fallbacks, prep failures, CPU chunks */
+	IO_DMA_FMW_CPU_REDO,	/* idempotent CPU re-copy after a DMA error,
+				 * or of a folio not handed to the device in full
+				 */
+	IO_DMA_FMW_ERROR,
+	IO_DMA_FMW_FS_DECLINE,	/* ->dma_copy_checks declined, also eagain */
+	IO_DMA_FMW_NR,
+};
+void io_dma_fmw_record(unsigned int reason);
+ssize_t io_dma_filemap_write(struct io_kiocb *req, struct kiocb *iocb,
+			     struct iov_iter *from, u64 src_user_addr);
 extern unsigned int io_dma_stripe_chans;
 int kiocb_done(struct io_kiocb *req, ssize_t ret, struct io_br_sel *sel, unsigned int issue_flags);
 void io_submit_flush_completions(struct io_ring_ctx *ctx);

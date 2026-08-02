@@ -304,7 +304,9 @@ static ssize_t ext4_write_checks(struct kiocb *iocb, struct iov_iter *from)
  * ext4_file_read_iter() or ext4_file_write_iter(). This runs the checks
  * they would have run first: the shutdown test for both directions, and
  * for a write the immutable test, the bitmap-format size limit and the
- * zeroing of the old last block on a write past EOF.
+ * zeroing of the old last block on a write past EOF. A write whose
+ * write_begin would open a journal handle is declined before the write
+ * checks run.
  */
 static ssize_t ext4_dma_copy_checks(struct kiocb *iocb, struct iov_iter *iter,
 				    int rw)
@@ -315,6 +317,17 @@ static ssize_t ext4_dma_copy_checks(struct kiocb *iocb, struct iov_iter *iter,
 		return -EIO;
 	if (rw == READ)
 		return 0;
+	/*
+	 * The offload cannot batch a write_begin that opens a journal
+	 * handle. It copies such a chunk with the CPU once the chunk heads
+	 * a group. A write whose every write_begin would open one could
+	 * never use the offload and would only pay for its setup, so
+	 * decline it here, before the checks below, which ->write_iter
+	 * then runs once. The offload's per-chunk check catches a fallback
+	 * that starts after this test.
+	 */
+	if (ext4_write_begin_opens_handle(inode))
+		return -EAGAIN;
 	return ext4_write_checks(iocb, iter);
 }
 
@@ -1010,7 +1023,8 @@ const struct file_operations ext4_file_operations = {
 	.fop_flags	= FOP_MMAP_SYNC | FOP_BUFFER_RASYNC |
 			  FOP_DIO_PARALLEL_WRITE |
 			  FOP_DONTCACHE |
-			  FOP_DMA_READ,
+			  FOP_DMA_READ | FOP_DMA_WRITE |
+			  FOP_TRUNCATE_FAILED_WRITE,
 	.setlease	= generic_setlease,
 	.dma_copy_checks = ext4_dma_copy_checks,
 };

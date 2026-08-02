@@ -357,6 +357,14 @@ struct readahead_control;
 /* kiocb is a read or write operation submitted by fs/aio.c. */
 #define IOCB_AIO_RW		(1 << 22)
 #define IOCB_HAS_METADATA	(1 << 23)
+/*
+ * ->write_begin() runs while the caller holds other folios of the file
+ * locked. A filesystem that must not wait for its journal or for
+ * writeback with folios of the file locked skips such a wait, or fails
+ * the call where it cannot, and the caller retries the range with no
+ * folio held.
+ */
+#define IOCB_FOLIOS_LOCKED	(1 << 24)
 
 /* for use in trace events */
 #define TRACE_IOCB_STRINGS \
@@ -374,7 +382,8 @@ struct readahead_control;
 	{ IOCB_NOIO,		"NOIO" }, \
 	{ IOCB_ALLOC_CACHE,	"ALLOC_CACHE" }, \
 	{ IOCB_AIO_RW,		"AIO_RW" }, \
-	{ IOCB_HAS_METADATA,	"AIO_HAS_METADATA" }
+	{ IOCB_HAS_METADATA,	"AIO_HAS_METADATA" }, \
+	{ IOCB_FOLIOS_LOCKED,	"FOLIOS_LOCKED" }
 
 struct kiocb {
 	struct file		*ki_filp;
@@ -1969,7 +1978,11 @@ struct file_operations {
 	 * READ it returns 0 or an error. For WRITE it stands in for
 	 * generic_write_checks() and file_modified(): it returns the byte
 	 * count to write, 0, or an error, and may truncate the iter and
-	 * advance the position, as the write_iter prologue would.
+	 * advance the position, as the write_iter prologue would. For a
+	 * WRITE, -EAGAIN declines the offload, and the caller takes
+	 * ->write_iter instead. ->write_iter runs its own checks, so a
+	 * WRITE must decline before it changes the iter, the position or
+	 * the inode.
 	 */
 	ssize_t (*dma_copy_checks)(struct kiocb *iocb, struct iov_iter *iter,
 				   int rw);
@@ -1998,6 +2011,22 @@ struct file_operations {
  * checks it does perform first.
  */
 #define FOP_DMA_READ		((__force fop_flags_t)(1 << 8))
+/* Buffered writes may be served by the io_uring DMA copy offload, which
+ * drives ->write_begin/->write_end directly and bypasses ->write_iter.
+ * A filesystem whose write_iter checks more than generic_write_checks()
+ * provides ->dma_copy_checks. One that writes back also provides an
+ * ->error_remove_folio that takes the folio out of the page cache, as
+ * generic_error_remove_folio() does: when the device stops completing a
+ * write, the offload drops through it the folios the device may still
+ * write.
+ */
+#define FOP_DMA_WRITE		((__force fop_flags_t)(1 << 9))
+/* A ->write_begin that fails past EOF, or a ->write_end there that commits
+ * less than its length, truncates the page cache from EOF, as
+ * ext4_truncate_failed_write() does. A caller holding other folios of the
+ * file across such a call would deadlock on them.
+ */
+#define FOP_TRUNCATE_FAILED_WRITE ((__force fop_flags_t)(1 << 10))
 
 /* Wrap a directory iterator that needs exclusive inode access */
 int wrap_directory_iterator(struct file *, struct dir_context *,
