@@ -245,7 +245,7 @@ static void io_buffer_unmap(struct io_ring_ctx *ctx, struct io_mapped_ubuf *imu)
 				dma_unmap_page(imu->dma_devs[d],
 					       imu->dma_addrs_dev[d][i],
 					       imu->bvec[i].bv_len,
-					       DMA_FROM_DEVICE);
+					       DMA_BIDIRECTIONAL);
 			kvfree(imu->dma_addrs_dev[d]);
 			imu->dma_addrs_dev[d] = NULL;
 			put_device(imu->dma_devs[d]);
@@ -1009,22 +1009,25 @@ static struct io_rsrc_node *io_sqe_buffer_register(struct io_ring_ctx *ctx,
 			for (i = 0; i < nr_pages; i++) {
 				struct bio_vec *bv = &imu->bvec[i];
 
-				/* Only the bytes the bvec covers are mapped.
-				 * Adjacent buffers can share a huge folio, and
-				 * mapping the whole folio for each would expose
-				 * the neighbours' bytes to the device and, on a
-				 * non-coherent platform, put their cache lines
-				 * through every map and unmap of this buffer.
+				/* Bidirectional: read DMA writes into the
+				 * buffer, write DMA reads from it. Only the
+				 * bytes the bvec covers are mapped. Adjacent
+				 * buffers can share a huge folio, and mapping
+				 * the whole folio for each would expose the
+				 * neighbours' bytes to the device and, on a
+				 * non-coherent platform, put their cache
+				 * lines through every map and unmap of this
+				 * buffer.
 				 */
 				addrs[i] = dma_map_page(dev, bv->bv_page,
 							bv->bv_offset,
 							bv->bv_len,
-							DMA_FROM_DEVICE);
+							DMA_BIDIRECTIONAL);
 				if (dma_mapping_error(dev, addrs[i])) {
 					while (i-- > 0)
 						dma_unmap_page(dev, addrs[i],
 							imu->bvec[i].bv_len,
-							DMA_FROM_DEVICE);
+							DMA_BIDIRECTIONAL);
 					kvfree(addrs);
 					addrs = NULL;
 					break;

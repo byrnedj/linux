@@ -2001,6 +2001,12 @@ struct file_operations {
  * checks it does perform first.
  */
 #define FOP_DMA_READ		((__force fop_flags_t)(1 << 8))
+/* Buffered writes may be served by the io_uring DMA copy offload, which
+ * drives ->write_begin/->write_end directly and bypasses ->write_iter.
+ * A filesystem whose write_iter checks more than generic_write_checks()
+ * provides ->dma_copy_checks.
+ */
+#define FOP_DMA_WRITE		((__force fop_flags_t)(1 << 9))
 
 /* Wrap a directory iterator that needs exclusive inode access */
 int wrap_directory_iterator(struct file *, struct dir_context *,
