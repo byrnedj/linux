@@ -608,6 +608,21 @@ static inline bool io_dma_pending(struct io_ring_ctx *ctx)
 	       READ_ONCE(ctx->dma.poll_list) != NULL;
 }
 bool io_dma_cq_wait_poll(struct io_ring_ctx *ctx, struct io_wait_queue *iowq);
+/* Filemap DMA-write gate and result accounting. See io_uring/dma.c. */
+enum {
+	IO_DMA_FMW_ENGAGED,
+	IO_DMA_FMW_NO_AOPS,	/* fs has no write_begin/end (e.g. XFS iomap) */
+	IO_DMA_FMW_NOT_BVEC,
+	IO_DMA_FMW_DIRECT,
+	IO_DMA_FMW_NO_DMA_ADDRS,
+	IO_DMA_FMW_EAGAIN,
+	IO_DMA_FMW_CPU_REDO,	/* DMA timeout or error, idempotent CPU re-copy */
+	IO_DMA_FMW_ERROR,
+	IO_DMA_FMW_NR,
+};
+void io_dma_fmw_record(unsigned int reason);
+ssize_t io_dma_filemap_write(struct io_kiocb *req, struct kiocb *iocb,
+			     struct iov_iter *from, u64 src_user_addr);
 int kiocb_done(struct io_kiocb *req, ssize_t ret, struct io_br_sel *sel, unsigned int issue_flags);
 void io_submit_flush_completions(struct io_ring_ctx *ctx);
 
