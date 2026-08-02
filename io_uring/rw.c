@@ -1244,7 +1244,43 @@ int io_write(struct io_kiocb *req, unsigned int issue_flags)
 		return -EAGAIN;
 	kiocb->ki_flags |= IOCB_WRITE;
 
-	if (likely(req->file->f_op->write_iter))
+	/* DMA-offloaded buffered write for registered buffers. Only in the
+	 * blocking (io-wq) pass -- buffered regular-file writes always punt
+	 * there -- so io_dma_filemap_write() may sleep. Falls back to the
+	 * normal path on -EAGAIN; every reason is counted (debugfs
+	 * "filemap_write:" section). */
+	ret2 = -EAGAIN;
+	if (!force_nonblock && !IS_ERR_OR_NULL(req->ctx->dma.chan) &&
+	    (req->flags & REQ_F_ISREG) &&
+	    (req->flags & REQ_F_BUF_NODE) && req->buf_node) {
+		const struct address_space_operations *aops =
+			req->file->f_mapping->a_ops;
+
+		if (!req->buf_node->buf->dma_addrs) {
+			io_dma_fmw_record(IO_DMA_FMW_NO_DMA_ADDRS);
+		} else if (!iov_iter_is_bvec(&io->iter)) {
+			io_dma_fmw_record(IO_DMA_FMW_NOT_BVEC);
+		} else if (kiocb->ki_flags & IOCB_DIRECT) {
+			io_dma_fmw_record(IO_DMA_FMW_DIRECT);
+		} else if (!aops->write_begin || !aops->write_end) {
+			/* iomap filesystems (XFS) take the normal path */
+			io_dma_fmw_record(IO_DMA_FMW_NO_AOPS);
+		} else {
+			/* Same reissue rule as the read path: the source
+			 * registered-buffer base must track the iter. */
+			ret2 = io_dma_filemap_write(req, kiocb, &io->iter,
+						    rw->addr + io->bytes_done);
+			if (ret2 > 0)
+				io_dma_fmw_record(IO_DMA_FMW_ENGAGED);
+			else if (ret2 == -EAGAIN)
+				io_dma_fmw_record(IO_DMA_FMW_EAGAIN);
+			else if (ret2 < 0)
+				io_dma_fmw_record(IO_DMA_FMW_ERROR);
+		}
+	}
+	if (ret2 != -EAGAIN) {
+		/* handled by the DMA path (incl. short writes and errors) */
+	} else if (likely(req->file->f_op->write_iter))
 		ret2 = req->file->f_op->write_iter(kiocb, &io->iter);
 	else if (req->file->f_op->write)
 		ret2 = loop_rw_iter(WRITE, rw, &io->iter);

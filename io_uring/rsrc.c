@@ -227,7 +227,7 @@ static void io_buffer_unmap(struct io_ring_ctx *ctx, struct io_mapped_ubuf *imu)
 		for (i = 0; i < imu->nr_bvecs; i++)
 			dma_unmap_page(imu->dma_dev, imu->dma_addrs[i],
 				       1UL << imu->folio_shift,
-				       DMA_FROM_DEVICE);
+				       DMA_BIDIRECTIONAL);
 		kvfree(imu->dma_addrs);
 		imu->dma_addrs = NULL;
 	}
@@ -960,15 +960,19 @@ static struct io_rsrc_node *io_sqe_buffer_register(struct io_ring_ctx *ctx,
 		}
 		imu->dma_dev = dev;
 		for (i = 0; i < nr_pages; i++) {
+			/* BIDIRECTIONAL: recv/filemap-read DMA writes INTO the
+			 * buffer; filemap-write DMA reads FROM it. A
+			 * FROM_DEVICE-only IOMMU entry would fault device
+			 * reads (no read permission in the IOVA entry). */
 			imu->dma_addrs[i] = dma_map_page(dev,
 					imu->bvec[i].bv_page, 0,
 					1UL << imu->folio_shift,
-					DMA_FROM_DEVICE);
+					DMA_BIDIRECTIONAL);
 			if (dma_mapping_error(dev, imu->dma_addrs[i])) {
 				while (i-- > 0)
 					dma_unmap_page(dev, imu->dma_addrs[i],
 						       1UL << imu->folio_shift,
-						       DMA_FROM_DEVICE);
+						       DMA_BIDIRECTIONAL);
 				kvfree(imu->dma_addrs);
 				imu->dma_addrs = NULL;
 				imu->dma_dev = NULL;
