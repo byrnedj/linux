@@ -2,6 +2,7 @@
 
 #include <linux/io_uring_types.h>
 #include <linux/io_uring.h>
+#include <linux/delay.h>
 #include <linux/uio.h>
 #include <linux/dma-mapping.h>
 #include <linux/spinlock.h>
@@ -1973,23 +1974,37 @@ struct io_dma_fmw_folio {
  * Poll every outstanding cookie to completion.  Sets *redo on any
  * DMA_ERROR.  Returns 0, or -ETIMEDOUT with cookies possibly still in
  * flight (the caller must treat every dst as poisoned).
+ *
+ * Spin only briefly: DSA transfers normally complete in single-digit
+ * microseconds, but under contention (many rings sharing the WQ
+ * descriptor pools) completion can take milliseconds -- and hundreds of
+ * io-wq workers busy-polling here saturated whole sockets and starved
+ * application heartbeats at O(100) shared rings.  Back off to sleeping
+ * once the fast path misses.
  */
 static int io_dma_fmw_wait(struct dma_chan *chan, dma_cookie_t *cookies,
 			   unsigned int *nr, bool *redo)
 {
 	unsigned long deadline = jiffies + msecs_to_jiffies(IO_DMA_FMW_WAIT_MS);
-	unsigned int i;
+	unsigned int i, spins;
 
 	for (i = 0; i < *nr; i++) {
 		enum dma_status st;
 
+		spins = 0;
 		while ((st = dmaengine_async_is_tx_complete(chan, cookies[i]))
 		       == DMA_IN_PROGRESS) {
 			if (time_after(jiffies, deadline)) {
 				*nr = 0;
 				return -ETIMEDOUT;
 			}
-			cond_resched();
+			spins++;
+			if (spins < 64)
+				cpu_relax();
+			else if (spins < 256)
+				cond_resched();
+			else
+				usleep_range(50, 150);
 		}
 		if (st != DMA_COMPLETE)
 			*redo = true;
@@ -2015,6 +2030,8 @@ ssize_t io_dma_filemap_write(struct io_kiocb *req, struct kiocb *iocb,
 	unsigned int nr_fol = 0, nr_cookies = 0, max_fol, max_cookies, i;
 	ssize_t want, written = 0, err = 0;
 	bool redo = false;
+	bool surrendered = false;
+	unsigned int prep_fails = 0;
 	int wedged = 0;
 
 	inode_lock(inode);
@@ -2061,6 +2078,16 @@ ssize_t io_dma_filemap_write(struct io_kiocb *req, struct kiocb *iocb,
 		offset = offset_in_folio(folio, pos);
 		bytes = min_t(size_t, bytes, folio_size(folio) - offset);
 
+		if (surrendered) {
+			/* Sustained descriptor exhaustion: stop touching the
+			 * DMA engine for the rest of this write and let the
+			 * CPU-redo pass commit everything. Beats paying a
+			 * drain-wait per chunk while dozens of other rings
+			 * hold the pools empty. */
+			dst_dma = 0;
+			redo = true;
+			goto record;
+		}
 		if (ctx->dma.use_phys_addrs) {
 			dst_dma = 0;
 		} else {
@@ -2113,6 +2140,13 @@ ssize_t io_dma_filemap_write(struct io_kiocb *req, struct kiocb *iocb,
 			if (!tx) {
 				io_dma_fmw_record(IO_DMA_FMW_EAGAIN);
 				redo = true;
+				/* Two drain-and-retry failures in one write
+				 * means the pools are held empty by other
+				 * rings: surrender the remainder to CPU. */
+				if (++prep_fails >= 2) {
+					surrendered = true;
+					break;	/* redo covers this chunk */
+				}
 			} else {
 				ck = dmaengine_submit(tx);
 				if (dma_submit_error(ck))
