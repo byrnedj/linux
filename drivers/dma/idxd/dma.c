@@ -364,6 +364,23 @@ static void idxd_dmaengine_drv_remove(struct idxd_dev *idxd_dev)
 
 	mutex_lock(&wq->wq_lock);
 	__idxd_wq_quiesce(wq);
+	if (wq->idxd_chan && wq->idxd_chan->chan.client_count) {
+		/*
+		 * Live clients such as io_uring rings hold pointers into
+		 * the channel and poll wq->descs. Freeing any of that
+		 * state here is a use-after-free. This can happen when a
+		 * device HALT's FLR recovery unbinds the driver under
+		 * load. Therefore we leak the wq's dmaengine state
+		 * instead. Submissions already fail cleanly through the
+		 * device and wq state checks and clients fall back to
+		 * CPU copies.
+		 */
+		dev_warn(&wq->idxd->pdev->dev,
+			 "wq %d unbound with live DMA clients; leaking channel state\n",
+			 wq->id);
+		mutex_unlock(&wq->wq_lock);
+		return;
+	}
 	idxd_unregister_dma_channel(wq);
 	idxd_drv_disable_wq(wq);
 	mutex_unlock(&wq->wq_lock);
