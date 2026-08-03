@@ -1725,6 +1725,19 @@ static int iaa_crypto_probe(struct idxd_dev *idxd_dev)
 		return -EBUSY;
 	}
 
+	/*
+	 * Checked before the type is written: the error path below resets
+	 * it, and the leaked state of a queue unbound from dmaengine with
+	 * live clients is torn down by type.
+	 */
+	if (wq->deferred_unbind) {
+		dev_warn(dev, "wq %d.%d still has DMA clients from before its unbind, retry once they have released it\n",
+			 idxd->id, wq->id);
+		idxd->cmd_status = IDXD_SCMD_WQ_ENABLED;
+		mutex_unlock(&wq->wq_lock);
+		return -EBUSY;
+	}
+
 	if (!idxd_wq_driver_name_match(wq, dev)) {
 		dev_dbg(dev, "wq %d.%d driver_name match failed: wq driver_name %s, dev driver name %s\n",
 			idxd->id, wq->id, wq->driver_name, dev->driver->name);

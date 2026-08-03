@@ -224,6 +224,21 @@ struct idxd_wq {
 	struct idxd_desc **descs;
 	struct sbitmap_queue sbq;
 	struct idxd_dma_chan *idxd_chan;
+	struct idxd_dma_chan *leaked_chan;	/* orphaned at unbind, held by
+						 * clients; reclaimed by the
+						 * deferred work
+						 */
+	bool deferred_unbind;	/* unbound with live DMA clients; finish
+				 * the teardown when the last one leaves
+				 */
+	bool unbind_drained;	/* that unbind drained the queue: what is
+				 * still outstanding will never complete
+				 */
+	struct work_struct deferred_unbind_work;
+	bool dead;		/* device resources released under live
+				 * clients; read under RCU before the
+				 * completion records or batches are touched
+				 */
 	char name[WQ_NAME_SIZE + 1];
 	u64 max_xfer_bytes;
 	u32 max_batch_size;
@@ -234,6 +249,16 @@ struct idxd_wq {
 	struct xarray upasid_xa;
 
 	char driver_name[DRIVER_NAME_SIZE + 1];
+
+	/*
+	 * The completion of the driver that enabled the queue, kept with the
+	 * descriptors. They are completed through it rather than through the
+	 * driver pointer, which an unbind with live clients clears while the
+	 * queue keeps its interrupt.
+	 */
+	void (*desc_complete)(struct idxd_desc *desc,
+			      enum idxd_complete_type comp_type,
+			      bool free_desc, void *ctx, u32 *status);
 };
 
 struct idxd_engine {
@@ -551,6 +576,7 @@ static inline void idxd_set_user_intr(struct idxd_device *idxd, bool enable)
 extern const struct bus_type dsa_bus_type;
 
 extern bool support_enqcmd;
+extern struct workqueue_struct *idxd_deferred_wq;
 extern struct ida idxd_ida;
 extern const struct device_type dsa_device_type;
 extern const struct device_type iax_device_type;
@@ -763,13 +789,17 @@ static inline void idxd_desc_complete(struct idxd_desc *desc,
 				      enum idxd_complete_type comp_type,
 				      bool free_desc)
 {
-	struct idxd_device_driver *drv;
+	struct idxd_wq *wq = desc->wq;
+	typeof(wq->desc_complete) complete;
 	u32 status;
 
-	drv = wq_to_idxd_drv(desc->wq);
-	if (drv->desc_complete)
-		drv->desc_complete(desc, comp_type, free_desc,
-				   &desc->txd, &status);
+	/*
+	 * Read once: the resubmit worker and the revoke's abort run without
+	 * wq_lock, unordered against the teardown that clears the copy.
+	 */
+	complete = READ_ONCE(wq->desc_complete);
+	if (complete)
+		complete(desc, comp_type, free_desc, &desc->txd, &status);
 }
 
 int idxd_register_devices(struct idxd_device *idxd);
@@ -809,6 +839,8 @@ int idxd_device_release_int_handle(struct idxd_device *idxd, int handle,
 void idxd_wqs_unmap_portal(struct idxd_device *idxd);
 int idxd_wq_alloc_resources(struct idxd_wq *wq);
 void idxd_wq_free_resources(struct idxd_wq *wq);
+void idxd_wq_leaked_release(struct idxd_wq *wq);
+void idxd_wq_leaked_reclaim(struct idxd_wq *wq);
 int idxd_wq_enable(struct idxd_wq *wq);
 int idxd_wq_disable(struct idxd_wq *wq, bool reset_config);
 void idxd_wq_drain(struct idxd_wq *wq);

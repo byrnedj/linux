@@ -428,6 +428,13 @@ static void dma_device_release(struct kref *ref)
 
 	list_del_rcu(&device->global_node);
 	dma_channel_rebalance();
+	/*
+	 * The id is released with the last reference rather than at
+	 * unregister: a channel orphaned to its clients keeps the device's
+	 * reference and its sysfs name, so a provider that re-registers
+	 * meanwhile must not be given the same id and collide with it.
+	 */
+	ida_free(&dma_ida, device->dev_id);
 
 	if (device->device_release)
 		device->device_release(device);
@@ -1205,6 +1212,98 @@ void dma_async_device_channel_unregister(struct dma_device *device,
 EXPORT_SYMBOL_GPL(dma_async_device_channel_unregister);
 
 /**
+ * dma_async_device_channel_orphan - unregister a channel, or detach it
+ *	from its device while clients still hold it
+ * @device: the dmaengine device
+ * @chan: the channel
+ *
+ * Clients take references through dma_chan_get(), which runs under
+ * dma_list_mutex. A channel that no client holds is unregistered, with
+ * the reference check, the removal from the device's channel list and
+ * the visibility teardown under one hold of that mutex, so a concurrent
+ * channel request either completes first or finds the channel gone. A
+ * channel that clients hold is taken off the device's channel list
+ * under the same hold of the mutex and a device reference is taken for
+ * it. A later dma_async_device_unregister() then leaves the channel and
+ * its state to the clients, which keep using chan->dev and
+ * chan->device, and no new client can find it. When the last client
+ * has released it the driver reclaims it with
+ * dma_async_device_channel_reclaim().
+ *
+ * Only a DMA_PRIVATE device may orphan channels. The client count of a
+ * public channel includes the references taken for the dmaengine_get()
+ * users, which dmaengine_put() drops by walking the device's channel
+ * list, so an orphaned public channel would never lose its last client.
+ *
+ * Return: 0 when the channel was unregistered, -EBUSY when clients hold
+ * it and it was orphaned instead, -EINVAL when @device is not
+ * DMA_PRIVATE and the channel was left as it was.
+ */
+int dma_async_device_channel_orphan(struct dma_device *device,
+				    struct dma_chan *chan)
+{
+	if (chan->local == NULL)
+		return 0;
+	if (WARN_ON_ONCE(!dma_has_cap(DMA_PRIVATE, device->cap_mask)))
+		return -EINVAL;
+
+	mutex_lock(&dma_list_mutex);
+	if (chan->client_count) {
+		list_del_init(&chan->device_node);
+		kref_get(&device->ref);
+		mutex_unlock(&dma_list_mutex);
+		return -EBUSY;
+	}
+	device->chancnt--;
+	chan->dev->chan = NULL;
+	list_del(&chan->device_node);
+	mutex_unlock(&dma_list_mutex);
+
+	ida_free(&device->chan_ida, chan->chan_id);
+	device_unregister(&chan->dev->device);
+	free_percpu(chan->local);
+	chan->local = NULL;
+	dma_channel_rebalance();
+	return 0;
+}
+EXPORT_SYMBOL_GPL(dma_async_device_channel_orphan);
+
+/**
+ * dma_async_device_channel_reclaim - free an orphaned channel's state
+ * @chan: a channel orphaned by dma_async_device_channel_orphan()
+ *
+ * To be called once the channel's last client has released it, which
+ * the driver learns from its device_free_chan_resources callback. Works
+ * through chan->device, which the orphan's reference keeps alive even
+ * after the device was unregistered, and drops that reference last.
+ */
+void dma_async_device_channel_reclaim(struct dma_chan *chan)
+{
+	struct dma_device *device = chan->device;
+
+	if (chan->local == NULL)
+		return;
+
+	mutex_lock(&dma_list_mutex);
+	WARN_ONCE(chan->client_count,
+		  "%s called while %d clients hold a reference\n",
+		  __func__, chan->client_count);
+	device->chancnt--;
+	chan->dev->chan = NULL;
+	mutex_unlock(&dma_list_mutex);
+
+	ida_free(&device->chan_ida, chan->chan_id);
+	device_unregister(&chan->dev->device);
+	free_percpu(chan->local);
+	chan->local = NULL;
+
+	mutex_lock(&dma_list_mutex);
+	dma_device_put(device);
+	mutex_unlock(&dma_list_mutex);
+}
+EXPORT_SYMBOL_GPL(dma_async_device_channel_reclaim);
+
+/**
  * dma_async_device_register - registers DMA devices found
  * @device:	pointer to &struct dma_device
  *
@@ -1357,7 +1456,6 @@ void dma_async_device_unregister(struct dma_device *device)
 	 */
 	dma_cap_set(DMA_PRIVATE, device->cap_mask);
 	dma_channel_rebalance();
-	ida_free(&dma_ida, device->dev_id);
 	dma_device_put(device);
 	mutex_unlock(&dma_list_mutex);
 }

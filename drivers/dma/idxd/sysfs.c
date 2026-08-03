@@ -904,8 +904,18 @@ static ssize_t wq_type_store(struct device *dev,
 	struct idxd_wq *wq = confdev_to_wq(dev);
 	enum idxd_wq_type old_type;
 
+	/* The deferred teardown reads the type under wq_lock. */
+	guard(mutex)(&wq->wq_lock);
 	if (wq->state != IDXD_WQ_DISABLED)
 		return -EPERM;
+
+	/*
+	 * A queue unbound with live DMA clients reads disabled once a halt
+	 * or a device disable has run, and its leaked state is torn down by
+	 * type when the last client releases it.
+	 */
+	if (wq->deferred_unbind)
+		return -EBUSY;
 
 	old_type = wq->type;
 	if (sysfs_streq(buf, idxd_wq_type_names[IDXD_WQT_NONE]))
