@@ -711,9 +711,29 @@ err:
 static void idxd_dmaengine_drv_remove(struct idxd_dev *idxd_dev)
 {
 	struct idxd_wq *wq = idxd_dev_to_wq(idxd_dev);
+	int i;
 
 	mutex_lock(&wq->wq_lock);
 	__idxd_wq_quiesce(wq);
+	for (i = 0; i < wq->chan_count && wq->ichans; i++) {
+		if (wq->ichans[i].chan.client_count) {
+			/*
+			 * Live clients (e.g. io_uring rings) hold pointers
+			 * into ichans and poll wq->descs; freeing any of it
+			 * here is a use-after-free -- observed as a
+			 * dma_map_phys oops on a garbage dev pointer when a
+			 * device HALT's FLR recovery unbound this driver
+			 * under load. Leak the wq's dmaengine state instead:
+			 * submissions already fail cleanly via device/wq
+			 * state checks and clients fall back to CPU copies.
+			 */
+			dev_warn(&wq->idxd->pdev->dev,
+				 "wq %d unbound with live DMA clients; leaking channel state\n",
+				 wq->id);
+			mutex_unlock(&wq->wq_lock);
+			return;
+		}
+	}
 	idxd_release_dma_channels(wq);
 	idxd_drv_disable_wq(wq);
 	mutex_unlock(&wq->wq_lock);
