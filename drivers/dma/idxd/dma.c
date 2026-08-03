@@ -312,6 +312,11 @@ static void idxd_dma_free_chan_resources(struct dma_chan *chan)
 	idxd_wq_put(wq);
 	dev_dbg(dev, "%s: client_count: %d\n", __func__,
 		idxd_wq_refcount(wq));
+	/* The core calls this when the last client releases the channel,
+	 * which is the first point a deferred unbind can complete.
+	 */
+	if (READ_ONCE(wq->deferred_unbind))
+		queue_work(system_long_wq, &wq->deferred_unbind_work);
 }
 
 /*
@@ -394,11 +399,16 @@ static enum dma_status idxd_dma_tx_status(struct dma_chan *dma_chan,
 	 * The descriptor is genuinely outstanding. A polled descriptor
 	 * carries no interrupt, so nothing but this function will ever
 	 * retire it, and a work queue or device that is no longer enabled
-	 * will not complete it either. Report the failure instead of
-	 * leaving the caller polling forever.
+	 * will not complete it either. The same holds for a quiesced
+	 * queue: an unbind with live clients kills wq_active and leaks
+	 * the state with wq->state still reading enabled, and a
+	 * descriptor caught in that window never gets a completion
+	 * record. Report the failure instead of leaving the caller
+	 * polling forever.
 	 */
 	if (wq->state != IDXD_WQ_ENABLED ||
-	    wq->idxd->state != IDXD_DEV_ENABLED)
+	    wq->idxd->state != IDXD_DEV_ENABLED ||
+	    percpu_ref_is_dying(&wq->wq_active))
 		return DMA_ERROR;
 
 	return DMA_IN_PROGRESS;
@@ -556,18 +566,6 @@ static int idxd_register_dma_channel(struct idxd_wq *wq)
 	return 0;
 }
 
-static void idxd_unregister_dma_channel(struct idxd_wq *wq)
-{
-	struct idxd_dma_chan *idxd_chan = wq->idxd_chan;
-	struct dma_chan *chan = &idxd_chan->chan;
-	struct idxd_dma_dev *idxd_dma = wq->idxd->idxd_dma;
-
-	dma_async_device_channel_unregister(&idxd_dma->dma, chan);
-	list_del(&chan->device_node);
-	kfree(wq->idxd_chan);
-	wq->idxd_chan = NULL;
-	put_device(wq_confdev(wq));
-}
 
 static int idxd_dmaengine_drv_probe(struct idxd_dev *idxd_dev)
 {
@@ -614,13 +612,87 @@ err:
 	return rc;
 }
 
+/*
+ * Finish a teardown that remove() could not complete because clients
+ * still held the channel. Runs after the last client's release, off a
+ * system workqueue since the release path holds dma_list_mutex and the
+ * unregister helper takes it. A client acquiring the channel between
+ * the release and this work makes the unregister fail with -EBUSY
+ * again, the flag stays set, and that client's own release requeues
+ * the work, so the queue recovers after whichever release turns out to
+ * be the last. The confdev reference that remove() deliberately kept
+ * holds the wq alive until this completes.
+ */
+static void idxd_dma_deferred_unbind_work(struct work_struct *work)
+{
+	struct idxd_wq *wq = container_of(work, struct idxd_wq,
+					  deferred_unbind_work);
+
+	mutex_lock(&wq->wq_lock);
+	if (!wq->deferred_unbind) {
+		mutex_unlock(&wq->wq_lock);
+		return;
+	}
+	if (wq->idxd_chan &&
+	    dma_async_device_channel_unregister_if_unused(
+			&wq->idxd->idxd_dma->dma, &wq->idxd_chan->chan)) {
+		/* A new client raced in; its release tries again. */
+		mutex_unlock(&wq->wq_lock);
+		return;
+	}
+	wq->deferred_unbind = false;
+	dev_info(&wq->idxd->pdev->dev,
+		 "wq %d: leaked channel state reclaimed, disabling\n",
+		 wq->id);
+	if (wq->idxd_chan) {
+		kfree(wq->idxd_chan);
+		wq->idxd_chan = NULL;
+		put_device(wq_confdev(wq));
+	}
+	idxd_drv_disable_wq(wq);
+	mutex_unlock(&wq->wq_lock);
+}
+
 static void idxd_dmaengine_drv_remove(struct idxd_dev *idxd_dev)
 {
 	struct idxd_wq *wq = idxd_dev_to_wq(idxd_dev);
 
 	mutex_lock(&wq->wq_lock);
 	__idxd_wq_quiesce(wq);
-	idxd_unregister_dma_channel(wq);
+	if (wq->idxd_chan &&
+	    dma_async_device_channel_unregister_if_unused(
+			&wq->idxd->idxd_dma->dma, &wq->idxd_chan->chan)) {
+		/*
+		 * Live clients such as io_uring rings hold pointers into
+		 * the channel and poll wq->descs. Freeing any of that
+		 * state here is a use-after-free. This can happen when a
+		 * device HALT's FLR recovery unbinds the driver under
+		 * load. The reference check and the channel unregister
+		 * run atomically under dma_list_mutex, so a client
+		 * acquiring the channel concurrently either makes this
+		 * unregister fail or finds the channel already gone.
+		 * On failure we leak the wq's dmaengine state instead.
+		 * Submissions already fail cleanly through the killed
+		 * wq_active percpu ref and clients fall back to CPU
+		 * copies.
+		 */
+		dev_warn(&wq->idxd->pdev->dev,
+			 "wq %d unbound with live DMA clients; leaking channel state\n",
+			 wq->id);
+		/* Recover once they leave: the channel release path sees
+		 * this and queues the deferred teardown.
+		 */
+		INIT_WORK(&wq->deferred_unbind_work,
+			  idxd_dma_deferred_unbind_work);
+		WRITE_ONCE(wq->deferred_unbind, true);
+		mutex_unlock(&wq->wq_lock);
+		return;
+	}
+	if (wq->idxd_chan) {
+		kfree(wq->idxd_chan);
+		wq->idxd_chan = NULL;
+		put_device(wq_confdev(wq));
+	}
 	idxd_drv_disable_wq(wq);
 	mutex_unlock(&wq->wq_lock);
 }
