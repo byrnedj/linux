@@ -233,20 +233,78 @@ int idxd_wq_alloc_resources(struct idxd_wq *wq)
 }
 EXPORT_SYMBOL_NS_GPL(idxd_wq_alloc_resources, "IDXD");
 
-void idxd_wq_free_resources(struct idxd_wq *wq)
+/* The memory the device reads and writes: completion records and batches. */
+static void idxd_wq_free_device_resources(struct idxd_wq *wq)
 {
 	struct device *dev = &wq->idxd->pdev->dev;
+	int i;
 
-	if (wq->type != IDXD_WQT_KERNEL)
-		return;
+	for (i = 0; i < wq->num_descs; i++) {
+		free_desc_batch(wq, wq->descs[i]);
+		wq->descs[i]->batch = NULL;
+	}
+	dma_free_coherent(dev, wq->compls_size, wq->compls, wq->compls_addr);
+	wq->compls = NULL;
+}
 
+/* The memory the clients reach: the descriptor arrays and the allocator. */
+static void idxd_wq_free_client_resources(struct idxd_wq *wq)
+{
 	free_hw_descs(wq);
 	free_descs(wq);
-	dma_free_coherent(dev, wq->compls_size, wq->compls, wq->compls_addr);
 	sbitmap_queue_free(&wq->sbq);
 	wq->type = IDXD_WQT_NONE;
 }
+
+void idxd_wq_free_resources(struct idxd_wq *wq)
+{
+	if (wq->type != IDXD_WQT_KERNEL)
+		return;
+
+	idxd_wq_free_device_resources(wq);
+	idxd_wq_free_client_resources(wq);
+}
 EXPORT_SYMBOL_NS_GPL(idxd_wq_free_resources, "IDXD");
+
+/*
+ * Release what a work queue unbound with live DMA clients still holds of
+ * its device: the portal, the interrupt and the memory the device reads
+ * and writes. The device has been disabled or reset, so nothing in
+ * flight can complete. The clients learn of it through wq->dead, which
+ * tx_status and the prep paths read under RCU before they touch that
+ * memory, and the synchronize_rcu() here orders the flag before the
+ * free. What the clients can still reach, the descriptor arrays and the
+ * allocator, stays until the last of them releases the channel and
+ * idxd_wq_leaked_reclaim() runs.
+ */
+void idxd_wq_leaked_release(struct idxd_wq *wq)
+{
+	lockdep_assert_held(&wq->wq_lock);
+
+	if (wq->dead || wq->type != IDXD_WQT_KERNEL)
+		return;
+	idxd_wq_unmap_portal(wq);
+	/* The disable or reset revoked every interrupt handle. */
+	WRITE_ONCE(wq->ie.int_handle, INVALID_INT_HANDLE);
+	idxd_wq_free_irq(wq);
+	WRITE_ONCE(wq->dead, true);
+	/* Every reader that saw the queue alive has left the memory. */
+	synchronize_rcu();
+	idxd_wq_free_device_resources(wq);
+	clear_bit(wq->id, wq->idxd->wq_enable_map);
+	wq->state = IDXD_WQ_DISABLED;
+}
+
+/* The last client of a dead queue has released its channel. */
+void idxd_wq_leaked_reclaim(struct idxd_wq *wq)
+{
+	lockdep_assert_held(&wq->wq_lock);
+
+	idxd_wq_free_client_resources(wq);
+	percpu_ref_exit(&wq->wq_active);
+	wq->client_count = 0;
+	wq->dead = false;
+}
 
 int idxd_wq_enable(struct idxd_wq *wq)
 {
@@ -1489,6 +1547,19 @@ int idxd_drv_enable_wq(struct idxd_wq *wq)
 		goto err;
 	}
 
+	/*
+	 * The queue's descriptor arrays and allocator still serve the DMA
+	 * clients of its previous binding. A fresh allocation here would
+	 * leave them polling a new array for their old cookies.
+	 */
+	if (wq->deferred_unbind) {
+		dev_warn(dev, "wq %d still has DMA clients from before its unbind, retry once they have released it\n",
+			 wq->id);
+		idxd->cmd_status = IDXD_SCMD_WQ_ENABLED;
+		rc = -EBUSY;
+		goto err;
+	}
+
 	if (wq->state != IDXD_WQ_DISABLED) {
 		dev_dbg(dev, "wq %d already enabled.\n", wq->id);
 		idxd->cmd_status = IDXD_SCMD_WQ_ENABLED;
@@ -1702,6 +1773,20 @@ void idxd_device_drv_remove(struct idxd_dev *idxd_dev)
 	idxd_device_disable(idxd);
 	if (test_bit(IDXD_FLAG_CONFIGURABLE, &idxd->flags))
 		idxd_device_reset(idxd);
+	/*
+	 * A queue unbound with live DMA clients kept its device resources
+	 * for them. The device is disabled now and nothing of theirs can
+	 * complete, so release those before the device goes away; the
+	 * channel state itself waits for the last client.
+	 */
+	for (i = 0; i < idxd->max_wqs; i++) {
+		struct idxd_wq *wq = idxd->wqs[i];
+
+		mutex_lock(&wq->wq_lock);
+		if (wq->deferred_unbind)
+			idxd_wq_leaked_release(wq);
+		mutex_unlock(&wq->wq_lock);
+	}
 	idxd_device_evl_free(idxd);
 }
 

@@ -27,6 +27,21 @@ static struct idxd_desc *__get_desc(struct idxd_wq *wq, int idx, int cpu)
 	return desc;
 }
 
+/*
+ * The completion record __get_desc() clears is device memory that
+ * idxd_wq_leaked_release() frees once the queue is dead; its
+ * synchronize_rcu() orders the flag before the free.
+ */
+static struct idxd_desc *get_desc_live(struct idxd_wq *wq, int idx, int cpu)
+{
+	guard(rcu)();
+	if (unlikely(READ_ONCE(wq->dead))) {
+		sbitmap_queue_clear(&wq->sbq, idx, cpu);
+		return ERR_PTR(-ENXIO);
+	}
+	return __get_desc(wq, idx, cpu);
+}
+
 struct idxd_desc *idxd_alloc_desc(struct idxd_wq *wq, enum idxd_op_type optype)
 {
 	int cpu, idx;
@@ -44,7 +59,7 @@ struct idxd_desc *idxd_alloc_desc(struct idxd_wq *wq, enum idxd_op_type optype)
 		if (optype == IDXD_OP_NONBLOCK)
 			return ERR_PTR(-EAGAIN);
 	} else {
-		return __get_desc(wq, idx, cpu);
+		return get_desc_live(wq, idx, cpu);
 	}
 
 	ws = &sbq->ws[0];
@@ -62,7 +77,7 @@ struct idxd_desc *idxd_alloc_desc(struct idxd_wq *wq, enum idxd_op_type optype)
 	if (idx < 0)
 		return ERR_PTR(-EAGAIN);
 
-	return __get_desc(wq, idx, cpu);
+	return get_desc_live(wq, idx, cpu);
 }
 EXPORT_SYMBOL_NS_GPL(idxd_alloc_desc, "IDXD");
 

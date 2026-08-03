@@ -1631,6 +1631,22 @@ int dma_async_device_channel_register(struct dma_device *device,
 				      const char *name);
 void dma_async_device_channel_unregister(struct dma_device *device,
 					 struct dma_chan *chan);
+int dma_async_device_channel_unregister_if_unused(struct dma_device *device,
+						  struct dma_chan *chan);
+int dma_async_device_channel_orphan(struct dma_device *device,
+				    struct dma_chan *chan);
+void dma_async_device_channel_reclaim(struct dma_chan *chan);
+
+/*
+ * True once dma_async_device_channel_orphan() has detached the channel
+ * from its device, after which its provider is gone or going. The read
+ * is unlocked, so it is a hint for a client choosing among channels it
+ * holds, not a guarantee.
+ */
+static inline bool dma_chan_orphaned(struct dma_chan *chan)
+{
+	return list_empty(&chan->device_node);
+}
 void dma_run_dependencies(struct dma_async_tx_descriptor *tx);
 #define dma_request_channel(mask, x, y) \
 	__dma_request_channel(&(mask), x, y, NULL)

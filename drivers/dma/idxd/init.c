@@ -38,6 +38,12 @@ MODULE_PARM_DESC(tc_override, "Override traffic class defaults");
 #define DRV_NAME "idxd"
 
 bool support_enqcmd;
+/*
+ * Runs the teardown a work queue could not finish at unbind because DMA
+ * clients still held its channel. It cannot be the device workqueue,
+ * since the clients may outlive the device.
+ */
+struct workqueue_struct *idxd_deferred_wq;
 DEFINE_IDA(idxd_ida);
 
 static struct idxd_driver_data idxd_driver_data[] = {
@@ -1006,7 +1012,11 @@ static void idxd_device_config_restore(struct idxd_device *idxd,
 		wq->max_batch_size = saved_wq->max_batch_size;
 		wq->enqcmds_retries = saved_wq->enqcmds_retries;
 		wq->descs = saved_wq->descs;
-		wq->idxd_chan = saved_wq->idxd_chan;
+		/*
+		 * idxd_chan is not restored: the unbind between save and
+		 * restore freed the channel, or orphaned it to its clients,
+		 * and a kernel queue is not rebound here anyway.
+		 */
 		len = strlen(saved_wq->driver_name) + 1;
 		strscpy(wq->driver_name, saved_wq->driver_name, len);
 
@@ -1321,6 +1331,10 @@ static int __init idxd_init_module(void)
 	else
 		support_enqcmd = true;
 
+	idxd_deferred_wq = alloc_workqueue("idxd-deferred", WQ_UNBOUND, 0);
+	if (!idxd_deferred_wq)
+		return -ENOMEM;
+
 	err = idxd_driver_register(&idxd_drv);
 	if (err < 0)
 		goto err_idxd_driver_register;
@@ -1358,6 +1372,7 @@ err_idxd_user_driver_register:
 err_idxd_dmaengine_driver_register:
 	idxd_driver_unregister(&idxd_drv);
 err_idxd_driver_register:
+	destroy_workqueue(idxd_deferred_wq);
 	return err;
 }
 module_init(idxd_init_module);
@@ -1368,6 +1383,8 @@ static void __exit idxd_exit_module(void)
 	idxd_driver_unregister(&idxd_dmaengine_drv);
 	idxd_driver_unregister(&idxd_drv);
 	pci_unregister_driver(&idxd_pci_driver);
+	/* Flushes the reclaims of channels whose last client has left. */
+	destroy_workqueue(idxd_deferred_wq);
 	idxd_cdev_remove();
 	idxd_remove_debugfs();
 }

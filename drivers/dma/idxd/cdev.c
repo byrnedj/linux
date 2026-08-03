@@ -604,6 +604,19 @@ static int idxd_user_drv_probe(struct idxd_dev *idxd_dev)
 
 	mutex_lock(&wq->wq_lock);
 
+	/*
+	 * Checked before the type is written: the error path below resets
+	 * it, and the leaked state of a queue unbound with live clients is
+	 * torn down by type.
+	 */
+	if (wq->deferred_unbind) {
+		dev_warn(dev, "wq %d still has DMA clients from before its unbind, retry once they have released it\n",
+			 wq->id);
+		idxd->cmd_status = IDXD_SCMD_WQ_ENABLED;
+		mutex_unlock(&wq->wq_lock);
+		return -EBUSY;
+	}
+
 	if (!idxd_wq_driver_name_match(wq, dev)) {
 		idxd->cmd_status = IDXD_SCMD_WQ_NO_DRV_NAME;
 		rc = -ENODEV;
