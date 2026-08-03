@@ -224,6 +224,14 @@ struct idxd_wq {
 	struct idxd_desc **descs;
 	struct sbitmap_queue sbq;
 	struct idxd_dma_chan *idxd_chan;
+	struct idxd_dma_chan *leaked_chan;	/* orphaned at unbind, held by
+						 * clients; reclaimed by the
+						 * deferred work
+						 */
+	bool deferred_unbind;	/* unbound with live DMA clients; finish
+				 * the teardown when the last one leaves
+				 */
+	struct work_struct deferred_unbind_work;
 	char name[WQ_NAME_SIZE + 1];
 	u64 max_xfer_bytes;
 	u32 max_batch_size;

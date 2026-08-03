@@ -1006,7 +1006,11 @@ static void idxd_device_config_restore(struct idxd_device *idxd,
 		wq->max_batch_size = saved_wq->max_batch_size;
 		wq->enqcmds_retries = saved_wq->enqcmds_retries;
 		wq->descs = saved_wq->descs;
-		wq->idxd_chan = saved_wq->idxd_chan;
+		/*
+		 * idxd_chan is not restored: the unbind between save and
+		 * restore freed the channel, or orphaned it to its clients,
+		 * and a kernel queue is not rebound here anyway.
+		 */
 		len = strlen(saved_wq->driver_name) + 1;
 		strscpy(wq->driver_name, saved_wq->driver_name, len);
 

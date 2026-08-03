@@ -1164,6 +1164,127 @@ void dma_async_device_channel_unregister(struct dma_device *device,
 EXPORT_SYMBOL_GPL(dma_async_device_channel_unregister);
 
 /**
+ * dma_async_device_channel_unregister_if_unused - unregister a channel
+ *	only when no client holds a reference
+ * @device: the dmaengine device
+ * @chan: the channel
+ *
+ * Clients take references through dma_chan_get(), which runs under
+ * dma_list_mutex. The reference check, the removal from the device's
+ * channel list, and the visibility teardown all happen under one hold
+ * of that mutex, so a concurrent channel request either completes
+ * first, which makes this function return -EBUSY, or finds the channel
+ * gone. This closes the window where a driver checks client_count and
+ * then frees channel state while a new client acquires it.
+ *
+ * Return: 0 when the channel was unregistered, -EBUSY when a client
+ * holds it.
+ */
+int dma_async_device_channel_unregister_if_unused(struct dma_device *device,
+						  struct dma_chan *chan)
+{
+	if (chan->local == NULL)
+		return 0;
+
+	mutex_lock(&dma_list_mutex);
+	if (chan->client_count) {
+		mutex_unlock(&dma_list_mutex);
+		return -EBUSY;
+	}
+	device->chancnt--;
+	chan->dev->chan = NULL;
+	list_del(&chan->device_node);
+	mutex_unlock(&dma_list_mutex);
+
+	ida_free(&device->chan_ida, chan->chan_id);
+	device_unregister(&chan->dev->device);
+	free_percpu(chan->local);
+	chan->local = NULL;
+	dma_channel_rebalance();
+	return 0;
+}
+EXPORT_SYMBOL_GPL(dma_async_device_channel_unregister_if_unused);
+
+/**
+ * dma_async_device_channel_orphan - unregister a channel, or detach it
+ *	from its device while clients still hold it
+ * @device: the dmaengine device
+ * @chan: the channel
+ *
+ * Like dma_async_device_channel_unregister_if_unused(), but a channel
+ * that clients hold is taken off the device's channel list under the
+ * same hold of dma_list_mutex and a device reference is taken for it.
+ * A later dma_async_device_unregister() then leaves the channel and its
+ * state to the clients, which keep using chan->dev and chan->device,
+ * and no new client can find it. When the last client has released it
+ * the driver reclaims it with dma_async_device_channel_reclaim().
+ *
+ * Return: 0 when the channel was unregistered, -EBUSY when clients hold
+ * it and it was orphaned instead.
+ */
+int dma_async_device_channel_orphan(struct dma_device *device,
+				    struct dma_chan *chan)
+{
+	if (chan->local == NULL)
+		return 0;
+
+	mutex_lock(&dma_list_mutex);
+	if (chan->client_count) {
+		list_del_init(&chan->device_node);
+		kref_get(&device->ref);
+		mutex_unlock(&dma_list_mutex);
+		return -EBUSY;
+	}
+	device->chancnt--;
+	chan->dev->chan = NULL;
+	list_del(&chan->device_node);
+	mutex_unlock(&dma_list_mutex);
+
+	ida_free(&device->chan_ida, chan->chan_id);
+	device_unregister(&chan->dev->device);
+	free_percpu(chan->local);
+	chan->local = NULL;
+	dma_channel_rebalance();
+	return 0;
+}
+EXPORT_SYMBOL_GPL(dma_async_device_channel_orphan);
+
+/**
+ * dma_async_device_channel_reclaim - free an orphaned channel's state
+ * @chan: a channel orphaned by dma_async_device_channel_orphan()
+ *
+ * To be called once the channel's last client has released it, which
+ * the driver learns from its device_free_chan_resources callback. Works
+ * through chan->device, which the orphan's reference keeps alive even
+ * after the device was unregistered, and drops that reference last.
+ */
+void dma_async_device_channel_reclaim(struct dma_chan *chan)
+{
+	struct dma_device *device = chan->device;
+
+	if (chan->local == NULL)
+		return;
+
+	mutex_lock(&dma_list_mutex);
+	WARN_ONCE(chan->client_count,
+		  "%s called while %d clients hold a reference\n",
+		  __func__, chan->client_count);
+	device->chancnt--;
+	chan->dev->chan = NULL;
+	mutex_unlock(&dma_list_mutex);
+
+	ida_free(&device->chan_ida, chan->chan_id);
+	device_unregister(&chan->dev->device);
+	free_percpu(chan->local);
+	chan->local = NULL;
+
+	mutex_lock(&dma_list_mutex);
+	dma_device_put(device);
+	mutex_unlock(&dma_list_mutex);
+}
+EXPORT_SYMBOL_GPL(dma_async_device_channel_reclaim);
+
+/**
  * dma_async_device_register - registers DMA devices found
  * @device:	pointer to &struct dma_device
  *
