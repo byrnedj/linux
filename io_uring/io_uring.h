@@ -590,6 +590,8 @@ void io_uring_dma_prep(struct io_kiocb *req);
 void io_dma_free_recv_kvec(struct io_kiocb *req);
 void io_dma_init_freelist(struct io_ring_ctx *ctx, struct io_uring_params *p);
 void io_dma_debugfs_init(void);
+extern unsigned int io_dma_max_clients_per_chan;
+extern unsigned int io_dma_admission_rejects;
 int io_dma_submit_queued_tasks(struct io_kiocb *req);
 void io_dma_unmap_batch(struct io_ring_ctx *ctx, struct device *dev,
 			struct io_dma_batch_entry *entries, unsigned int nr,
