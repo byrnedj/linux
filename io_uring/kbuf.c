@@ -836,16 +836,23 @@ int io_register_pbuf_ring(struct io_ring_ctx *ctx, void __user *arg)
 			goto fail;
 		}
 		if (IS_ERR_OR_NULL(ctx->dma.chan)) {
-			pr_info_ratelimited("io_uring DMA: IOU_PBUF_RING_DMA on a ring without a DMA channel (create the ring with IORING_SETUP_DMA)\n");
-			ret = -ENODEV;
-			goto fail;
-		}
-		ret = io_pbuf_dma_map(bl, ctx->dma.chan->device->dev,
-				      data_addr, data_size);
-		if (ret) {
-			pr_err("io_uring DMA: io_pbuf_dma_map failed ret=%d addr=%llx size=%llx\n",
-			       ret, data_addr, data_size);
-			goto fail;
+			/* An admission-capped ring accepts the registration
+			 * unmapped: dma_addrs stays NULL and every recv on
+			 * this buffer ring CPU-falls-back, which is the
+			 * cap's intended degradation, not a config error. */
+			if (!ctx->dma.admission_limited) {
+				pr_info_ratelimited("io_uring DMA: IOU_PBUF_RING_DMA on a ring without a DMA channel (create the ring with IORING_SETUP_DMA)\n");
+				ret = -ENODEV;
+				goto fail;
+			}
+		} else {
+			ret = io_pbuf_dma_map(bl, ctx->dma.chan->device->dev,
+					      data_addr, data_size);
+			if (ret) {
+				pr_err("io_uring DMA: io_pbuf_dma_map failed ret=%d addr=%llx size=%llx\n",
+				       ret, data_addr, data_size);
+				goto fail;
+			}
 		}
 	}
 
