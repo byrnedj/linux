@@ -321,6 +321,13 @@ struct io_dma_channel {
 	struct dma_chan		*chan;
 	bool			use_phys_addrs;
 
+	/* Ring asked for IORING_SETUP_DMA but the per-channel client cap
+	 * (io_uring_dma_max_clients_per_chan) was reached: chan stays NULL,
+	 * every offload gate falls through to the CPU path, and DMA buffer
+	 * ring registration is accepted unmapped instead of failing.
+	 */
+	bool			admission_limited;
+
 	struct work_struct	poll_work;
 	atomic_t		poll_armed;
 

@@ -168,6 +168,10 @@ static const struct file_operations io_dma_cpu_lat_fops = {
 
 void io_dma_debugfs_init(void)
 {
+	debugfs_create_u32("io_uring_dma_max_clients_per_chan", 0644, NULL,
+			   &io_dma_max_clients_per_chan);
+	debugfs_create_u32("io_uring_dma_admission_rejects", 0444, NULL,
+			   &io_dma_admission_rejects);
 	debugfs_create_u32("io_uring_dma_cq_poll_us", 0644, NULL,
 			   &io_dma_cq_poll_us);
 	debugfs_create_u32("io_uring_dma_fmw_spin_us", 0644, NULL,
