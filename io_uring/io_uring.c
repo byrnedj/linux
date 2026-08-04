@@ -2370,12 +2370,30 @@ static int io_dma_shared_cnt;
 static unsigned int io_dma_shared_rr;
 static DEFINE_MUTEX(io_dma_shared_mutex);
 
+/*
+ * Admission control: cap how many rings may share one channel (0 = no cap).
+ * Sharing is functionally unbounded but not free -- every extra ring on a
+ * WQ adds descriptor-queueing delay for all of them, and past the point
+ * where the engines are saturated an admitted ring only makes the existing
+ * clients slower.  A ring refused here still comes up, permanently on the
+ * CPU-copy path (dma.admission_limited), which is the cheaper backoff:
+ * per-submission -EAGAIN retry cycles burn the submitter, and the filemap
+ * write wait burns the poller.  Debugfs io_uring_dma_max_clients_per_chan;
+ * refusals counted in io_uring_dma_admission_rejects.  Checked only at ring
+ * creation, so changing the cap does not affect existing rings.
+ */
+unsigned int io_dma_max_clients_per_chan __read_mostly;
+unsigned int io_dma_admission_rejects;
+
 static struct dma_chan *io_dma_shared_pick(int node)
 {
+	unsigned int cap = READ_ONCE(io_dma_max_clients_per_chan);
 	int i, idx;
 
 	for (i = 0; i < io_dma_shared_cnt; i++) {
 		idx = (io_dma_shared_rr + i) % io_dma_shared_cnt;
+		if (cap && io_dma_shared[idx].refcnt >= cap)
+			continue;
 		if (node == NUMA_NO_NODE ||
 		    dev_to_node(io_dma_shared[idx].chan->device->dev) == node) {
 			io_dma_shared_rr = idx + 1;
@@ -2386,7 +2404,8 @@ static struct dma_chan *io_dma_shared_pick(int node)
 	return NULL;
 }
 
-static struct dma_chan *io_dma_shared_get(dma_cap_mask_t *mask, int node)
+static struct dma_chan *io_dma_shared_get(dma_cap_mask_t *mask, int node,
+					  bool *capped)
 {
 	struct dma_chan *chan;
 
@@ -2410,6 +2429,12 @@ static struct dma_chan *io_dma_shared_get(dma_cap_mask_t *mask, int node)
 	}
 	/* 4) share any channel, any node */
 	chan = io_dma_shared_pick(NUMA_NO_NODE);
+	if (!chan && READ_ONCE(io_dma_max_clients_per_chan) &&
+	    io_dma_shared_cnt > 0) {
+		/* Channels exist but every one is at the client cap. */
+		io_dma_admission_rejects++;
+		*capped = true;
+	}
 	goto out;
 
 register_fresh:
@@ -2444,19 +2469,42 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 {
 	dma_cap_mask_t mask;
 	int node = numa_node_id();
+	bool capped = false;
 	int rc = 0;
 
 	dma_cap_zero(mask);
 	dma_cap_set(DMA_MEMCPY, mask);
+
+	/* Init the submit/poll machinery before acquisition: an
+	 * admission-capped ring keeps dma.chan == NULL but still runs
+	 * through generic teardown, which must find these initialized. */
+	init_llist_head(&ctx->dma.submit_list);
+	ctx->dma.poll_list = NULL;
+	ctx->dma.poll_list_tail = NULL;
+	spin_lock_init(&ctx->dma.lock);
+	INIT_WORK(&ctx->dma.poll_work, io_dma_poll_workfn);
+	atomic_set(&ctx->dma.poll_armed, 0);
 
 	/* Prefer a channel whose DSA device sits on the caller's NUMA
 	 * node: a cross-socket engine pays UPI hops on every descriptor
 	 * fetch and data move, which shows up as bimodal throughput
 	 * depending on which channel the ring happened to win.  Fresh
 	 * channels are handed out first-come first-served; once the
-	 * engine is exhausted, rings share channels round-robin. */
-	ctx->dma.chan = io_dma_shared_get(&mask, node);
+	 * engine is exhausted, rings share channels round-robin up to
+	 * the admission cap. */
+	ctx->dma.chan = io_dma_shared_get(&mask, node, &capped);
 	if (IS_ERR_OR_NULL(ctx->dma.chan)) {
+		if (capped) {
+			/* Deliberate backoff, not an error: the ring runs,
+			 * every offload gate CPU-falls-back. */
+			pr_notice_ratelimited("io_uring DMA: client cap %u reached; ring runs without offload requester=%s[%d] tgid=%d\n",
+					      READ_ONCE(io_dma_max_clients_per_chan),
+					      current->comm, task_pid_nr(current),
+					      task_tgid_nr(current));
+			ctx->dma.chan = NULL;
+			ctx->dma.admission_limited = true;
+			return 0;
+		}
 		rc = ctx->dma.chan ? PTR_ERR(ctx->dma.chan) : -ENODEV;
 		pr_err("io_uring DMA: no channel available: %d requester=%s[%d] tgid=%d\n",
 		       rc, current->comm,
@@ -2482,12 +2530,6 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 		 io_dma_shared_cnt,
 		 current->comm, task_pid_nr(current), task_tgid_nr(current), ctx);
 
-	init_llist_head(&ctx->dma.submit_list);
-	ctx->dma.poll_list = NULL;
-	ctx->dma.poll_list_tail = NULL;
-	spin_lock_init(&ctx->dma.lock);
-	INIT_WORK(&ctx->dma.poll_work, io_dma_poll_workfn);
-	atomic_set(&ctx->dma.poll_armed, 0);
 	io_dma_init_freelist(ctx, p);
 	io_dma_compl_thread_start(ctx);
 

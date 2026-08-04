@@ -402,6 +402,10 @@ void io_dma_debugfs_init(void)
 			    &io_dma_lat_reset_fops);
 	debugfs_create_file("io_uring_dma_completion_mode", 0644, NULL, NULL,
 			    &io_dma_comp_mode_fops);
+	debugfs_create_u32("io_uring_dma_max_clients_per_chan", 0644, NULL,
+			   &io_dma_max_clients_per_chan);
+	debugfs_create_u32("io_uring_dma_admission_rejects", 0444, NULL,
+			   &io_dma_admission_rejects);
 	debugfs_create_u32("io_uring_dma_reap_on_enter", 0644, NULL,
 			   &io_dma_reap_on_enter);
 	debugfs_create_u32("io_uring_dma_drain_wait_us", 0644, NULL,
