@@ -333,7 +333,17 @@ struct io_dma_channel {
 	struct work_struct	poll_work;
 	atomic_t		poll_armed;
 
-	/* Per-ctx completion kthread (busypoll/mwait modes); NULL falls back
+	/* poll_work is executing its drain loop. Submitters elide the
+	 * per-submission queue_work() while this is set -- the loop re-checks
+	 * the pending lists after every pass, and its exit protocol (clear
+	 * poll_active, full barrier, re-check, resume if non-empty) closes the
+	 * publish-vs-exit race -- so the workqueue pool lock leaves the
+	 * per-recv submit path (profiled at 3.7% of node cycles as
+	 * queue_work_on -> queued_spin_lock_slowpath under 20GB/s ingest).
+	 */
+	atomic_t		poll_active;
+
+	/* Per-ctx completion kthread (mwait mode); NULL falls back
 	 * to the poll_work kworker. Submit wakes it via compl_wait.
 	 */
 	struct task_struct	*compl_thread;

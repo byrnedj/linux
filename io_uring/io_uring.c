@@ -2294,7 +2294,7 @@ static void io_release_dma_chan(struct io_ring_ctx *ctx)
 		ctx->dma.releasing = true;
 		spin_unlock_irqrestore(&ctx->dma.lock, flags);
 
-		pr_info("io_uring DMA: releasing channel %s requester=%s[%d] tgid=%d ctx=%p\n",
+		pr_debug("io_uring DMA: releasing channel %s requester=%s[%d] tgid=%d ctx=%p\n",
 			dma_chan_name(ctx->dma.chan), current->comm,
 			task_pid_nr(current), task_tgid_nr(current), ctx);
 		io_dma_shared_put(ctx->dma.chan);
@@ -2484,6 +2484,7 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 	spin_lock_init(&ctx->dma.lock);
 	INIT_WORK(&ctx->dma.poll_work, io_dma_poll_workfn);
 	atomic_set(&ctx->dma.poll_armed, 0);
+	atomic_set(&ctx->dma.poll_active, 0);
 
 	/* Prefer a channel whose DSA device sits on the caller's NUMA
 	 * node: a cross-socket engine pays UPI hops on every descriptor

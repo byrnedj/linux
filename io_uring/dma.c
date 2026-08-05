@@ -541,11 +541,37 @@ void io_dma_poll_workfn(struct work_struct *w)
 	/* io_dma_channel is embedded in io_ring_ctx as 'dma' */
 	struct io_ring_ctx *ctx = container_of(d, struct io_ring_ctx, dma);
 
-	/* Drain until the list is empty */
-	do {
-		__io_dma_poll(ctx);
-		cpu_relax();
-	} while (io_dma_pending(ctx));
+	/*
+	 * poll_active is the submit-side kick-elision handshake: while it is
+	 * set, io_dma_submit_queued_tasks() skips its queue_work() because
+	 * this loop is guaranteed to observe the newly published tasks. The
+	 * guarantee comes from the exit protocol below: clear poll_active,
+	 * full barrier, THEN re-check the pending lists. A submitter
+	 * publishes (llist_add, a full barrier) and THEN reads poll_active;
+	 * so either it reads 0 and kicks, or its publish is ordered before
+	 * our post-clear re-check and we resume. Either way no task is left
+	 * behind with nobody scheduled to reap it.
+	 */
+	atomic_set(&d->poll_active, 1);
+	for (;;) {
+		/* Drain until the list is empty */
+		do {
+			__io_dma_poll(ctx);
+			cpu_relax();
+		} while (io_dma_pending(ctx));
+
+		atomic_set(&d->poll_active, 0);
+		/* Full store-load barrier: the clear must be visible before we
+		 * re-read the pending lists, pairing with the submitter's
+		 * publish-then-read-poll_active order (llist_add is a full
+		 * barrier). smp_mb__after_atomic() is NOT enough here --
+		 * atomic_set is a plain store on x86. */
+		smp_mb();
+		if (!io_dma_pending(ctx))
+			break;
+		/* A publish raced our exit and its kick was elided; resume. */
+		atomic_set(&d->poll_active, 1);
+	}
 }
 
 /*
@@ -2416,20 +2442,25 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 			else
 				/*
 				 * Unbound, NOT schedule_work(): the per-CPU
-				 * pool would run the poller on THIS (the
-				 * submitter's) CPU, so detection while the app
-				 * computes depends on the kworker winning a
-				 * wakeup-preemption fight with the app thread.
-				 * That fight is fragile -- measured: an inline
-				 * CQ-wait drain shifting the kworkers' runtime
-				 * profile was enough to make preemption stop
-				 * happening, leaving completions undetected for
-				 * the whole app compute slice (~83us) instead
-				 * of ~10us. An unbound worker lands on an idle
-				 * CPU and detects in parallel with the app.
+				 * pool would run the poller on the
+				 * submitter's CPU, making detection depend
+				 * on the kworker winning a wakeup-preemption
+				 * fight with the app thread; an unbound
+				 * worker lands on an idle CPU and detects in
+				 * parallel with the app.
+				 *
+				 * Elide the kick while the workfn's drain loop
+				 * is active: the tasks published above (a full
+				 * barrier) are ordered against its post-clear
+				 * re-check (see io_dma_poll_workfn), so it
+				 * cannot exit without seeing them. At ingest
+				 * rates the poller is effectively resident and
+				 * this skips the workqueue pool lock entirely
+				 * (was 3.7% of node cycles at 20GB/s).
 				 */
-				queue_work(system_unbound_wq,
-					   &ctx->dma.poll_work);
+				if (atomic_read(&ctx->dma.poll_active) == 0)
+					queue_work(system_unbound_wq,
+						   &ctx->dma.poll_work);
 		}
 	} else if (atomic_read(&ctx->dma.poll_armed) == 0) {
 		/*
@@ -2567,7 +2598,50 @@ out_disarm:
 	/* Release ordering hands poll_list (written lock-free above) to
 	 * whichever thread arms the poller next. */
 	atomic_set_release(&ctx->dma.poll_armed, 0);
-	return io_dma_pending(ctx) ? 1 : 0;
+
+	/*
+	 * Full store-load barrier: the poll_list/submit_list writes above must
+	 * be visible before the poll_active read below, pairing with the
+	 * workfn's clear-poll_active -> smp_mb -> re-check exit protocol
+	 * (mirrors the submitter's llist_add full barrier).
+	 */
+	smp_mb();
+	if (!io_dma_pending(ctx))
+		return 0;
+
+	/*
+	 * Tasks remain parked: still DMA_IN_PROGRESS at walk time, or
+	 * published during our splice. The splice above (llist_del_all, then
+	 * the poll_list write) has a window where those tasks are invisible
+	 * to io_dma_pending() -- a concurrently exiting workfn can read both
+	 * lists empty at its post-clear re-check and leave, while the
+	 * submitter's kick was already consumed (elided against that same
+	 * workfn). If this caller is a one-shot drain (inline reap on enter,
+	 * CQ-wait poll, the no-task issue-path drain), nothing is scheduled
+	 * to ever look at the parked task again: its completion record is
+	 * written and nobody reads it, the in-flight ref pins the req
+	 * forever, and the connection starves (observed as deterministic
+	 * end-of-run stalls in kworker/busypoll modes on 64KB xnode recv).
+	 * Close the hole here, on the disarm edge every poller passes
+	 * through: whenever we leave pollable work behind, ensure a
+	 * persistent poller is scheduled, under the same poll_active elision
+	 * rule as the submit path. The workfn's own drain passes skip this
+	 * (poll_active is set), so steady state pays one smp_mb and one
+	 * atomic read per drain pass.
+	 */
+	if (!IS_ERR_OR_NULL(ctx->dma.chan)) {
+		if (READ_ONCE(io_dma_completion_mode) == IO_DMA_COMP_MWAIT &&
+		    ctx->dma.compl_thread) {
+			/* The compl thread's own drain passes re-check
+			 * io_dma_pending() in its loop condition; only
+			 * foreign callers need to wake it. */
+			if (ctx->dma.compl_thread != current)
+				wake_up(&ctx->dma.compl_wait);
+		} else if (atomic_read(&ctx->dma.poll_active) == 0) {
+			queue_work(system_unbound_wq, &ctx->dma.poll_work);
+		}
+	}
+	return 1;
 }
 
 /*
