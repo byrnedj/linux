@@ -134,6 +134,40 @@ idxd_dma_submit_memcpy(struct dma_chan *c, dma_addr_t dma_dest,
 	return &desc->txd;
 }
 
+static struct dma_async_tx_descriptor *
+idxd_dma_prep_memset(struct dma_chan *c, dma_addr_t dma_dest, int value,
+		     size_t len, unsigned long flags)
+{
+	struct idxd_wq *wq = to_idxd_wq(c);
+	u32 desc_flags;
+	struct idxd_device *idxd = wq->idxd;
+	struct idxd_desc *desc;
+	u64 pattern;
+
+	if (wq->state != IDXD_WQ_ENABLED)
+		return NULL;
+
+	if (len > idxd->max_xfer_bytes)
+		return NULL;
+
+	/* The memory fill operation repeats a 64-bit pattern. */
+	pattern = (value & 0xff) * 0x0101010101010101ULL;
+
+	op_flag_setup(flags, &desc_flags);
+	desc = idxd_alloc_desc(wq, IDXD_OP_NONBLOCK);
+	if (IS_ERR(desc))
+		return NULL;
+
+	/* The pattern field of the fill descriptor overlays src_addr. */
+	idxd_prep_desc_common(wq, desc->hw, DSA_OPCODE_MEMFILL,
+			      pattern, dma_dest, len, desc->compl_dma,
+			      desc_flags);
+
+	desc->txd.flags = flags;
+
+	return &desc->txd;
+}
+
 static int idxd_dma_alloc_chan_resources(struct dma_chan *chan)
 {
 	struct idxd_wq *wq = to_idxd_wq(chan);
@@ -236,6 +270,11 @@ int idxd_register_dma_device(struct idxd_device *idxd)
 	if (idxd->hw.opcap.bits[0] & IDXD_OPCAP_MEMMOVE) {
 		dma_cap_set(DMA_MEMCPY, dma->cap_mask);
 		dma->device_prep_dma_memcpy = idxd_dma_submit_memcpy;
+	}
+
+	if (idxd->hw.opcap.bits[0] & IDXD_OPCAP_MEMFILL) {
+		dma_cap_set(DMA_MEMSET, dma->cap_mask);
+		dma->device_prep_dma_memset = idxd_dma_prep_memset;
 	}
 
 	dma->device_tx_status = idxd_dma_tx_status;
