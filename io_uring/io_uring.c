@@ -2482,6 +2482,7 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 	spin_lock_init(&ctx->dma.lock);
 	INIT_WORK(&ctx->dma.poll_work, io_dma_poll_workfn);
 	atomic_set(&ctx->dma.poll_armed, 0);
+	atomic_set(&ctx->dma.poll_active, 0);
 	atomic_set(&ctx->dma.diag_irq_submitted, 0);
 	atomic_set(&ctx->dma.diag_irq_completed, 0);
 	atomic_set(&ctx->dma.diag_irq_orphaned, 0);
