@@ -653,11 +653,37 @@ void io_dma_poll_workfn(struct work_struct *w)
 	/* io_dma_channel is embedded in io_ring_ctx as 'dma' */
 	struct io_ring_ctx *ctx = container_of(d, struct io_ring_ctx, dma);
 
-	/* Drain until the list is empty */
-	do {
-		__io_dma_poll(ctx);
-		cpu_relax();
-	} while (io_dma_pending(ctx));
+	/*
+	 * poll_active is the submit-side kick-elision handshake: while it is
+	 * set, io_dma_submit_queued_tasks() skips its queue_work() because
+	 * this loop is guaranteed to observe the newly published tasks. The
+	 * guarantee comes from the exit protocol below: clear poll_active,
+	 * full barrier, THEN re-check the pending lists. A submitter
+	 * publishes (llist_add, a full barrier) and THEN reads poll_active;
+	 * so either it reads 0 and kicks, or its publish is ordered before
+	 * our post-clear re-check and we resume. Either way no task is left
+	 * behind with nobody scheduled to reap it.
+	 */
+	atomic_set(&d->poll_active, 1);
+	for (;;) {
+		/* Drain until the list is empty */
+		do {
+			__io_dma_poll(ctx);
+			cpu_relax();
+		} while (io_dma_pending(ctx));
+
+		atomic_set(&d->poll_active, 0);
+		/* Full store-load barrier: the clear must be visible before we
+		 * re-read the pending lists, pairing with the submitter's
+		 * publish-then-read-poll_active order (llist_add is a full
+		 * barrier). smp_mb__after_atomic() is NOT enough here --
+		 * atomic_set is a plain store on x86. */
+		smp_mb();
+		if (!io_dma_pending(ctx))
+			break;
+		/* A publish raced our exit and its kick was elided; resume. */
+		atomic_set(&d->poll_active, 1);
+	}
 }
 
 /*
@@ -2601,9 +2627,19 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 				 * the whole app compute slice (~83us) instead
 				 * of ~10us. An unbound worker lands on an idle
 				 * CPU and detects in parallel with the app.
+				 *
+				 * Elide the kick while the workfn's drain loop
+				 * is active: the tasks published above (a full
+				 * barrier) are ordered against its post-clear
+				 * re-check (see io_dma_poll_workfn), so it
+				 * cannot exit without seeing them. At ingest
+				 * rates the poller is effectively resident and
+				 * this skips the workqueue pool lock entirely
+				 * (was 3.7% of node cycles at 20GB/s).
 				 */
-				queue_work(system_unbound_wq,
-					   &ctx->dma.poll_work);
+				if (atomic_read(&ctx->dma.poll_active) == 0)
+					queue_work(system_unbound_wq,
+						   &ctx->dma.poll_work);
 		}
 	} else if (atomic_read(&ctx->dma.poll_armed) == 0) {
 		/*
