@@ -429,7 +429,10 @@ void io_dma_debugfs_init(void)
  * io_dma_task_alloc()'s memset covers only the task part; users of the
  * inline array initialize it themselves (sg_init_table).
  */
-#define IO_DMA_INLINE_SG	8
+/* Matches IO_DMA_BATCH_MAX: a full-size batch's source SG must fit the
+ * task-inline array, or every 9+-chunk batch pays a GFP_NOWAIT kmalloc on
+ * the submit hot path (which is what the old value of 8 silently did). */
+#define IO_DMA_INLINE_SG	IO_DMA_BATCH_MAX
 
 struct io_dma_task_mem {
 	struct io_dma_task	t;

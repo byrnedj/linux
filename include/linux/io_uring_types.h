@@ -434,7 +434,13 @@ struct io_dma_batch_entry {
 						 * (skb kvec source) */
 };
 
-#define IO_DMA_BATCH_MAX	16
+/* Sized so one 64KB HW-GRO skb (up to ~16 page frags + linear head,
+ * folio-bounded => <=18 chunks) always fits ONE batch descriptor. At 16,
+ * nearly every skb split into two submissions -- one full, one nearly
+ * empty -- and the ENQCMDS portal write (serializing UC store + wmb pair,
+ * plus enqcmds retries) was the single hottest DSA-mode symbol at 4.8% of
+ * node cycles under 20GB/s ingest. */
+#define IO_DMA_BATCH_MAX	32
 
 struct io_dma_task {
 	struct io_kiocb		*req;
