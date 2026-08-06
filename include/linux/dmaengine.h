@@ -200,6 +200,9 @@ struct dma_vec {
  *  transaction is marked with DMA_PREP_REPEAT will cause the new transaction
  *  to never be processed and stay in the issued queue forever. The flag is
  *  ignored if the previous transaction is not a repeated transaction.
+ * @DMA_PREP_CACHE_CONTROL: tell the driver to direct destination writes into
+ *  cache (cache-allocating) rather than bypassing it. Advisory: drivers that
+ *  cannot honour it ignore the flag.
  */
 enum dma_ctrl_flags {
 	DMA_PREP_INTERRUPT = (1 << 0),
@@ -212,6 +215,7 @@ enum dma_ctrl_flags {
 	DMA_PREP_CMD = (1 << 7),
 	DMA_PREP_REPEAT = (1 << 8),
 	DMA_PREP_LOAD_EOT = (1 << 9),
+	DMA_PREP_CACHE_CONTROL = (1 << 10),
 };
 
 /**

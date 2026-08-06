@@ -61,6 +61,8 @@ static void op_flag_setup(unsigned long flags, u32 *desc_flags)
 	*desc_flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
 	if (flags & DMA_PREP_INTERRUPT)
 		*desc_flags |= IDXD_OP_FLAG_RCI;
+	if (flags & DMA_PREP_CACHE_CONTROL)
+		*desc_flags |= IDXD_OP_FLAG_CC;
 }
 
 static inline void idxd_prep_desc_common(struct idxd_wq *wq,
