@@ -17,8 +17,11 @@
 #include <linux/timekeeping.h>
 #include <linux/debugfs.h>
 #include <linux/task_work.h>
+#include <linux/kmemleak.h>
+#include <linux/percpu.h>
 #include "io_uring.h"
 #include "rw.h"
+#include <linux/bitmap.h>
 #include "rsrc.h"
 #include "refs.h"
 
@@ -37,6 +40,2704 @@ static inline unsigned long io_dma_prep_flags(void)
 {
 	return READ_ONCE(io_dma_cache_control) ? DMA_PREP_CACHE_CONTROL : 0;
 }
+
+/*
+ * PFN-keyed persistent source-mapping cache.
+ *
+ * Under translated IOMMU domains the dominant recoverable submit cost
+ * on the DMA source paths is the per-chunk dma_map and dma_unmap.
+ * Destinations are already persistent since registered buffers map
+ * once at registration.  This gives sources the same discipline,
+ * lazily.  The first chunk touching a folio maps its
+ * io_dma_map_quantum() sized segment DMA_BIDIRECTIONAL and caches the
+ * segment-head PFN to dma_addr translation in a per-device xarray.
+ * Later chunks on that segment are pure arithmetic.  dma_unmap runs
+ * only on the bytes-capped CLOCK eviction and on explicit flush.
+ *
+ * This is correct because the struct page to physical address relation
+ * is immutable and descriptors are only issued against pages held live
+ * by the I/O being processed through the filemap folio reference, so a
+ * stale cached translation can never misdirect DMA.  Staleness costs
+ * IOVA space and a lingering window in which the device can read and
+ * write the mapped memory, bounded by the cap.  That memory may be
+ * freed and reused while it stays mapped, so the cache relies on the
+ * device being programmed by the kernel alone.
+ *
+ * A standing mapping outlives the I/O that made it, so the ownership
+ * transfers a per-chunk map and unmap perform at their ends have no
+ * place here: segments are mapped with DMA_ATTR_SKIP_CPU_SYNC and the
+ * datapath transfers explicitly, handing a source chunk to the device
+ * before its descriptor is issued and a destination piece to the
+ * device before its write and back to the CPU once the write has
+ * landed. On a coherent device each transfer is a flag test.
+ *
+ * The entry lifetime is refs = 1 cache bias plus one per in-flight
+ * batch entry.  Lookup takes a ref with atomic_inc_not_zero() under
+ * RCU.  Eviction erases the entry and drops the bias, so a mapping
+ * survives until its last in-flight user completes.
+ *
+ * Mappings are keyed to the DSA struct device and live in its IOMMU
+ * domain, so the cache gives them and its reservation back when the
+ * device's driver unbinds, and reserves again for the next binding.
+ */
+
+struct io_pfn_map {
+	unsigned long		pfn;		/* segment-head PFN, the cache key */
+	dma_addr_t		dma_base;	/* segment mapping, bidirectional
+						 * so reads (src) and writes
+						 * (dst) share entries
+						 */
+	unsigned int		size;		/* mapped bytes (<= cache quantum) */
+	atomic_t		refs;		/* cache bias + in-flight users */
+	bool			referenced;	/* CLOCK second-chance bit */
+	unsigned long		last_used;	/* jiffies, for age-based retire */
+	struct device		*dev;		/* unmap handle */
+	struct io_pfn_cache	*cache;
+	int			slot;		/* slot in the cache's reserved
+						 * IOVA range, or -1 for a plain
+						 * per-entry mapping
+						 */
+	struct rcu_head		rcu;
+};
+
+struct io_pfn_cache {
+	/*
+	 * Every lookup reads the fields up to covered, and every hit on
+	 * every CPU writes the counters from hits on, so the counters start
+	 * a cache line of their own. With covered in their line, 128KB
+	 * reads lost 11 to 14 percent of their throughput. A new field read
+	 * on lookup goes in a hole above.
+	 */
+	struct xarray		xa;
+	spinlock_t		lock;		/* serializes the CLOCK sweep */
+	bool			dead;		/* the binding or the device is
+						 * going away: no lookup or
+						 * insert uses the cache
+						 */
+	bool			gone;		/* retired: reservation freed,
+						 * collector held until a
+						 * revive
+						 */
+	u8			nr_sharing;	/* caches the budget is split
+						 * across, this one included
+						 * (io_pfn_cache_ceiling())
+						 */
+	unsigned long		hand;		/* next PFN the sweep visits */
+	unsigned long		next_age;	/* jiffies, next age walk due */
+	struct device		*dev;
+	size_t			quantum;	/* pow2 segment size entries are
+						 * carved into (io_dma_map_quantum)
+						 */
+	atomic64_t		covered;	/* bytes mapped through the tree */
+	atomic64_t		hits ____cacheline_aligned_in_smp;
+	atomic64_t		misses;
+	atomic64_t		inserts;
+	atomic64_t		insert_fails;	/* alloc/map/xa failure, plain map */
+	atomic64_t		range_fallbacks;/* chunk not coverable by one entry */
+	atomic64_t		evictions;
+	atomic64_t		age_evictions;	/* retired for idleness */
+	atomic64_t		ref_skips;	/* sweep passed an in-flight entry */
+	/*
+	 * Ghost list: the keys, and only the keys, of segments the cap
+	 * recently forced out, each stored as an xarray value holding
+	 * its eviction time under the key scaled down by the quantum
+	 * (io_pfn_ghost_index()). A miss that hits the ghost is an eviction
+	 * the workload paid for with a remap, which is the one signal
+	 * that separates "the cap is trimming dead streaming entries"
+	 * from "the cap is thrashing a live working set". Ghost hits
+	 * grow the adaptive target below; their absence decays it. Age
+	 * evictions never enter the ghost, idleness is not undersizing.
+	 */
+	struct xarray		ghost;
+	unsigned long		ghost_hand;	/* purge and replace hand */
+	atomic64_t		ghost_count;
+	atomic64_t		ghost_hits;
+	u64			eff_cap;	/* adaptive target, bytes;
+						 * 0 uninitialized, 1 parked
+						 */
+	u64			ghost_hits_snap;/* at the last decay tick */
+	u64			hits_snap;	/* ditto, hits plus waits */
+	u64			misses_snap;
+	u32			parked_ticks;	/* ticks spent parked */
+	u32			probing;	/* short ticks left in a probe */
+	u32			probe_interval;	/* parked ticks to the next
+						 * probe
+						 */
+	bool			probe_from_park;/* the probe refills after a
+						 * park, not a flush
+						 */
+	u64			inserts_snap;	/* at the last tick */
+	u64			evictions_snap;	/* cap evictions only */
+	u32			dead_ticks;	/* ticks that only churned */
+	u32			cyclic_turnover;/* cap evictions in a row of
+						 * cyclic ticks
+						 */
+	u32			prev_smiss;	/* inserts per hundred segment
+						 * touches at the last tick
+						 */
+	u64			touches_snap;	/* segment touches at the last
+						 * tick
+						 */
+	unsigned long		next_adapt;	/* jiffies */
+
+	u64 __percpu		*touches;	/* segment touches: an op's
+						 * first chunk on a segment,
+						 * while not parked
+						 */
+
+	/*
+	 * Reserved IOVA range, allocated at creation or by a revive and
+	 * freed by the retire, so no range carries over from one binding of
+	 * the device to the next. Entries are linked in at slot * quantum
+	 * and unlinked once retired.
+	 * Standing mappings then never touch the IOVA allocator: no fill
+	 * ever walks its rbtree, and no flush or eviction parks a range in
+	 * its rcache depot, which is where a burst of frees left a million
+	 * free-but-cached nodes for every later allocation to walk. With
+	 * no reservation (no IOMMU, or the range could not be had) entries
+	 * fall back to per-entry maps.
+	 */
+	struct dma_iova_state	iova;
+	unsigned int		nslots;		/* 0: no reservation */
+	unsigned int		quantum_shift;
+	unsigned long		*slots;		/* used-slot bitmap */
+	unsigned long		*dirty;		/* retired, still linked */
+	struct io_pfn_map	**by_slot;	/* the entry holding each slot */
+	unsigned int		nr_dirty;
+	unsigned int		slot_hint;	/* next slot to try */
+	unsigned int		slot_hand;	/* CLOCK hand over the ring */
+	spinlock_t		slot_lock;
+	atomic_t		gc_busy;
+	bool			gc_rescan;	/* a caller left its slots
+						 * to the collector at work,
+						 * under slot_lock
+						 */
+	bool			age_walking;	/* an age walk has retired
+						 * and not yet collected
+						 */
+	atomic64_t		slot_links;	/* entries linked into the range */
+	atomic64_t		slot_fails;	/* range full or link failed */
+	atomic64_t		unlink_runs;	/* dma_iova_unlink() calls */
+	atomic64_t		unlink_slots;	/* slots those covered */
+	atomic64_t		waits;		/* hits taken after waiting for
+						 * another CPU's insert
+						 */
+	atomic64_t		wait_timeouts;	/* waits that ran out */
+	atomic64_t		short_fallbacks;/* segment shorter than the
+						 * quantum: not cached
+						 */
+	struct mutex		life_lock;	/* orders retire and revive */
+	struct work_struct	age_work;	/* io_pfn_cache_age_work() */
+	unsigned int		nr_used;	/* bits set in slots, under
+						 * slot_lock
+						 */
+	bool			removed;	/* the device is gone for good,
+						 * under life_lock
+						 */
+};
+
+/*
+ * A miss claims its key with this marker before it maps, so the
+ * followers of a convoy find the claim and wait for the entry instead
+ * of each mapping the segment, losing the insert race to the leader and
+ * unmapping again: a fifth of all touches did that under four jobs. The
+ * marker holds no bytes and no reference; walkers skip it.
+ */
+#define IO_PFN_PENDING		xa_mk_value(0)
+
+#define IO_PFN_CACHE_DEVS	16
+static struct io_pfn_cache *io_pfn_caches[IO_PFN_CACHE_DEVS];
+static struct device *io_pfn_cache_devs[IO_PFN_CACHE_DEVS];
+static DEFINE_SPINLOCK(io_pfn_cache_reg_lock);
+static void io_pfn_cache_kill(struct io_pfn_cache *c, unsigned long action);
+static struct io_pfn_cache *io_pfn_cache_get(struct device *dev);
+static void io_pfn_cache_age_work(struct work_struct *work);
+static void io_pfn_cache_probe_arm(struct io_pfn_cache *c, bool from_park);
+
+/*
+ * Covered-bytes cap in MiB, where 0 disables the cache entirely.  This
+ * is the hard bound on the standing window, the bytes the device can
+ * reach until an entry is retired; the adaptive target sizes itself
+ * below it from the workload's reuse and parks on streaming, so the
+ * cap need not be tuned to the working set.  It defaults to the IOVA
+ * reservation, which is what the adaptive ceiling is anyway: a cap
+ * above the reservation only spills entries to per-entry maps, and one
+ * below it forgoes coverage the reservation already paid for.
+ */
+static u32 io_dma_pfn_cache_cap_mb __read_mostly = 65536;
+
+/*
+ * Clears of the cap whose first round of flushes has yet to finish. A
+ * put at cap 0 that collects leaves its slot to such a clear, which
+ * flushes every cache once more after the count drops
+ * (io_pfn_slots_gc_cleared()).
+ */
+static atomic_t io_pfn_cache_clearing;
+
+/*
+ * Age at which an idle entry is retired even though the cache is under
+ * its cap, in milliseconds, where 0 keeps entries until the cap forces
+ * them out.  The cap alone bounds the standing device-reachable window
+ * in bytes and says nothing about how long any one mapping persists,
+ * so this bounds it in time: a segment that no I/O has touched for
+ * this long is unmapped, no more than a quarter of this later, or a
+ * second when that is longer, plus the walk itself, as long as the cache
+ * still sees lookups (io_pfn_cache_age_period()).  A write re-arms every
+ * cache, so a lowered age applies from the next lookup.
+ */
+static u32 io_dma_pfn_cache_max_age_ms __read_mostly = 60000;
+
+/*
+ * Adaptive sizing.  When set, cap_mb is a ceiling rather than the
+ * standing target: the cache aims for an effective cap that ghost
+ * hits grow toward the ceiling and quiet intervals settle onto the
+ * resident set, never under it, with a floor of an eighth of the
+ * ceiling.  The target starts at the ceiling: the first pass over a set
+ * to be re-read looks exactly like a stream, nothing is touched twice
+ * before the second pass, so no signal can size the first fill, and
+ * from the floor a set larger than it paid one floor pass of churn
+ * before ghost hits earned the target back up, 5-6% of a 64 GB
+ * re-read's first twelve seconds with every eviction a synchronous
+ * unlink.  A pattern the cache does not pay for parks (the tick's
+ * gates), idle entries go to the age walk, and a re-read phase whose
+ * working set a lowered ceiling thrashes earns its way back up at one
+ * step per paid-for eviction.  0 pins the target at cap_mb, which is
+ * the historical behaviour.
+ */
+static u32 io_dma_pfn_cache_auto __read_mostly = 1;
+
+/*
+ * What the park gates read, per segment touch: the inserts (the segment
+ * miss) and the lookups (the amortization) apart, since the chunk hit
+ * ratio folds the two together (an op of 4 KB destination pages makes
+ * up to 32 lookups on one 128 KB segment) and read a set larger than
+ * the ceiling that a four-job convoy re-reads as 86-91% hits at a 25%
+ * segment miss, never parking it, though a plain map per chunk beat its
+ * evictions by up to a half. A cache keeps evicting when a touch serves
+ * at least IO_PFN_PARK_LOOKUPS lookups, or when fewer than
+ * IO_PFN_PARK_MISS_PCT of touches insert. At a quarter of the set,
+ * parking beat the thrash at every block size, 18 lookups per touch
+ * included, so the lookups bar sits above anything measured; the miss
+ * bar spares a set that all but fits.
+ */
+#define IO_PFN_PARK_LOOKUPS	32
+#define IO_PFN_PARK_MISS_PCT	20
+
+/* prev_smiss before any tick: the first tick is never "flat". */
+#define IO_PFN_SMISS_NONE	U32_MAX
+
+/*
+ * Machine-wide standing-mapping budget for adaptive mode, in MiB, or 0
+ * for none, in which case a cache's ceiling is its IOVA reservation.
+ * The budget existed to keep the caches under an IOVA allocator cliff
+ * that the reserved ranges have since removed: standing mappings no
+ * longer touch the allocator, and what a large cache costs is its
+ * IOMMU page tables (a fraction of a percent of the bytes) and a
+ * longer standing window before an idle entry ages out. A host that
+ * wants to bound the total anyway sets this; it is split across the
+ * caches currently holding mappings.
+ */
+static u32 io_dma_pfn_cache_auto_budget_mb __read_mostly;
+
+/*
+ * Registry slots taken. A removed device's slot passes to a new device
+ * and is not counted again (__io_pfn_cache_get()).
+ */
+static atomic_t io_pfn_cache_nr;
+
+/*
+ * IOVA reserved per cache, in MiB, taken when the cache is created; 0
+ * leaves the cache on per-entry maps. Reservation is address space
+ * only, page tables are built as entries link in, so on a 56-bit device
+ * the default costs nothing until used. A cap above the reservation
+ * still works: entries past the range take plain maps. A cache that an
+ * unbind retired reserves the size it took at creation again when a ring
+ * on the rebound device revives it, or nothing if it took none, whatever
+ * the knob says then.
+ */
+static u32 io_dma_pfn_iova_reserve_mb __read_mostly = 65536;
+
+/*
+ * How long a lookup waits for another CPU's insert of the same segment,
+ * in microseconds, before mapping for itself. A link and its sync take
+ * a few microseconds; the wait costs nothing when no insert is pending.
+ */
+static u32 io_dma_pfn_wait_us __read_mostly = 20;
+
+/* Ghost growth per hit and settling per quiet 2s tick (eff >> shift). */
+#define IO_PFN_GHOST_GROW_SEGS	64
+#define IO_PFN_ADAPT_DECAY_SHIFT 3
+#define IO_PFN_ADAPT_TICK	(2 * HZ)
+
+/*
+ * The caches the machine budget is split across: those currently holding
+ * mappings, and @c, which asks for its ceiling only to hold some.
+ * Registration outlives a device's use, but a device that a past workload
+ * touched and this one does not must not dilute the budget: with rings
+ * acquiring channels from a shared pool, the registry accretes devices
+ * over time, and dividing by the all-time count starved every active
+ * cache.
+ */
+static u8 io_pfn_cache_sharing(struct io_pfn_cache *c)
+{
+	unsigned int i;
+	u8 n = 1;
+
+	for (i = 0; i < IO_PFN_CACHE_DEVS; i++) {
+		struct io_pfn_cache *pc;
+
+		if (!READ_ONCE(io_pfn_cache_devs[i]))
+			break;
+		pc = io_pfn_caches[i];
+		if (pc && pc != c && atomic64_read(&pc->covered) > 0)
+			n++;
+	}
+	return n;
+}
+
+/*
+ * Per-cache adaptive ceiling: the machine budget's fair share among the
+ * caches that share it. The share count is taken when the cache is
+ * created and on every adaptive tick, and the per-tick recount converges
+ * as traffic shifts. Counting on every call would read every cache's
+ * covered count, whose line every claim, publish and retire writes, on
+ * every lookup.
+ */
+static u64 io_pfn_cache_ceiling(struct io_pfn_cache *c, u64 hard)
+{
+	u64 budget = (u64)READ_ONCE(io_dma_pfn_cache_auto_budget_mb) << 20;
+	u64 ceil = hard;
+
+	if (c->nslots)
+		ceil = min(ceil, (u64)c->nslots << c->quantum_shift);
+	if (!budget)
+		return ceil;
+	return min(ceil, div_u64(budget, READ_ONCE(c->nr_sharing)));
+}
+
+static u64 io_pfn_cache_floor(u64 ceil)
+{
+	return min(ceil, clamp(ceil >> 3, (u64)SZ_64M, (u64)SZ_8G));
+}
+
+/*
+ * The eviction target: the adaptive effective cap, clamped to the
+ * per-cache ceiling, or the hard cap itself when auto sizing is off.
+ */
+#define IO_PFN_EFF_PARKED	1
+/*
+ * A parked cache probes the pattern again every IO_PFN_PROBE_TICKS
+ * ticks, at the floor, and judges the probe on IO_PFN_PROBE_TICK long
+ * ticks until the gates decide: a set that still does not fit refills the ceiling in
+ * well under a second and churns from then until the tick that
+ * re-parks it, so judged on the usual tick a probe spent most of its
+ * time thrashing and a parked cache trailed cache-off by 4-12%;
+ * judged on quarter-second ticks it trails by 1-5%, the rest of which
+ * is the parked lookup path itself. Probing less often instead would
+ * leave a set that has come to fit running uncached for that much
+ * longer.
+ */
+#define IO_PFN_PROBE_TICKS	8
+#define IO_PFN_PROBE_TICK	(HZ / 4)
+/*
+ * A probe that only confirms the pattern doubles the wait to the next,
+ * up to this many ticks; a park from an engaged cache, or a probe that
+ * stays engaged, starts over at IO_PFN_PROBE_TICKS. Each probe costs about a
+ * short tick of churn, 1-2% of the 12 s around it; a set that has come
+ * to fit runs uncached until the next probe, 7% under its engaged rate
+ * at 1 MB reads and a quarter under at 128 KB, so the wait is capped at
+ * twice the base. The first fill after a flush is judged on probe
+ * ticks too, so a set that will not fit parks within a few of them
+ * instead of a few whole ticks later.
+ */
+#define IO_PFN_PROBE_TICKS_MAX	16
+/*
+ * A tick with this many inserts, no ghost hit, about as many evictions
+ * as inserts, and traffic that does not pay for them is a streaming
+ * pattern: little of what it inserted was reused before it left. Two
+ * in a row park the cache.
+ */
+#define IO_PFN_DEAD_MIN_INSERTS	1024
+
+static u64 io_pfn_cache_target_of(struct io_pfn_cache *c, u64 eff, u64 hard)
+{
+	u64 ceil;
+
+	if (!READ_ONCE(io_dma_pfn_cache_auto))
+		return hard;
+	ceil = io_pfn_cache_ceiling(c, hard);
+	if (eff == IO_PFN_EFF_PARKED)
+		return 0;
+	if (!eff)
+		eff = ceil;
+	return min(eff, ceil);
+}
+
+static u64 io_pfn_cache_target(struct io_pfn_cache *c, u64 hard)
+{
+	return io_pfn_cache_target_of(c, READ_ONCE(c->eff_cap), hard);
+}
+
+/* Sweep visit budget per eviction call.  This bounds the datapath
+ * latency when the table is large and mostly referenced or in flight.
+ * The age walk visits as many entries per RCU read-side batch.
+ */
+#define IO_PFN_EVICT_BUDGET	1024
+
+/* Unmaps performed inline per eviction call. An insert overshoots the
+ * cap by at most one segment, so the steady state evicts about one
+ * entry. Lowering the cap at runtime is the case that would otherwise
+ * unmap the whole excess in one sweep, with preemption disabled, so
+ * cap the inline work and leave the rest to the following inserts.
+ * The age walk and a flush end an RCU read-side batch after as many
+ * retirements.
+ */
+#define IO_PFN_EVICT_UNMAP_MAX	64
+
+/*
+ * Standing mappings are carved into power-of-two segments no larger
+ * than dma_opt_mapping_size().  IOVA allocations above that limit
+ * bypass the IOMMU's per-CPU rcaches and fall to the domain rbtree
+ * under its lock.  We cap at 2MB so that a no-IOMMU SIZE_MAX answer
+ * degenerates to whole-folio behaviour.
+ */
+static size_t io_dma_map_quantum(struct device *dev)
+{
+	size_t q = dma_opt_mapping_size(dev);
+
+	if (!q || q > SZ_2M)
+		q = SZ_2M;
+	return rounddown_pow_of_two(q);
+}
+
+static void io_pfn_cache_reserve(struct io_pfn_cache *c, gfp_t gfp)
+{
+	u64 bytes = (u64)READ_ONCE(io_dma_pfn_iova_reserve_mb) << 20;
+	u64 nslots = bytes >> c->quantum_shift;
+
+	/*
+	 * dma_iova_try_alloc() takes a size_t. On 32-bit a size of 4 GiB or
+	 * more would be truncated, to nothing or to less than what the slots
+	 * span, so such a cache keeps to per-entry maps.
+	 */
+	if (!nslots || nslots > UINT_MAX || bytes != (size_t)bytes)
+		return;
+	c->slots = bitmap_zalloc(nslots, gfp);
+	c->dirty = bitmap_zalloc(nslots, gfp);
+	c->by_slot = kvcalloc(nslots, sizeof(*c->by_slot), gfp);
+	if (!c->slots || !c->dirty || !c->by_slot ||
+	    !dma_iova_try_alloc(c->dev, &c->iova, 0, bytes)) {
+		bitmap_free(c->slots);
+		bitmap_free(c->dirty);
+		kvfree(c->by_slot);
+		c->slots = c->dirty = NULL;
+		c->by_slot = NULL;
+		return;
+	}
+	spin_lock_init(&c->slot_lock);
+	c->nslots = nslots;
+}
+
+static void io_pfn_cache_unreserve(struct io_pfn_cache *c)
+{
+	if (c->nslots)
+		dma_iova_free(c->dev, &c->iova);
+	bitmap_free(c->slots);
+	bitmap_free(c->dirty);
+	kvfree(c->by_slot);
+}
+
+/*
+ * Give back the slot arrays of a removed device's cache. A removed device
+ * never binds again, so its cache is never revived, and once every slot
+ * that a transfer held at the retire has had its last put and been marked,
+ * nothing touches the arrays again: the retire holds the collector,
+ * inserts refuse, and a sweep on the dead cache leaves the ring
+ * (io_pfn_cache_evict()). Until then the arrays stay, and ring setup for
+ * a device without a cache tries again whenever its walk of the registry
+ * passes this one (io_pfn_cache_full()). The caller holds c->life_lock.
+ */
+static void io_pfn_cache_release(struct io_pfn_cache *c)
+{
+	bool clean;
+
+	lockdep_assert_held(&c->life_lock);
+	if (!c->slots || !READ_ONCE(c->gone))
+		return;
+	spin_lock(&c->slot_lock);
+	clean = bitmap_equal(c->slots, c->dirty, c->nslots);
+	spin_unlock(&c->slot_lock);
+	if (!clean)
+		return;
+	bitmap_free(c->dirty);
+	kvfree(c->by_slot);
+	c->dirty = NULL;
+	c->by_slot = NULL;
+	bitmap_free(c->slots);
+	WRITE_ONCE(c->slots, NULL);
+}
+
+/*
+ * Whether @c's registry slot can pass to a new device: its device was
+ * removed and its slot arrays are released. The cache itself stays
+ * allocated, since lookups and in-flight entries may still hold it.
+ */
+static bool io_pfn_cache_reusable(struct io_pfn_cache *c)
+{
+	return READ_ONCE(c->removed) && !READ_ONCE(c->slots);
+}
+
+/*
+ * Whether every registry slot holds another device whose cache is still
+ * in use. Such a device runs uncached, which is reported once. A removed
+ * device's cache whose arrays a transfer still held at the removal is
+ * given another chance to release them here. Each slot is read once. A
+ * second read could find the slot that @dev took after the first, and so
+ * report a full registry for a device that has a cache.
+ */
+static bool io_pfn_cache_full(struct device *dev)
+{
+	int i;
+
+	for (i = 0; i < IO_PFN_CACHE_DEVS; i++) {
+		/* Pairs with the release in __io_pfn_cache_get(). */
+		struct device *d = smp_load_acquire(&io_pfn_cache_devs[i]);
+		struct io_pfn_cache *c;
+
+		if (!d || d == dev)
+			return false;
+		c = READ_ONCE(io_pfn_caches[i]);
+		if (READ_ONCE(c->removed) && READ_ONCE(c->slots)) {
+			mutex_lock(&c->life_lock);
+			io_pfn_cache_release(c);
+			mutex_unlock(&c->life_lock);
+		}
+		if (io_pfn_cache_reusable(c))
+			return false;
+	}
+	dev_warn_once(dev, "io_uring DMA: mapping cache registry full, device runs uncached\n");
+	return true;
+}
+
+static struct io_pfn_cache *__io_pfn_cache_get(struct device *dev, gfp_t gfp)
+{
+	struct io_pfn_cache *c, *old;
+	int i, slot = -1;
+
+	c = io_pfn_cache_get(dev);
+	if (c)
+		return c;
+
+	c = kzalloc(sizeof(*c), gfp);
+	if (!c)
+		return NULL;
+	c->touches = alloc_percpu_gfp(u64, gfp);
+	if (!c->touches) {
+		kfree(c);
+		return NULL;
+	}
+	c->probe_interval = IO_PFN_PROBE_TICKS;
+	io_pfn_cache_probe_arm(c, false);
+	xa_init(&c->xa);
+	xa_init(&c->ghost);
+	spin_lock_init(&c->lock);
+	INIT_WORK(&c->age_work, io_pfn_cache_age_work);
+	c->dev = dev;
+	c->quantum = io_dma_map_quantum(dev);
+	c->quantum_shift = ilog2(c->quantum);
+	c->nr_sharing = io_pfn_cache_sharing(c);
+	mutex_init(&c->life_lock);
+	io_pfn_cache_reserve(c, gfp);
+
+	/*
+	 * A removed device's slot can sit before @dev's, so the whole
+	 * prefix is searched for @dev before a slot is taken.
+	 */
+	spin_lock(&io_pfn_cache_reg_lock);
+	for (i = 0; i < IO_PFN_CACHE_DEVS; i++) {
+		if (io_pfn_cache_devs[i] == dev) {	/* We lost an insert race. */
+			spin_unlock(&io_pfn_cache_reg_lock);
+			io_pfn_cache_unreserve(c);
+			free_percpu(c->touches);
+			kfree(c);
+			return io_pfn_caches[i];
+		}
+		if (!io_pfn_cache_devs[i])
+			break;
+		if (slot < 0 && io_pfn_cache_reusable(io_pfn_caches[i]))
+			slot = i;
+	}
+	if (slot < 0 && i < IO_PFN_CACHE_DEVS)
+		slot = i;
+	if (slot >= 0) {
+		/*
+		 * Pin the device for good. A cache that gives its slot up
+		 * stays allocated and names its device, through which the
+		 * entries that transfers still hold unmap, so the reference
+		 * is never dropped, and a device that comes back after
+		 * removal is a new one, which the retired cache is never
+		 * handed. A lookup that read the slot's old device can then
+		 * load the new cache, so lookups check the cache's device.
+		 */
+		get_device(dev);
+		old = io_pfn_caches[slot];
+		if (old)
+			kmemleak_not_leak(old);
+		else
+			atomic_inc(&io_pfn_cache_nr);
+		/*
+		 * Orders the new cache's initialization before a lookup
+		 * that loads it without having seen the new device.
+		 */
+		smp_store_release(&io_pfn_caches[slot], c);
+		/* pairs with the lockless loads in io_pfn_cache_get() */
+		smp_store_release(&io_pfn_cache_devs[slot], dev);
+		spin_unlock(&io_pfn_cache_reg_lock);
+		return c;
+	}
+	spin_unlock(&io_pfn_cache_reg_lock);
+	io_pfn_cache_unreserve(c);
+	free_percpu(c->touches);
+	kfree(c);	/* The registry is full, so this device runs uncached. */
+	return NULL;
+}
+
+/*
+ * Datapath lookup. It never creates a cache: only io_pfn_cache_prepare()
+ * does, where the reservation can be allocated and the device's unbind
+ * and removal watched.
+ */
+static struct io_pfn_cache *io_pfn_cache_get(struct device *dev)
+{
+	int i;
+
+	for (i = 0; i < IO_PFN_CACHE_DEVS; i++) {
+		/* Pairs with the slot-publishing release in __io_pfn_cache_get(). */
+		struct device *d = smp_load_acquire(&io_pfn_cache_devs[i]);
+
+		if (d == dev) {
+			struct io_pfn_cache *c = READ_ONCE(io_pfn_caches[i]);
+
+			/* The slot may have passed to a new device since. */
+			return c->dev == dev ? c : NULL;
+		}
+		if (!d)
+			break;
+	}
+	return NULL;
+}
+
+/*
+ * Everything a cache holds lives in its device's IOMMU domain, and every
+ * IOVA call dereferences the domain the device has at the time. Once the
+ * driver has unbound, the group's domain type can be changed, which frees
+ * the domain, and removal frees it too. dma-debug also reports whatever
+ * the device still has mapped when the unbind completes. So the cache is
+ * retired when the driver starts to unbind, while the domain cannot be
+ * replaced, and a slot that a transfer still in flight holds is unlinked
+ * once the unbind completes and the driver has stopped the device. PCI
+ * unbinds the driver before it removes the device. A bus that removes a
+ * bound device sends BUS_NOTIFY_DEL_DEVICE first, which comes before the
+ * IOMMU's BUS_NOTIFY_REMOVED_DEVICE, so the cache is retired there while
+ * the domain still exists. Such a bus can report the removal while
+ * another task unbinds the driver, so each cache's life_lock serializes
+ * its retires. The lock is per cache: the retire that completes an
+ * unbind runs after the driver core has dropped the binding's hold on
+ * the domain, and a wait there for another device's retire would widen
+ * the window in which a type change can free the domain. The removal
+ * sends BUS_NOTIFY_REMOVED_DEVICE once the driver has unbound, and the
+ * device can no longer bind, so a removed device's cache gives back its
+ * slot arrays there, and with them its registry slot.
+ */
+static int io_pfn_cache_bus_notify(struct notifier_block *nb,
+				   unsigned long action, void *data)
+{
+	struct device *dev = data;
+	int i;
+
+	if (action != BUS_NOTIFY_UNBIND_DRIVER &&
+	    action != BUS_NOTIFY_UNBOUND_DRIVER &&
+	    action != BUS_NOTIFY_DEL_DEVICE &&
+	    action != BUS_NOTIFY_REMOVED_DEVICE)
+		return NOTIFY_DONE;
+	for (i = 0; i < IO_PFN_CACHE_DEVS; i++) {
+		/* Pairs with the slot-publishing release in __io_pfn_cache_get(). */
+		struct device *d = smp_load_acquire(&io_pfn_cache_devs[i]);
+
+		if (!d)
+			break;
+		if (d == dev) {
+			struct io_pfn_cache *c = READ_ONCE(io_pfn_caches[i]);
+
+			if (c->dev != dev)
+				continue;
+			mutex_lock(&c->life_lock);
+			if (action == BUS_NOTIFY_REMOVED_DEVICE) {
+				WRITE_ONCE(c->removed, true);
+				io_pfn_cache_release(c);
+			} else {
+				io_pfn_cache_kill(c, action);
+			}
+			mutex_unlock(&c->life_lock);
+		}
+	}
+	return NOTIFY_OK;
+}
+
+#define IO_PFN_CACHE_BUSES	4
+static const struct bus_type *io_pfn_cache_buses[IO_PFN_CACHE_BUSES];
+static struct notifier_block io_pfn_cache_bus_nb[IO_PFN_CACHE_BUSES];
+static DEFINE_MUTEX(io_pfn_cache_bus_mutex);
+
+/*
+ * Watch @dev's bus for driver unbind and device removal. Returns false
+ * when that cannot be had.
+ */
+static bool io_pfn_cache_watch(struct device *dev)
+{
+	const struct bus_type *bus = dev->bus;
+	bool watched = false;
+	int i;
+
+	if (!bus)
+		return false;
+	mutex_lock(&io_pfn_cache_bus_mutex);
+	for (i = 0; i < IO_PFN_CACHE_BUSES; i++) {
+		if (io_pfn_cache_buses[i] == bus) {
+			watched = true;
+			break;
+		}
+		if (io_pfn_cache_buses[i])
+			continue;
+		io_pfn_cache_bus_nb[i].notifier_call = io_pfn_cache_bus_notify;
+		/*
+		 * The notifier runs ahead of dma-debug's check for mappings
+		 * a driver left behind, which runs at the default priority
+		 * when the unbind completes, so a retire finished there is
+		 * not reported.
+		 */
+		io_pfn_cache_bus_nb[i].priority = 1;
+		if (!bus_register_notifier(bus, &io_pfn_cache_bus_nb[i])) {
+			io_pfn_cache_buses[i] = bus;
+			watched = true;
+		}
+		break;
+	}
+	mutex_unlock(&io_pfn_cache_bus_mutex);
+	return watched;
+}
+
+/*
+ * Bring back a cache that an unbind retired, for its device's new
+ * binding. The caller holds the device lock and c->life_lock. The old
+ * range went with the old binding, so the range is reserved again in
+ * whatever domain the device has now, with the cache's own geometry,
+ * which lockless lookups read and so never changes. Nothing from before
+ * the retire may carry over. An insert that mapped before the retire
+ * keeps its claim, and then its entry, in the xarray until it sees the
+ * mark and takes the entry back out, and its mapping is in the old
+ * domain. The retire's grace period orders that claim before the retire,
+ * so the test below finds it. The test looks for a present entry, claims
+ * included, instead of testing the head, since a claim whose node
+ * allocations failed can leave an empty node linked, which no insert on a
+ * dead cache would ever free. An entry that a transfer from before the
+ * retire still holds keeps its slot until its last put marks it, so the
+ * slot state is reset only once every slot the old range showed is
+ * marked. Until then, while the quantum does not fit the domain, and
+ * while no range can be had, the cache stays retired and the device runs
+ * uncached. The marks are tested before anything is reserved. Once
+ * complete they stay so, since a retired cache hands out no slot and
+ * holds its collector. A lookup takes the slot lock before it links, so
+ * the unlock after the reset orders the new range before any lookup that
+ * finds the cache live.
+ */
+static void io_pfn_cache_revive(struct io_pfn_cache *c)
+{
+	unsigned long index = 0;
+	bool clean;
+
+	if (xa_find(&c->xa, &index, ULONG_MAX, XA_PRESENT) ||
+	    c->quantum != io_dma_map_quantum(c->dev))
+		return;
+	if (c->nslots) {
+		spin_lock(&c->slot_lock);
+		clean = bitmap_equal(c->slots, c->dirty, c->nslots);
+		spin_unlock(&c->slot_lock);
+		if (!clean)
+			return;
+		if (!dma_iova_try_alloc(c->dev, &c->iova, 0,
+					(size_t)c->nslots << c->quantum_shift))
+			return;
+		spin_lock(&c->slot_lock);
+		bitmap_zero(c->slots, c->nslots);
+		bitmap_zero(c->dirty, c->nslots);
+		c->nr_dirty = 0;
+		c->nr_used = 0;
+		c->gc_rescan = false;
+		c->slot_hint = 0;
+		spin_unlock(&c->slot_lock);
+	}
+	atomic_set(&c->gc_busy, 0);
+	WRITE_ONCE(c->gone, false);
+	WRITE_ONCE(c->dead, false);
+	dev_info(c->dev, "io_uring DMA: mapping cache revived\n");
+}
+
+/*
+ * Create the device's cache from a context that may sleep, so its
+ * reservation and bitmap are allocated where they can be. Ring setup
+ * calls this for every channel in the ring's stripe set, and a device
+ * whose cache is live needs nothing more. A device whose bus cannot be
+ * watched runs uncached, since its cache could not be retired before its
+ * domain can go. So does a device that finds the registry full, which is
+ * turned away before the device lock is taken and a cache is built for it
+ * only to be freed. A cache is created, or revived, only while the binding
+ * that registered @chan is in place. That binding holds the device's
+ * default domain, which a driver bound since may leave free to change,
+ * as vfio-pci does, and the ring's channel may come from a binding that
+ * has ended since. An unbind of idxd orphans every channel its clients
+ * hold inside remove(), under the device lock, so under that lock a
+ * channel still on its device's list proves the binding, and a later
+ * unbind retires the cache again. A signal ends the wait for the lock,
+ * as does the task_work that completions on the caller's other rings
+ * queue, unless those rings use DEFER_TASKRUN or SQPOLL. A cache this
+ * call would have created or revived then waits for a later ring.
+ */
+void io_pfn_cache_prepare(struct dma_chan *chan)
+{
+	struct device *dev = chan->device->dev;
+	struct io_pfn_cache *c = io_pfn_cache_get(dev);
+
+	/*
+	 * Only a watched device gets a cache. A binding that began after
+	 * the cache's last retire registered its channels after that
+	 * retire, and a ring acquires a channel only once it is registered,
+	 * so a stale read here can only miss the retire that ends the
+	 * binding of @chan, and the test below would skip that channel too.
+	 */
+	if (c && !READ_ONCE(c->gone))
+		return;
+	if (!c && io_pfn_cache_full(dev))
+		return;
+	/*
+	 * A retired cache whose quantum does not fit the domain stays
+	 * retired until the group's type changes back, since the revive
+	 * refuses it, so it is not worth the device lock, which an FLR or a
+	 * reset holds for up to seconds. While the binding of @chan is in
+	 * place the domain cannot be replaced, so this read is exact, and
+	 * the test below skips any other channel anyway.
+	 */
+	if (c && c->quantum != io_dma_map_quantum(dev))
+		return;
+	if (!io_pfn_cache_watch(dev))
+		return;
+	if (device_lock_interruptible(dev))
+		return;
+	if (dev->driver && !dma_chan_orphaned(chan)) {
+		c = __io_pfn_cache_get(dev, GFP_KERNEL);
+		if (c) {
+			mutex_lock(&c->life_lock);
+			if (READ_ONCE(c->gone))
+				io_pfn_cache_revive(c);
+			mutex_unlock(&c->life_lock);
+		}
+	}
+	device_unlock(dev);
+}
+
+/*
+ * Retired slots stay linked until this collector unlinks them, in runs
+ * of adjacent slots with one IOTLB flush per run. dma_iova_unlink()
+ * cannot queue its flush the way a plain unmap on a flush-queue domain
+ * does, so unlinking every retirement on its own cost the thrashing
+ * cache a third of its throughput. Slots are handed out sequentially
+ * and the sweep retires them in ring order, so runs are long.
+ */
+#define IO_PFN_GC_MIN_DIRTY	64
+#define IO_PFN_GC_RUNS		16
+#define IO_PFN_GC_RUN_MAX	1024	/* slots per unlink: 128 MB */
+
+/*
+ * min_dirty of a caller that needs every retired slot unlinked and has no
+ * later collector to count on: a put after the cap was cleared, which no
+ * lookup will follow, and the end of the age walk (IO_PFN_GC_WALK). Such
+ * a caller that finds another collector at work leaves it a request
+ * instead of returning with its slots still linked. The walk, which runs
+ * in process context, waits for the collector instead.
+ */
+#define IO_PFN_GC_ALL		0
+/*
+ * min_dirty of the age walk's final collect: an IO_PFN_GC_ALL caller in
+ * process context. The slots the walk retired can take thousands of
+ * passes to unlink, so it yields between them, and it waits for a
+ * collector at work rather than leave them to it.
+ */
+#define IO_PFN_GC_WALK		UINT_MAX
+/*
+ * min_dirty of an insert that found the ring full: a threshold of one
+ * whose first pass does not stand aside for an age walk. Until the walk
+ * has collected, nothing else would free a slot, and every insert would
+ * map outside the ring. The pass-end test stops it after that pass while
+ * the walk runs, and an insert that finds another collector at work maps
+ * outside the ring meanwhile.
+ */
+#define IO_PFN_GC_SLOT		(UINT_MAX - 1)
+
+static void __io_pfn_slots_gc(struct io_pfn_cache *c, unsigned int min_dirty)
+{
+	struct { unsigned int start, len; } runs[IO_PFN_GC_RUNS];
+	bool walk = min_dirty == IO_PFN_GC_WALK;
+	bool all = walk || min_dirty == IO_PFN_GC_ALL;
+	bool for_slot = min_dirty == IO_PFN_GC_SLOT;
+	unsigned int n, i, pos;
+	bool more;
+
+	if (all || for_slot)
+		min_dirty = 1;
+	/*
+	 * The age walk retires in PFN order, which scatters its slots over
+	 * the ring until it is done. A collector alongside it would keep
+	 * finding full passes of short runs and unlink them at an IOTLB sync
+	 * each for as long as the walk lasts, on a submitter. So until the
+	 * walk has retired and collected, only a caller that must see its
+	 * slots go collects, and a datapath collector already at work stops
+	 * after its current pass unless it takes such a caller's request.
+	 * A flush's walk and its retry loop stand aside too, and the loop
+	 * waits for the walk's collect. The walk collects at its end, from
+	 * process context, once its slots have joined into what runs they
+	 * can. An insert that found the ring full still collects one pass.
+	 */
+	if (!all && !for_slot && READ_ONCE(c->age_walking))
+		return;
+	while (atomic_cmpxchg(&c->gc_busy, 0, 1)) {
+		bool busy, done;
+
+		if (!all)
+			return;		/* another collector is at it */
+		if (walk) {
+			/*
+			 * A request would hand the walk's scattered slots to
+			 * the collector at work, which may be a submitter, so
+			 * the walk waits for it instead. Once the cache is
+			 * dead, kill holds the collector for good and unlinks
+			 * every slot itself.
+			 */
+			if (READ_ONCE(c->dead))
+				return;
+			cond_resched();
+			continue;
+		}
+		/*
+		 * The collector at work may already be past this caller's
+		 * slots. It lets go only under slot_lock, after it has
+		 * taken any request left there, so either it collects them
+		 * or this caller finds it gone and collects them itself.
+		 * A holder found gone with nothing dirty has collected them.
+		 */
+		spin_lock(&c->slot_lock);
+		busy = atomic_read(&c->gc_busy);
+		if (busy)
+			c->gc_rescan = true;
+		done = busy || !c->nr_dirty;
+		spin_unlock(&c->slot_lock);
+		if (done)
+			return;
+	}
+	do {
+		n = 0;
+		pos = 0;
+		spin_lock(&c->slot_lock);
+		while (n < IO_PFN_GC_RUNS) {
+			unsigned int start, end;
+
+			start = find_next_bit(c->dirty, c->nslots, pos);
+			if (start >= c->nslots)
+				break;
+			end = find_next_zero_bit(c->dirty, c->nslots, start);
+			if (end - start > IO_PFN_GC_RUN_MAX)
+				end = start + IO_PFN_GC_RUN_MAX;
+			bitmap_clear(c->dirty, start, end - start);
+			c->nr_dirty -= end - start;
+			runs[n].start = start;
+			runs[n].len = end - start;
+			n++;
+			pos = end;
+		}
+		spin_unlock(&c->slot_lock);
+		for (i = 0; i < n; i++) {
+			dma_iova_unlink(c->dev, &c->iova,
+					(size_t)runs[i].start << c->quantum_shift,
+					(size_t)runs[i].len << c->quantum_shift,
+					DMA_BIDIRECTIONAL, DMA_ATTR_SKIP_CPU_SYNC);
+			atomic64_inc(&c->unlink_runs);
+			atomic64_add(runs[i].len, &c->unlink_slots);
+		}
+		/* Only now are the slots free to hand out again. */
+		spin_lock(&c->slot_lock);
+		for (i = 0; i < n; i++) {
+			bitmap_clear(c->slots, runs[i].start, runs[i].len);
+			c->nr_used -= runs[i].len;
+		}
+		if (c->gc_rescan) {
+			/*
+			 * A caller retired slots this pass may have missed
+			 * and counts on this collector to unlink them, so from
+			 * here on it collects as that caller would have.
+			 */
+			c->gc_rescan = false;
+			all = true;
+			min_dirty = 1;
+			more = c->nr_dirty != 0;
+		} else {
+			more = n == IO_PFN_GC_RUNS &&
+			       c->nr_dirty >= min_dirty &&
+			       (all || !READ_ONCE(c->age_walking));
+		}
+		if (!more)
+			atomic_set(&c->gc_busy, 0);
+		spin_unlock(&c->slot_lock);
+		if (more && walk)
+			cond_resched();
+	} while (more);
+}
+
+/*
+ * Every lookup calls the collector, so the test that it has nothing to do
+ * stays inline in the caller.
+ */
+static __always_inline void io_pfn_slots_gc(struct io_pfn_cache *c,
+					    unsigned int min_dirty)
+{
+	bool one = min_dirty == IO_PFN_GC_ALL || min_dirty == IO_PFN_GC_WALK ||
+		   min_dirty == IO_PFN_GC_SLOT;
+
+	if (c->nslots && READ_ONCE(c->nr_dirty) >= (one ? 1 : min_dirty))
+		__io_pfn_slots_gc(c, min_dirty);
+}
+
+static int io_pfn_slot_get(struct io_pfn_cache *c)
+{
+	unsigned int slot;
+	bool collected = false;
+
+	if (!c->nslots)
+		return -1;
+again:
+	/*
+	 * A full ring fails on the count, without taking the lock. An age
+	 * walk keeps the ring full until a collect frees its slots, and
+	 * inserts that scanned the whole bitmap under slot_lock to find that
+	 * out kept the walk's own retirements, which take the lock too,
+	 * queued behind them. The count is tested again under the lock, since
+	 * inserts that passed the first test together race for the last free
+	 * slots.
+	 */
+	if (READ_ONCE(c->nr_used) >= c->nslots)
+		goto full;
+	spin_lock(&c->slot_lock);
+	slot = c->nslots;
+	if (c->nr_used < c->nslots) {
+		slot = find_next_zero_bit(c->slots, c->nslots, c->slot_hint);
+		if (slot >= c->nslots)
+			slot = find_first_zero_bit(c->slots, c->nslots);
+	}
+	if (slot >= c->nslots) {
+		spin_unlock(&c->slot_lock);
+		goto full;
+	}
+	__set_bit(slot, c->slots);
+	c->nr_used++;
+	/* Sequential handout keeps entries inserted together adjacent in
+	 * the range: IOMMU page-table locality, and the runs the
+	 * collector unlinks.
+	 */
+	c->slot_hint = slot + 1 < c->nslots ? slot + 1 : 0;
+	spin_unlock(&c->slot_lock);
+	return slot;
+full:
+	if (!collected) {
+		collected = true;
+		io_pfn_slots_gc(c, IO_PFN_GC_SLOT);
+		goto again;
+	}
+	return -1;
+}
+
+/* A slot whose link failed: nothing to unlink, free it outright. */
+static void io_pfn_slot_put(struct io_pfn_cache *c, int slot)
+{
+	spin_lock(&c->slot_lock);
+	__clear_bit(slot, c->slots);
+	c->nr_used--;
+	spin_unlock(&c->slot_lock);
+}
+
+/* A retired entry's slot: mark it for the collector. */
+static void io_pfn_slot_retire(struct io_pfn_cache *c, int slot)
+{
+	spin_lock(&c->slot_lock);
+	WRITE_ONCE(c->by_slot[slot], NULL);
+	__set_bit(slot, c->dirty);
+	c->nr_dirty++;
+	spin_unlock(&c->slot_lock);
+}
+
+/* Map a segment for a new entry: into the reserved range when a slot is
+ * free, else a plain per-entry mapping. Returns the device address or 0.
+ */
+static dma_addr_t io_pfn_map_segment(struct io_pfn_cache *c,
+				     struct io_pfn_map *pm,
+				     struct folio *folio, size_t seg_base,
+				     size_t seg_len)
+{
+	dma_addr_t base;
+	int slot;
+
+	/*
+	 * io_pfn_cache_kill() marks a cache whose binding or device is going
+	 * away and waits a grace period before it touches the IOVA space,
+	 * so a mapping made here either completes first or sees the mark.
+	 * Every call below is safe in atomic context.
+	 */
+	rcu_read_lock();
+	if (unlikely(READ_ONCE(c->dead))) {
+		rcu_read_unlock();
+		return 0;
+	}
+	slot = io_pfn_slot_get(c);
+	if (slot >= 0) {
+		size_t off = (size_t)slot << c->quantum_shift;
+		int err;
+
+		err = dma_iova_link(c->dev, &c->iova,
+				    PFN_PHYS(folio_pfn(folio)) + seg_base, off,
+				    seg_len, DMA_BIDIRECTIONAL,
+				    DMA_ATTR_SKIP_CPU_SYNC);
+		if (!err) {
+			err = dma_iova_sync(c->dev, &c->iova, off, seg_len);
+			if (err)
+				dma_iova_unlink(c->dev, &c->iova, off, seg_len,
+						DMA_BIDIRECTIONAL,
+						DMA_ATTR_SKIP_CPU_SYNC);
+		}
+		if (!err) {
+			pm->slot = slot;
+			WRITE_ONCE(c->by_slot[slot], pm);
+			atomic64_inc(&c->slot_links);
+			rcu_read_unlock();
+			return c->iova.addr + off;
+		}
+		io_pfn_slot_put(c, slot);
+	}
+	if (c->nslots)
+		atomic64_inc(&c->slot_fails);
+	pm->slot = -1;
+	base = dma_map_page_attrs(c->dev, folio_page(folio, 0), seg_base,
+				  seg_len, DMA_BIDIRECTIONAL,
+				  DMA_ATTR_SKIP_CPU_SYNC);
+	rcu_read_unlock();
+	if (dma_mapping_error(c->dev, base))
+		return 0;
+	return base;
+}
+
+/*
+ * The collect of a slot-backed put that found the cap cleared. While the
+ * clear's first round of flushes runs, the put leaves its slot to the
+ * clear, which flushes every cache again after that round. The flush's
+ * walk can retire slots scattered over the ring, and a collector that
+ * took them here would follow the walk on the put's datapath.
+ */
+static void io_pfn_slots_gc_cleared(struct io_pfn_cache *c)
+{
+	/* Pairs with the barrier before the clear's store. */
+	smp_rmb();
+	if (atomic_read(&io_pfn_cache_clearing))
+		return;
+	io_pfn_slots_gc(c, IO_PFN_GC_ALL);
+}
+
+/*
+ * @collect is false when the caller collects after the put: the walk of
+ * a flush or of the age retirement.
+ */
+static void io_pfn_map_unmap(struct io_pfn_map *pm, bool collect)
+{
+	struct io_pfn_cache *c = pm->cache;
+
+	if (pm->slot >= 0) {
+		io_pfn_slot_retire(c, pm->slot);
+		/*
+		 * A walk that collects after its puts has them only mark
+		 * their slots. Each collect scans the whole dirty bitmap and
+		 * unlinks with an IOTLB sync of its own, which a flush at a
+		 * cleared cap would otherwise pay once for every entry.
+		 */
+		if (!collect)
+			return;
+		/*
+		 * With the cache switched off no lookup runs, so no sweep
+		 * would ever collect this slot. A put after the cap was
+		 * cleared therefore collects it, or leaves it to the collector
+		 * at work or to the clear. The barrier pairs with those in
+		 * io_pfn_cache_cap_set(), so either this put sees the cleared
+		 * cap and the clear over, or a flush of the clear finds the
+		 * slot dirty.
+		 */
+		smp_mb();
+		if (unlikely(!READ_ONCE(io_dma_pfn_cache_cap_mb)))
+			io_pfn_slots_gc_cleared(c);
+	} else {
+		dma_unmap_page_attrs(pm->dev, pm->dma_base, pm->size,
+				     DMA_BIDIRECTIONAL, DMA_ATTR_SKIP_CPU_SYNC);
+	}
+}
+
+/*
+ * Drop one reference. The last dropper unmaps and frees, and collects
+ * once the cap is cleared unless @collect is false (io_pfn_map_unmap()).
+ */
+static void __io_pfn_map_put(struct io_pfn_map *pm, bool collect)
+{
+	if (!atomic_dec_and_test(&pm->refs))
+		return;
+	io_pfn_map_unmap(pm, collect);
+	kfree_rcu(pm, rcu);
+}
+
+/* Drop one reference. The last dropper unmaps and frees. */
+static void io_pfn_map_put(struct io_pfn_map *pm)
+{
+	__io_pfn_map_put(pm, true);
+}
+
+/*
+ * Displace an entry from the cache so its mapping dies with its last
+ * reference. The wedge path uses this on cached write destinations,
+ * whose standing mapping a stalled device may still write through, so
+ * no later I/O is handed it. That path keeps its own reference, so the
+ * mapping and its slot stay with the folio it leaks.
+ */
+static void io_pfn_map_displace(struct io_pfn_cache *c, struct io_pfn_map *pm)
+{
+	if (!c || !pm)
+		return;
+	if (xa_cmpxchg(&c->xa, pm->pfn, pm, NULL,
+		       GFP_NOWAIT | __GFP_NOWARN) == pm) {
+		atomic64_sub(pm->size, &c->covered);
+		io_pfn_map_put(pm);	/* the cache bias */
+	}
+}
+
+/*
+ * Wait for a pending insert of @pfn. Returns the entry with a reference
+ * taken, or NULL when the claim was dropped or the wait ran out.
+ */
+static struct io_pfn_map *io_pfn_map_wait(struct io_pfn_cache *c,
+					  unsigned long pfn)
+{
+	u64 end = ktime_get_ns() +
+		  (u64)READ_ONCE(io_dma_pfn_wait_us) * NSEC_PER_USEC;
+	struct io_pfn_map *pm;
+	void *e;
+
+	do {
+		cpu_relax();
+		rcu_read_lock();
+		e = xa_load(&c->xa, pfn);
+		if (e && !xa_is_value(e)) {
+			pm = e;
+			if (atomic_inc_not_zero(&pm->refs)) {
+				rcu_read_unlock();
+				return pm;
+			}
+		}
+		rcu_read_unlock();
+		if (!e)
+			return NULL;	/* the claimant gave up */
+	} while (ktime_get_ns() < end);
+	atomic64_inc(&c->wait_timeouts);
+	return NULL;
+}
+
+/*
+ * Finish a hit on @pm, which the caller holds a reference to. Every
+ * cached entry covers a whole quantum and the caller has already bounded
+ * the span to one, so a span past the entry cannot happen; the check
+ * guards that invariant rather than a case. Every hit ends here, so it
+ * stays inline in the lookup.
+ */
+static __always_inline struct io_pfn_map *
+io_pfn_map_hit(struct io_pfn_cache *c, struct io_pfn_map *pm, size_t rel,
+	       size_t len, dma_addr_t *dma, atomic64_t *counter)
+{
+	if (WARN_ON_ONCE(rel + len > pm->size)) {
+		atomic64_inc(&c->range_fallbacks);
+		io_pfn_map_put(pm);
+		return NULL;
+	}
+	WRITE_ONCE(pm->referenced, true);
+	WRITE_ONCE(pm->last_used, jiffies);
+	atomic64_inc(counter);
+	*dma = pm->dma_base + rel;
+	return pm;
+}
+
+/* A ghost's value is its eviction time in jiffies, cut to fit a value. */
+#define IO_PFN_GHOST_TIME_MASK	(LONG_MAX >> 1)
+
+/*
+ * A ghost older than twice max_age, or two minutes when aging is off,
+ * can no longer say anything about the present working set.
+ */
+static bool io_pfn_ghost_stale(void *gv, unsigned long max_age)
+{
+	unsigned long age = (jiffies - xa_to_value(gv)) &
+			    IO_PFN_GHOST_TIME_MASK;
+
+	return age > 2 * msecs_to_jiffies(max_age ? max_age : 60000);
+}
+
+/*
+ * A ghost's index is its segment-head PFN scaled down by the quantum.
+ * Every cached segment is a whole quantum of a folio at least that large,
+ * and folios are naturally aligned, so the scaling loses nothing, and an
+ * xarray leaf holds up to 64 ghosts instead of two. Were two segments to
+ * share an index, they would only share a sizing hint.
+ */
+static unsigned long io_pfn_ghost_index(struct io_pfn_cache *c,
+					unsigned long pfn)
+{
+	unsigned int shift = c->quantum_shift > PAGE_SHIFT ?
+			     c->quantum_shift - PAGE_SHIFT : 0;
+
+	return pfn >> shift;
+}
+
+/*
+ * Remember the key of an entry that cap pressure took. The list holds no
+ * more keys than the cache could hold entries, under its hard cap and
+ * its reservation. A key that more evictions than that have followed
+ * would not have stayed even in a cache of that size, so it cannot show
+ * the target too small, and without the bound a list that only the purge
+ * trims grows with every segment the cache ever evicts. At the bound the
+ * new ghost replaces the first one at or past the purge hand, so the list
+ * follows the present evictions instead of keeping the first ones. That
+ * is random in time only while evictions come in no PFN order. Evictions
+ * in ascending PFN order can bring the hand up behind the newest ghosts,
+ * which it then erases as they come, so a pass of a sequential re-read
+ * can lose most of its ghosts before the next pass reaches them. Each
+ * purge moves the hand past the fresh ghosts it visits, which keeps those
+ * until the hand comes round again. A list that a lowered cap left over
+ * the bound loses two ghosts for every one added, so it shrinks back with
+ * the evictions instead of staying as long as they keep its ghosts fresh.
+ * Runs under c->lock, which the hand needs.
+ */
+static void io_pfn_ghost_add(struct io_pfn_cache *c, unsigned long pfn)
+{
+	u64 max = ((u64)READ_ONCE(io_dma_pfn_cache_cap_mb) << 20) >>
+		  c->quantum_shift;
+	unsigned int i;
+	void *old;
+
+	lockdep_assert_held(&c->lock);
+	if (c->nslots)
+		max = min_t(u64, max, c->nslots);
+	if (!max)
+		return;
+	for (i = 0; i < 2 && atomic64_read(&c->ghost_count) >= (s64)max; i++) {
+		unsigned long gidx = c->ghost_hand;
+
+		old = xa_find(&c->ghost, &gidx, ULONG_MAX, XA_PRESENT);
+		if (!old) {
+			gidx = 0;
+			old = xa_find(&c->ghost, &gidx, ULONG_MAX, XA_PRESENT);
+		}
+		if (!old)
+			break;
+		if (xa_erase(&c->ghost, gidx))
+			atomic64_dec(&c->ghost_count);
+		c->ghost_hand = gidx + 1;
+	}
+	/*
+	 * Counted before the store, so that a hit or a flush that takes the
+	 * new ghost out at once cannot drive the count below the list, and
+	 * taken back when the store added no key: a key ghosted again unhit,
+	 * or a failed allocation.
+	 */
+	atomic64_inc(&c->ghost_count);
+	old = xa_store(&c->ghost, io_pfn_ghost_index(c, pfn),
+		       xa_mk_value(jiffies & IO_PFN_GHOST_TIME_MASK),
+		       GFP_NOWAIT | __GFP_NOWARN);
+	if (old)
+		atomic64_dec(&c->ghost_count);
+}
+
+/*
+ * The CLOCK sweep advances the hand from where it last stopped.  It
+ * gives referenced entries a second chance and skips entries with
+ * in-flight users.  The second chance provides scan resistance since a
+ * streaming pattern cannot flush the recycling working set, whose
+ * entries keep their bit set.  The sweep runs on the submit path, from
+ * every lookup and again when an insert pushes covered past the cap.
+ * The not-due early-out, the trylock, which fails when another
+ * submitter is already sweeping, and the visit budget bound the added
+ * latency.  A lookup also starts the age walk, which runs from a work
+ * item.  A cache that sees no lookups at all does not age.  There is
+ * no timer: the CLOCK sweep rides the datapath and the age walk is
+ * started from it.
+ */
+/*
+ * Retire entries, under two policies.
+ *
+ * Over the cap, the CLOCK hand advances from where it stopped and
+ * gives referenced entries a second chance, which is what keeps a
+ * streaming pattern from flushing a recycling working set.
+ *
+ * Independently of the cap, the age walk retires every entry that no
+ * I/O has touched for max_age. Age takes precedence over the second
+ * chance, since an idle entry's reference bit only records that it was
+ * used at some point in the past, not recently.
+ */
+/*
+ * Take @pm out of the cache and drop its bias. Identity-checked: the
+ * flush, the age walk and the write wedge's displacement remove entries
+ * without the cache lock, so between a walk handing us @pm and the
+ * removal another CPU can take it out, drop the bias and insert a
+ * replacement under the same key. Only the remover that actually took an
+ * entry out may retire it. Returns false when someone else got there
+ * first. An aged retirement needs no lock. A capped one runs under
+ * c->lock, which its ghost needs.
+ */
+static bool io_pfn_cache_retire(struct io_pfn_cache *c, struct io_pfn_map *pm,
+				bool aged)
+{
+	if (xa_cmpxchg(&c->xa, pm->pfn, pm, NULL,
+		       GFP_NOWAIT | __GFP_NOWARN) != pm)
+		return false;
+	atomic64_sub(pm->size, &c->covered);
+	atomic64_inc(&c->evictions);
+	if (aged) {
+		atomic64_inc(&c->age_evictions);
+	} else if (READ_ONCE(io_dma_pfn_cache_auto)) {
+		/*
+		 * Cap pressure took a live-looking entry. Remember its key
+		 * so a near-term re-read can prove the target too small.
+		 * Values carry the eviction time, for the purge and for the
+		 * staleness test of a hit.
+		 */
+		io_pfn_ghost_add(c, pm->pfn);
+	}
+	/*
+	 * Drop the cache bias. An aged retirement comes from the age walk,
+	 * which collects what it retired, so its put leaves the slot to it.
+	 */
+	__io_pfn_map_put(pm, !aged);
+	return true;
+}
+
+/*
+ * The cap walk over the reserved range: the CLOCK hand goes round the
+ * slot ring in insertion order, which is the canonical CLOCK and what
+ * makes retirements adjacent for the collector. Called under c->lock
+ * with RCU held. Returns with *over updated.
+ */
+static void io_pfn_cache_sweep_ring(struct io_pfn_cache *c, u64 target,
+				    bool *over, int *budget, int *unmaps)
+{
+	unsigned int slot = c->slot_hand;
+	bool wrapped = false;
+
+	while (*over) {
+		struct io_pfn_map *pm;
+
+		slot = find_next_bit(c->slots, c->nslots, slot);
+		if (slot >= c->nslots) {
+			if (wrapped)
+				break;
+			wrapped = true;
+			slot = 0;
+			continue;
+		}
+		pm = READ_ONCE(c->by_slot[slot]);
+		slot++;
+		/*
+		 * A retired slot counts against the budget too. The age walk
+		 * leaves what it retired uncollected until its collect ends,
+		 * and a sweep that passed over that for free could cross the
+		 * whole stretch the walk had retired, on a submitter.
+		 */
+		if (--*budget <= 0)
+			break;
+		if (!pm)
+			continue;	/* retired, or still linking */
+		if (atomic_read(&pm->refs) > 1) {
+			atomic64_inc(&c->ref_skips);
+			continue;
+		}
+		if (READ_ONCE(pm->referenced)) {
+			WRITE_ONCE(pm->referenced, false);
+			continue;
+		}
+		if (!io_pfn_cache_retire(c, pm, false))
+			continue;
+		*over = atomic64_read(&c->covered) >
+			(s64)(target + ((u64)c->quantum << 2));
+		if (--*unmaps <= 0)
+			break;
+	}
+	c->slot_hand = slot < c->nslots ? slot : 0;
+}
+
+/*
+ * Segment touches so far, an op's first chunk on each segment, summed
+ * over the CPUs. Read on the tick and for the stats, never on the
+ * datapath.
+ */
+static u64 io_pfn_cache_touches(struct io_pfn_cache *c)
+{
+	u64 n = 0;
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		n += *per_cpu_ptr(c->touches, cpu);
+	return n;
+}
+
+/*
+ * Judge a fill on short ticks: a probe's refill after a park, or the
+ * first fill after a flush. A fresh fill has no earlier tick to compare
+ * against, so its first probe tick supplies one; a probe from a park
+ * keeps the tick that parked.
+ */
+static void io_pfn_cache_probe_arm(struct io_pfn_cache *c, bool from_park)
+{
+	c->probing = IO_PFN_ADAPT_TICK / IO_PFN_PROBE_TICK;
+	c->probe_from_park = from_park;
+	if (!from_park) {
+		c->prev_smiss = IO_PFN_SMISS_NONE;
+		c->next_adapt = jiffies + IO_PFN_PROBE_TICK;
+	}
+}
+
+/*
+ * Park, and set when to probe again: a probe that only confirmed the
+ * pattern doubles the wait, up to probe_ticks_max; a park from an
+ * engaged cache starts over at probe_ticks.
+ */
+static void io_pfn_cache_park(struct io_pfn_cache *c)
+{
+	if (c->probing && c->probe_from_park)
+		c->probe_interval = min(c->probe_interval * 2,
+					IO_PFN_PROBE_TICKS_MAX);
+	else
+		c->probe_interval = IO_PFN_PROBE_TICKS;
+	WRITE_ONCE(c->eff_cap, IO_PFN_EFF_PARKED);
+	c->parked_ticks = 0;
+	c->probing = 0;
+}
+
+/*
+ * The adaptive tick. On a tick without a single ghost hit the target
+ * settles toward what is mapped, an eighth of the way per tick, and
+ * never under it: evicting live mappings to find out whether they have
+ * gone stale costs more than stale mappings do (a re-read after a 64 GB
+ * stream ran the same with 14 GB per device of them standing, and a
+ * write whose target had crept under its set lost a third), so idle
+ * entries are left to the age walk. Growth happens on the miss path.
+ * Runs under c->lock. The evictions it counts are the cap's alone: the
+ * age walk retires idle entries in bursts, which say nothing about the
+ * pattern. An aged retirement counts in both counters, so those between
+ * the two reads can put the difference off either way, even below zero.
+ * The difference and its change since the last tick are both clamped at
+ * zero, which keeps every tick sane. A lookup that waited for another
+ * CPU's insert counts as a hit, since the entry served it: a convoy's
+ * followers are reuse. Without them four jobs reading a large file once
+ * would read as streaming, and two re-reading a set larger than the
+ * ceiling as a cyclic set. The tick also recounts the caches the budget
+ * is split across.
+ */
+static void io_pfn_cache_adapt_tick(struct io_pfn_cache *c, u64 cap)
+{
+	u64 gh = atomic64_read(&c->ghost_hits);
+	u64 h = atomic64_read(&c->hits) + atomic64_read(&c->waits);
+	u64 m = atomic64_read(&c->misses);
+	u64 ins = atomic64_read(&c->inserts);
+	u64 ev = max_t(s64, atomic64_read(&c->evictions) -
+			    atomic64_read(&c->age_evictions), 0);
+	u64 t = io_pfn_cache_touches(c);
+	u64 dh = h - c->hits_snap;
+	u64 dm = m - c->misses_snap;
+	u64 di = ins - c->inserts_snap;
+	u64 de = ev > c->evictions_snap ? ev - c->evictions_snap : 0;
+	u64 dt = t > c->touches_snap ? t - c->touches_snap : 0;
+	unsigned long tick = IO_PFN_ADAPT_TICK;
+	u64 floor, eff;
+
+	WRITE_ONCE(c->nr_sharing, io_pfn_cache_sharing(c));
+	floor = io_pfn_cache_floor(io_pfn_cache_ceiling(c, cap));
+	eff = io_pfn_cache_target(c, cap);
+
+	if (READ_ONCE(c->eff_cap) == IO_PFN_EFF_PARKED) {
+		/*
+		 * Parked: the cache proved useless
+		 * for the current pattern and every
+		 * lookup bypasses it. Probe again
+		 * periodically; access patterns
+		 * change with workload phases.
+		 */
+		if (++c->parked_ticks >= c->probe_interval) {
+			c->parked_ticks = 0;
+			/* One dead probe tick re-parks. */
+			c->dead_ticks = 1;
+			WRITE_ONCE(c->eff_cap, floor);
+			/*
+			 * Judge the probe on short ticks, a normal
+			 * tick's worth of them at most, so a set that
+			 * refills the ceiling and churns is re-parked
+			 * about as soon as it has, not a whole tick
+			 * later. A short tick that finds the ring still
+			 * filling has no verdict and just hands on to
+			 * the next.
+			 */
+			io_pfn_cache_probe_arm(c, true);
+			tick = IO_PFN_PROBE_TICK;
+		}
+	} else {
+		bool ghosting =
+			gh != c->ghost_hits_snap;
+		u64 dg = gh - c->ghost_hits_snap;
+		u64 turned = c->cyclic_turnover + de;
+		/*
+		 * Per segment touch: the inserts are the segment miss,
+		 * the lookups the chunk amortization.
+		 */
+		u32 smiss = dt ? (u32)min_t(u64, div64_u64(di * 100, dt),
+					    100) : 0;
+		u64 lkpt = dt ? div64_u64(dh + dm, dt) : 0;
+		/*
+		 * Whether the tick's traffic paid for the evictions it
+		 * brought: enough chunk lookups per touch that a plain map
+		 * for each would cost more, or few enough inserts that the
+		 * set is as good as fitting.
+		 */
+		bool pays = lkpt >= IO_PFN_PARK_LOOKUPS ||
+			    smiss < IO_PFN_PARK_MISS_PCT;
+		/* No longer improving tick over tick. */
+		bool flat = smiss + 2 >= c->prev_smiss;
+		/*
+		 * A probe's ticks compare against the tick that parked:
+		 * the probe's own refill reads as all misses, and the
+		 * next tick against it as improvement, which would spare
+		 * a set that has not changed.
+		 */
+		bool probing = c->probing > 0;
+		unsigned int settle = IO_PFN_ADAPT_DECAY_SHIFT;
+
+		if (probing) {
+			c->probing--;
+			tick = IO_PFN_PROBE_TICK;
+			/* A short tick settles by its share of a whole one. */
+			settle += ilog2(IO_PFN_ADAPT_TICK / IO_PFN_PROBE_TICK);
+		}
+
+		/* Only a row of cyclic ticks adds up. */
+		c->cyclic_turnover = 0;
+		/*
+		 * A fresh fill's early ticks are fill-heavy, so its miss
+		 * ratio falls for a tick or two after the ring is full,
+		 * which reads as improvement; with the target at the
+		 * ceiling there is no growth left for that to mean, and
+		 * the turnover below still guards a switch of phases.
+		 */
+		if (ghosting && !pays &&
+		    (flat || (probing && !c->probe_from_park)) &&
+		    eff >= io_pfn_cache_ceiling(c, cap) &&
+		    atomic64_read(&c->covered) >= (s64)eff && de) {
+			/*
+			 * Gate only once growth is
+			 * exhausted: the target is at
+			 * the ceiling, and the cache
+			 * has filled it and evicts.
+			 * Before that a low, flat
+			 * ratio is what mid-fill
+			 * looks like for a set that
+			 * will fit, and growth
+			 * resolves it. The target
+			 * alone does not say, since
+			 * ghost hits carry it to the
+			 * ceiling long before the
+			 * cache fills it.
+			 */
+			/*
+			 * Ghost hits keep demanding
+			 * growth but the hit ratio
+			 * is low and no longer
+			 * improving: a cyclic set
+			 * larger than the ceiling,
+			 * where growth cannot help
+			 * until the whole set fits,
+			 * which it never will. A set
+			 * still growing toward a fit
+			 * shows a climbing ratio and
+			 * is spared. Park, not halve:
+			 * a smaller cache misses such
+			 * a set as often, and a halved
+			 * target would only invite
+			 * the next ghost hit to grow
+			 * it back to the ceiling.
+			 * Park only once a row of such
+			 * ticks has evicted more than
+			 * the ceiling holds. A switch
+			 * between two phases that each
+			 * fit evicts no more than that
+			 * before the new phase hits,
+			 * and a set that will never
+			 * fit gets there within one
+			 * turnover.
+			 */
+			/*
+			 * A probe from a park needs no
+			 * turnover: a full ring evicting
+			 * with its misses mostly ghost
+			 * hits is the parked set back,
+			 * still not fitting. A set that
+			 * now fits evicts nothing; a new
+			 * set is not in the ghost and
+			 * earns its park by turnover.
+			 */
+			if (turned <= eff >> c->quantum_shift &&
+			    !(probing && c->probe_from_park &&
+			      dg * 2 >= di)) {
+				c->cyclic_turnover =
+					min_t(u64, turned, U32_MAX);
+				c->dead_ticks = 0;
+			} else {
+				io_pfn_cache_park(c);
+				tick = IO_PFN_ADAPT_TICK;
+			}
+		} else if (!ghosting &&
+			   di >= IO_PFN_DEAD_MIN_INSERTS &&
+			   de * 2 >= di &&
+			   !pays &&
+			   (!probing || c->probe_from_park) &&
+			   ++c->dead_ticks >= 2) {
+			/*
+			 * Streaming: the tick retired
+			 * about what it inserted and
+			 * missed none of it. The cache
+			 * only taxes such a pattern
+			 * with an insert, an eviction
+			 * and a flush share per touch.
+			 * A fresh fill is judged on
+			 * whole ticks here: a one-pass
+			 * scan a re-read follows must
+			 * not park the cache under it.
+			 */
+			io_pfn_cache_park(c);
+			c->dead_ticks = 0;
+			tick = IO_PFN_ADAPT_TICK;
+		} else if (!ghosting) {
+			u64 held = max_t(s64,
+					 atomic64_read(&c->covered), 0);
+
+			if (di < IO_PFN_DEAD_MIN_INSERTS ||
+			    de * 2 < di ||
+			    pays)
+				c->dead_ticks = 0;
+			/*
+			 * Settle toward the resident set plus the
+			 * headroom a ghost hit would leave over it,
+			 * so the sweep stays off a set that fits. A
+			 * tick that inserted and evicted nothing is a
+			 * fill under way, not a quiet one: the target
+			 * holds until the set has arrived, or a fill
+			 * judged on short ticks would be cut off under
+			 * the ceiling before it could reach it.
+			 */
+			held += held >> 3;
+			if (di < IO_PFN_DEAD_MIN_INSERTS || de)
+				eff -= eff >> settle;
+			WRITE_ONCE(c->eff_cap,
+				   max3(eff, floor,
+					min(held,
+					    io_pfn_cache_ceiling(c, cap))));
+		} else {
+			c->dead_ticks = 0;
+		}
+		/*
+		 * A probe from a park compares every tick against the
+		 * one that parked; a fresh fill compares tick to tick.
+		 */
+		if (!probing || !c->probe_from_park)
+			c->prev_smiss = smiss;
+	}
+	c->ghost_hits_snap = gh;
+	c->hits_snap = h;
+	c->misses_snap = m;
+	c->inserts_snap = ins;
+	c->evictions_snap = ev;
+	c->touches_snap = t;
+	c->next_adapt = jiffies + tick;
+}
+
+/*
+ * Purge stale ghosts (io_pfn_ghost_stale()). Bounded walk from a hand.
+ * Runs under c->lock. A ghost hit may take a ghost out concurrently, so
+ * only the eraser that got it counts it.
+ */
+static void io_pfn_cache_purge_ghosts(struct io_pfn_cache *c,
+				      unsigned long max_age)
+{
+	unsigned long gidx = 0;
+	void *gv;
+	int gbudget = IO_PFN_EVICT_BUDGET;
+
+	xa_for_each_start(&c->ghost, gidx, gv,
+			  c->ghost_hand) {
+		if (--gbudget <= 0)
+			break;
+		if (io_pfn_ghost_stale(gv, max_age) &&
+		    xa_erase(&c->ghost, gidx))
+			atomic64_dec(&c->ghost_count);
+	}
+	c->ghost_hand = gbudget <= 0 ? gidx + 1 : 0;
+}
+
+/*
+ * How long until the next age walk. Each walk visits every entry, so a
+ * larger cache is walked less often, at about IO_PFN_AGE_VISITS entries a
+ * second, but at least once per quarter of max_age and at most once a
+ * second. An idle entry is therefore unmapped no later than a quarter of
+ * max_age after it ages, or a second when that is longer, plus the walk
+ * itself and the wait for the lookup that starts it.
+ */
+#define IO_PFN_AGE_VISITS	4096
+
+static unsigned long io_pfn_cache_age_period(struct io_pfn_cache *c,
+					     unsigned long max_age)
+{
+	u64 n = max_t(s64, atomic64_read(&c->covered), 0) >> c->quantum_shift;
+	unsigned long most = max_t(unsigned long,
+				   msecs_to_jiffies(max_age) / 4, HZ);
+
+	return clamp_t(unsigned long, div_u64(n * HZ, IO_PFN_AGE_VISITS),
+		       HZ, most);
+}
+
+/*
+ * The age walk. A lookup starts it once per period and it runs here, off
+ * the datapath, so that it can visit every entry and retire every idle
+ * one. A walk on the datapath, under the cache lock, has to stop after a
+ * bounded number of visits and retirements, and a large idle population
+ * would leave at a few dozen entries a second. Retirement is
+ * identity-checked, so the walk needs no cache lock against the CLOCK
+ * sweep or a flush. Entries are freed with kfree_rcu(), so each batch of
+ * visits holds the read lock, and the walk yields between batches.
+ */
+static void io_pfn_cache_age_work(struct work_struct *work)
+{
+	struct io_pfn_cache *c = container_of(work, struct io_pfn_cache,
+					      age_work);
+	unsigned long max_age = READ_ONCE(io_dma_pfn_cache_max_age_ms);
+	unsigned int visits = 0, retired = 0;
+	unsigned long index, age_before;
+	struct io_pfn_map *pm;
+	bool walking = false;
+
+	if (max_age) {
+		unsigned long next = READ_ONCE(c->next_age);
+		unsigned long due = jiffies +
+				    io_pfn_cache_age_period(c, max_age);
+
+		/*
+		 * A write of pfn_cache_max_age_ms in the jiffy a walk falls
+		 * due re-arms next_age with the value it already had, so a
+		 * lookup that read the old age can still win its exchange and
+		 * arm the next walk a quarter of the old age out. Such a
+		 * lookup has queued this walk, which reads the new age, so the
+		 * walk pulls the next start in to its own period.
+		 */
+		if (time_after(next, due))
+			cmpxchg(&c->next_age, next, due);
+		age_before = jiffies - msecs_to_jiffies(max_age);
+		rcu_read_lock();
+		xa_for_each(&c->xa, index, pm) {
+			bool aged;
+
+			/*
+			 * io_pfn_cache_kill() waits a grace period after the
+			 * mark, so a retirement here, and the unmap that a
+			 * plain-mapped one does, finishes before it touches
+			 * the device's IOVA space. A cleared cap is followed
+			 * by a flush that revokes every entry, so the walk
+			 * leaves the rest to it.
+			 */
+			if (READ_ONCE(c->dead) ||
+			    !READ_ONCE(io_dma_pfn_cache_cap_mb))
+				break;
+			if (xa_is_value(pm))
+				continue;	/* an insert's claim */
+			/*
+			 * Age first, so that ref_skips counts only an aged
+			 * entry that an I/O still holds, which is rare, and
+			 * not every in-flight entry the walk passes.
+			 */
+			aged = time_before(READ_ONCE(pm->last_used),
+					   age_before);
+			if (aged && atomic_read(&pm->refs) > 1) {
+				atomic64_inc(&c->ref_skips);
+			} else if (aged) {
+				/* Datapath collectors stand aside from here. */
+				if (!walking) {
+					WRITE_ONCE(c->age_walking, true);
+					walking = true;
+				}
+				if (io_pfn_cache_retire(c, pm, true))
+					retired++;
+			}
+			if (++visits >= IO_PFN_EVICT_BUDGET ||
+			    retired >= IO_PFN_EVICT_UNMAP_MAX) {
+				visits = 0;
+				retired = 0;
+				rcu_read_unlock();
+				cond_resched();
+				rcu_read_lock();
+			}
+		}
+		rcu_read_unlock();
+	}
+	/*
+	 * Retirement only marks a slot, and the datapath collector waits
+	 * for a run of them. An idle cache would otherwise leave its last
+	 * retired slots linked indefinitely, so the walk collects whatever
+	 * it retired. It does so before it lets the datapath collectors
+	 * back in, since one of them would otherwise take the whole
+	 * collect, at an IOTLB sync per short run, on a submitter. A walk
+	 * that retired nothing owes nothing and has kept no collector out,
+	 * so it only collects what the datapath left under its threshold,
+	 * and not while another collector is at work.
+	 */
+	io_pfn_slots_gc(c, walking ? IO_PFN_GC_WALK : 1);
+	if (walking)
+		WRITE_ONCE(c->age_walking, false);
+}
+
+static void io_pfn_cache_evict(struct io_pfn_cache *c, u64 cap)
+{
+	unsigned long next_age = READ_ONCE(c->next_age);
+	unsigned long max_age;
+	u64 target = io_pfn_cache_target(c, cap);
+	struct io_pfn_map *pm;
+	unsigned long index;
+	int budget = IO_PFN_EVICT_BUDGET;
+	int unmaps = IO_PFN_EVICT_UNMAP_MAX;
+	bool over, aging, adapt_due, xa_over;
+	int pass;
+
+	/*
+	 * Pairs with the barrier in io_pfn_cache_max_age_set(): a lookup
+	 * that finds the walk re-armed also finds the age it was re-armed
+	 * for, so it cannot arm the next walk a quarter of the old age out.
+	 */
+	smp_rmb();
+	max_age = READ_ONCE(io_dma_pfn_cache_max_age_ms);
+
+	io_pfn_slots_gc(c, IO_PFN_GC_MIN_DIRTY);
+
+	/* A dead-band of a few segments over the target parks the sweep
+	 * when a fitting working set sits at its converged size; without
+	 * it every insert at the boundary evicts one entry and the sweep
+	 * stays hot on the datapath.
+	 */
+	over = atomic64_read(&c->covered) >
+		(s64)(target + ((u64)c->quantum << 2));
+	aging = max_age && time_after(jiffies, next_age);
+	/* The adaptive tick is independent of aging, so a cache with
+	 * max_age_ms at 0 still decays, parks and unparks.
+	 */
+	adapt_due = READ_ONCE(io_dma_pfn_cache_auto) &&
+		    time_after(jiffies, READ_ONCE(c->next_adapt));
+	if (!over && !aging && !adapt_due)
+		return;
+
+	/*
+	 * The age walk visits every entry, which no lookup can afford
+	 * under the cache lock, so the lookup only starts it. The exchange
+	 * picks one lookup per period.
+	 */
+	if (aging) {
+		unsigned long due = jiffies +
+				    io_pfn_cache_age_period(c, max_age);
+
+		if (cmpxchg(&c->next_age, next_age, due) == next_age)
+			queue_work(system_dfl_long_wq, &c->age_work);
+	}
+
+	if (!spin_trylock(&c->lock))
+		return;
+
+	/*
+	 * The entries this walk examines are freed with kfree_rcu(), and
+	 * the xarray iterators hand them back outside any read-side
+	 * section. Under preemptible RCU c->lock is not one, so a grace
+	 * period elapsing mid-sweep would leave it reading freed entries.
+	 */
+	rcu_read_lock();
+
+	if (adapt_due || (aging && READ_ONCE(io_dma_pfn_cache_auto))) {
+		if (time_after(jiffies, c->next_adapt))
+			io_pfn_cache_adapt_tick(c, cap);
+		io_pfn_cache_purge_ghosts(c, max_age);
+	}
+
+	/*
+	 * A lookup that passed the dead test before io_pfn_cache_kill() set
+	 * the mark can still get here. The retire's grace period orders the
+	 * mark before any read-side section that it does not wait for, so
+	 * such a sweep leaves the ring, whose arrays a removed device's cache
+	 * gives back (io_pfn_cache_release()).
+	 */
+	if (over && c->nslots && !READ_ONCE(c->dead))
+		io_pfn_cache_sweep_ring(c, target, &over, &budget, &unmaps);
+	/*
+	 * The xarray walk carries cap pressure only for a cache without a
+	 * ring: mixing the ring's insertion order with the tree's PFN order
+	 * would undo the runs. A ring cache's plain-mapped remainder,
+	 * entries that found the ring full, is retired by age, and by this
+	 * walk while the cache is parked. When the ceiling is the whole
+	 * ring, as at the defaults, a cyclic park comes at a full ring, so
+	 * there is such a remainder, and left in place it would keep
+	 * covered over the dead band and send every parked lookup through a
+	 * ring sweep that scans the empty slot bitmap twice. The walk
+	 * leaves slot-backed entries to the ring sweep.
+	 */
+	xa_over = over && (!c->nslots || !target);
+	for (pass = 0; pass < 2 && xa_over; pass++) {
+		unsigned long start = pass ? 0 : c->hand;
+
+		if (budget <= 0 || unmaps <= 0)
+			break;
+
+		xa_for_each_start(&c->xa, index, pm, start) {
+			if (xa_is_value(pm))
+				continue;	/* an insert's claim */
+			if (--budget <= 0) {
+				c->hand = index + 1;
+				goto out;
+			}
+			if (c->nslots && pm->slot >= 0)
+				continue;	/* the ring sweep's */
+			if (atomic_read(&pm->refs) > 1) {
+				atomic64_inc(&c->ref_skips);
+				continue;
+			}
+			if (READ_ONCE(pm->referenced)) {
+				WRITE_ONCE(pm->referenced, false);
+				continue;
+			}
+			if (!io_pfn_cache_retire(c, pm, false))
+				continue;
+			xa_over = atomic64_read(&c->covered) >
+				(s64)(target + ((u64)c->quantum << 2));
+			if (--unmaps <= 0 || !xa_over) {
+				c->hand = index + 1;
+				goto out;
+			}
+		}
+		c->hand = 0;
+	}
+out:
+	rcu_read_unlock();
+	spin_unlock(&c->lock);
+}
+
+/*
+ * Look up or create the persistent mapping covering [offset,
+ * offset+len) from the head of @folio and return it with an in-flight
+ * reference taken.  *dma is set to the chunk's device address.  NULL
+ * means the caller should fall back to a plain per-chunk map and is
+ * never an error.
+ *
+ * Entries are quantized.  The folio is carved into c->quantum segments
+ * from its head, each cached and mapped independently, so that every
+ * IOVA allocation stays inside the IOMMU's per-CPU rcache size
+ * classes.  The chunk must lie within one segment.  The filemap-read
+ * path splits chunks at segment boundaries to guarantee this and a
+ * chunk that crosses one falls back to a plain map.
+ *
+ * @map_len is the known physically contiguous extent from the folio
+ * head, which is folio_size() for page-cache folios.
+ *
+ * @touch says this chunk is the op's first on its segment; later
+ * chunks of the same segment are the same access for the touch count
+ * and are not counted again.
+ */
+static struct io_pfn_map *io_pfn_map_lookup(struct io_pfn_cache *c,
+					    struct folio *folio,
+					    size_t offset, size_t len,
+					    size_t map_len, bool touch,
+					    dma_addr_t *dma)
+{
+	u64 cap = (u64)READ_ONCE(io_dma_pfn_cache_cap_mb) << 20;
+	size_t seg_base, seg_len, rel;
+	struct io_pfn_map *pm, *old;
+	unsigned long pfn;
+	dma_addr_t base;
+
+	if (!c || !cap || READ_ONCE(c->dead))
+		return NULL;
+
+	/*
+	 * Parked: every lookup takes the caller's plain map, and all the
+	 * cache owes it is the drain of what the park left and the tick
+	 * that will probe again, both of which the sweep runs. So the
+	 * sweep is entered only when one is due, and the segment math,
+	 * the touch count and the sweep's own bookkeeping wait for the
+	 * probe: through the full path a parked 128 KB read, eighteen
+	 * lookups a segment, ran five percent under cache-off.
+	 */
+	if (READ_ONCE(io_dma_pfn_cache_auto) &&
+	    READ_ONCE(c->eff_cap) == IO_PFN_EFF_PARKED) {
+		if (atomic64_read(&c->covered) >
+		    (s64)((u64)c->quantum << 2) ||
+		    time_after(jiffies, READ_ONCE(c->next_adapt)))
+			io_pfn_cache_evict(c, cap);
+		return NULL;
+	}
+
+	/* Give the sweep a chance, and the age walk a start, on every
+	 * lookup. Below the cap with nothing due this is a few reads and
+	 * compares. Without this an idle entry would only ever be visited
+	 * once an insert pushed the cache over the cap.
+	 */
+	io_pfn_cache_evict(c, cap);
+
+	seg_base = offset & ~(c->quantum - 1);
+	seg_len = min_t(size_t, c->quantum, map_len - seg_base);
+	rel = offset - seg_base;
+	pfn = folio_pfn(folio) + (seg_base >> PAGE_SHIFT);
+
+	/*
+	 * A segment shorter than the quantum is a small folio or a folio
+	 * tail. Each would take a whole slot of the reserved range for a
+	 * fraction of its bytes - small-folio files exhausted a 64 GB
+	 * range with 2 GB of data - and a mapping that small saves the
+	 * plain path almost nothing. Leave them to per-chunk maps, which
+	 * recycle through the allocator's per-CPU cache.
+	 */
+	if (seg_len < c->quantum) {
+		atomic64_inc(&c->short_fallbacks);
+		return NULL;
+	}
+
+	/*
+	 * Count the access before the cache decides anything about it.
+	 * A probe's first tick reads the touches since the un-park, which
+	 * is where counting resumed.
+	 */
+	if (touch)
+		this_cpu_inc(*c->touches);
+
+	/*
+	 * A tick may have parked the cache since the test above; one
+	 * lookup through the engaged path is no harm.
+	 */
+	if (!io_pfn_cache_target(c, cap))
+		return NULL;
+	if (unlikely(rel + len > seg_len)) {
+		atomic64_inc(&c->range_fallbacks);
+		return NULL;
+	}
+
+	rcu_read_lock();
+	pm = xa_load(&c->xa, pfn);
+	if (pm && !xa_is_value(pm) && atomic_inc_not_zero(&pm->refs)) {
+		rcu_read_unlock();
+		return io_pfn_map_hit(c, pm, rel, len, dma, &c->hits);
+	}
+	rcu_read_unlock();
+	if (xa_is_value(pm)) {
+		/* Another CPU is inserting this segment; take its entry. */
+		pm = io_pfn_map_wait(c, pfn);
+		if (!pm)
+			return NULL;
+		return io_pfn_map_hit(c, pm, rel, len, dma, &c->waits);
+	}
+	/*
+	 * Claim the key before mapping. A claim already there is a
+	 * concurrent insert to wait for; an entry already there is a hit.
+	 */
+	/*
+	 * An entry the exchange hands back is only pinned once its
+	 * reference is taken, and it is freed with kfree_rcu(); the
+	 * read-side section covers the gap between the two.
+	 */
+	rcu_read_lock();
+	old = xa_cmpxchg(&c->xa, pfn, NULL, IO_PFN_PENDING,
+			 GFP_NOWAIT | __GFP_NOWARN);
+	if (old) {
+		bool got = false;
+
+		if (!xa_is_err(old) && !xa_is_value(old))
+			got = atomic_inc_not_zero(&old->refs);
+		rcu_read_unlock();
+		if (xa_is_err(old))
+			goto fail;
+		if (xa_is_value(old)) {
+			pm = io_pfn_map_wait(c, pfn);
+			if (!pm)
+				return NULL;
+			return io_pfn_map_hit(c, pm, rel, len, dma, &c->waits);
+		}
+		if (!got)
+			goto fail;
+		return io_pfn_map_hit(c, old, rel, len, dma, &c->hits);
+	}
+	rcu_read_unlock();
+	atomic64_inc(&c->misses);
+
+	if (READ_ONCE(io_dma_pfn_cache_auto) &&
+	    xa_load(&c->ghost, io_pfn_ghost_index(c, pfn))) {
+		void *gv = xa_erase(&c->ghost, io_pfn_ghost_index(c, pfn));
+
+		if (gv)
+			atomic64_dec(&c->ghost_count);
+		/*
+		 * A stale ghost the purge has yet to reach says nothing
+		 * about the present working set. With ageing on, an entry
+		 * idle that long would have aged out at any size, so the
+		 * miss cannot show the target too small. With ageing off
+		 * the list speaks only for the last two minutes.
+		 */
+		if (gv && !io_pfn_ghost_stale(gv,
+				READ_ONCE(io_dma_pfn_cache_max_age_ms))) {
+			u64 eff, old;
+
+			/*
+			 * This segment was evicted by cap pressure and is
+			 * being remapped: the effective cap is thrashing
+			 * the working set. Step the target up toward the
+			 * hard cap, one increment per paid-for eviction.
+			 */
+			atomic64_inc(&c->ghost_hits);
+			/*
+			 * Step up, and never converge to exactly the
+			 * resident bytes: a target equal to the working
+			 * set keeps the evict sweep hot on every insert.
+			 * An eighth of headroom over what is currently
+			 * mapped parks the sweep once the set fits.
+			 */
+			old = READ_ONCE(c->eff_cap);
+			eff = io_pfn_cache_target_of(c, old, cap);
+			eff += (u64)c->quantum * IO_PFN_GHOST_GROW_SEGS;
+			eff = max(eff, (u64)atomic64_read(&c->covered) +
+				       ((u64)atomic64_read(&c->covered) >> 3));
+			eff = min(eff, io_pfn_cache_ceiling(c, cap));
+			/*
+			 * The tick, under c->lock, may have parked or decayed
+			 * the target since it was read; growing it from the
+			 * stale value would undo a park at once, with the
+			 * cache still full. Only the value read is replaced,
+			 * and a lost race leaves the step to the next ghost
+			 * hit.
+			 */
+			if (old != IO_PFN_EFF_PARKED)
+				cmpxchg64(&c->eff_cap, old, eff);
+		}
+	}
+
+	pm = kmalloc_obj(*pm, GFP_NOWAIT | __GFP_NOWARN);
+	if (!pm)
+		goto unclaim;
+	/*
+	 * Fill the entry before mapping it: a slot-backed mapping is
+	 * published in by_slot[] as it is made, and the ring sweep reads
+	 * the entry from there.
+	 */
+	pm->cache = c;
+	pm->pfn = pfn;
+	pm->size = seg_len;
+	pm->dev = c->dev;
+	pm->referenced = true;
+	pm->last_used = jiffies;
+	atomic_set(&pm->refs, 2);	/* the cache bias plus this I/O */
+	base = io_pfn_map_segment(c, pm, folio, seg_base, seg_len);
+	if (!base) {
+		kfree(pm);
+		goto unclaim;
+	}
+	pm->dma_base = base;
+
+	/*
+	 * Charge before publishing: once the entry is visible a flush, or
+	 * a lookup displacing it for a longer run under the same key, may
+	 * remove it and subtract its bytes, and a remover that subtracts
+	 * what was never added drives the counter negative. covered is
+	 * signed and the cap is not, so a negative count compared unsigned
+	 * reads as enormous and the sweep spends its whole budget on every
+	 * call until the add lands.
+	 */
+	atomic64_add(seg_len, &c->covered);
+
+	/*
+	 * Publish over the claim. Nothing else takes a claim out, so this
+	 * cannot fail; the fallback below only guards the invariant.
+	 */
+	old = xa_cmpxchg(&c->xa, pfn, IO_PFN_PENDING, pm,
+			 GFP_NOWAIT | __GFP_NOWARN);
+	if (unlikely(old != IO_PFN_PENDING)) {
+		WARN_ON_ONCE(1);
+		atomic64_sub(seg_len, &c->covered);
+		io_pfn_map_unmap(pm, true);
+		kfree_rcu(pm, rcu);	/* by_slot[] may have shown it */
+		goto fail;
+	}
+	/*
+	 * Pairs with the barrier in io_pfn_cache_cap_set(), and with the
+	 * grace period in io_pfn_cache_kill(): if the cap was cleared or
+	 * the device marked dead under this insert, either the revoking
+	 * flush's walk finds the entry now that it is published, or the
+	 * change is visible here and this insert takes its own entry back
+	 * out. Nothing else would ever retire it.
+	 */
+	smp_mb();
+	if (unlikely(!READ_ONCE(io_dma_pfn_cache_cap_mb) ||
+		     READ_ONCE(c->dead)))
+		io_pfn_map_displace(c, pm);
+	atomic64_inc(&c->inserts);
+	if (atomic64_read(&c->covered) > (s64)io_pfn_cache_target(c, cap))
+		io_pfn_cache_evict(c, cap);
+	*dma = pm->dma_base + rel;
+	return pm;
+unclaim:
+	xa_cmpxchg(&c->xa, pfn, IO_PFN_PENDING, NULL, GFP_NOWAIT | __GFP_NOWARN);
+fail:
+	atomic64_inc(&c->insert_fails);
+	return NULL;
+}
+
+/* Erase everything.  In-flight users keep their mappings alive until
+ * their references drop.  @retire is set for the flush of
+ * io_pfn_cache_kill(), the one flush that collects on a dead cache.
+ */
+static void io_pfn_cache_flush(struct io_pfn_cache *c, bool retire)
+{
+	unsigned int n = 0, retired = 0;
+	struct io_pfn_map *pm;
+	unsigned long index;
+	void *gv;
+
+	if (READ_ONCE(c->gone))
+		return;	/* nothing is mapped and the collector is held */
+
+	/* The walk runs without c->lock: removals are identity-checked,
+	 * so a concurrent sweep and this flush retire disjoint entries,
+	 * and a spinlock held across an unmap per entry would put the
+	 * whole cache's unmaps in one non-preemptible section. Entries
+	 * are freed with kfree_rcu() and the walk hands them back outside
+	 * any read-side section, so take the read lock, which under
+	 * preemptible RCU the spinlock never was. The walk yields between
+	 * batches, so that a large cache's flush neither holds off grace
+	 * periods nor, without preemptible RCU, runs as one non-preemptible
+	 * section.
+	 */
+	rcu_read_lock();
+	xa_for_each(&c->xa, index, pm) {
+		if (xa_is_value(pm))
+			continue;	/* an insert's claim; it publishes later */
+		if (xa_cmpxchg(&c->xa, index, pm, NULL,
+			       GFP_NOWAIT | __GFP_NOWARN) != pm)
+			continue;	/* a sweep got there first */
+		atomic64_sub(pm->size, &c->covered);
+		/*
+		 * The loop below collects whatever this walk retires, so a
+		 * put here only marks its slot. A collect from each would
+		 * unlink the walk's slots one at a time, and a request from
+		 * each would keep a busy collector, perhaps a submitter or a
+		 * ring's completion poller, at work for the rest of the walk.
+		 */
+		__io_pfn_map_put(pm, false);
+		if (++retired >= IO_PFN_EVICT_UNMAP_MAX) {
+			retired = 0;
+			rcu_read_unlock();
+			cond_resched();
+			rcu_read_lock();
+		}
+	}
+	rcu_read_unlock();
+	/*
+	 * A collector already running on the datapath stops once fewer
+	 * than its run threshold are dirty, so retry until every retired
+	 * slot is unlinked: a flush that returns with slots still linked
+	 * has not revoked anything. On a dead cache the retire collects in
+	 * its own flush, then holds the collector and unlinks every slot
+	 * left, at the latest once the unbind completes, so any other
+	 * flush leaves the slots to it rather than spin until then.
+	 */
+	while (READ_ONCE(c->nr_dirty) && !READ_ONCE(c->gone) &&
+	       (retire || !READ_ONCE(c->dead))) {
+		io_pfn_slots_gc(c, 1);
+		if (READ_ONCE(c->nr_dirty))
+			cond_resched();
+	}
+
+	/*
+	 * Ghosts are plain values that need neither the cache lock nor RCU,
+	 * so a long list is erased with scheduling points rather than in one
+	 * non-preemptible section. Only the eraser that got a ghost counts
+	 * it, since a concurrent ghost hit or eviction may race this walk.
+	 */
+	xa_for_each(&c->ghost, index, gv) {
+		if (xa_erase(&c->ghost, index))
+			atomic64_dec(&c->ghost_count);
+		if (!(++n % IO_PFN_EVICT_BUDGET))
+			cond_resched();
+	}
+
+	spin_lock(&c->lock);
+	c->hand = 0;
+	c->ghost_hand = 0;
+	c->eff_cap = 0;	/* re-derive the start on next use */
+	c->hits_snap = atomic64_read(&c->hits) + atomic64_read(&c->waits);
+	c->misses_snap = atomic64_read(&c->misses);
+	c->ghost_hits_snap = atomic64_read(&c->ghost_hits);
+	c->parked_ticks = 0;
+	c->probe_interval = IO_PFN_PROBE_TICKS;
+	io_pfn_cache_probe_arm(c, false);
+	c->dead_ticks = 0;
+	c->cyclic_turnover = 0;
+	c->touches_snap = io_pfn_cache_touches(c);
+	c->inserts_snap = atomic64_read(&c->inserts);
+	c->evictions_snap = max_t(s64, atomic64_read(&c->evictions) -
+				       atomic64_read(&c->age_evictions), 0);
+	spin_unlock(&c->lock);
+}
+
+static bool io_pfn_cache_usable(void)
+{
+	return READ_ONCE(io_dma_pfn_cache_cap_mb) != 0;
+}
+
+static int io_pfn_cache_stats_show(struct seq_file *m, void *p)
+{
+	int i;
+
+	seq_printf(m, "cap_mb %u max_age_ms %u\n",
+		   READ_ONCE(io_dma_pfn_cache_cap_mb),
+		   READ_ONCE(io_dma_pfn_cache_max_age_ms));
+	for (i = 0; i < IO_PFN_CACHE_DEVS; i++) {
+		struct io_pfn_cache *c;
+
+		/* Pairs with the slot-publishing release in io_pfn_cache_get(). */
+		if (!smp_load_acquire(&io_pfn_cache_devs[i]))
+			break;
+		c = io_pfn_caches[i];
+		seq_printf(m,
+			   "dev %s quantum_kb %zu iova_mb %llu slots_used %u dirty %u links %lld link_fails %lld unlink_runs %lld unlink_slots %lld covered_kb %lld hits %lld waits %lld wait_timeouts %lld misses %lld inserts %lld insert_fails %lld range_fallbacks %lld short_fallbacks %lld evictions %lld age_evictions %lld ref_skips %lld ghost_hits %lld ghost_count %lld eff_cap_mb %llu touches %llu dead %d\n",
+			   dev_name(c->dev),
+			   c->quantum >> 10,
+			   ((u64)c->nslots << c->quantum_shift) >> 20,
+			   READ_ONCE(c->nr_used),
+			   READ_ONCE(c->nr_dirty),
+			   atomic64_read(&c->slot_links),
+			   atomic64_read(&c->slot_fails),
+			   atomic64_read(&c->unlink_runs),
+			   atomic64_read(&c->unlink_slots),
+			   atomic64_read(&c->covered) >> 10,
+			   atomic64_read(&c->hits),
+			   atomic64_read(&c->waits),
+			   atomic64_read(&c->wait_timeouts),
+			   atomic64_read(&c->misses),
+			   atomic64_read(&c->inserts),
+			   atomic64_read(&c->insert_fails),
+			   atomic64_read(&c->range_fallbacks),
+			   atomic64_read(&c->short_fallbacks),
+			   atomic64_read(&c->evictions),
+			   atomic64_read(&c->age_evictions),
+			   atomic64_read(&c->ref_skips),
+			   atomic64_read(&c->ghost_hits),
+			   atomic64_read(&c->ghost_count),
+			   io_pfn_cache_target(c,
+				(u64)READ_ONCE(io_dma_pfn_cache_cap_mb) << 20)
+					>> 20,
+			   io_pfn_cache_touches(c),
+			   READ_ONCE(c->dead));
+	}
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(io_pfn_cache_stats);
+
+/*
+ * Retire a cache whose binding or device is going away, while the binding
+ * holds the device's IOMMU domain, or just after the hold is dropped for
+ * the part the start of an unbind deferred. After the mark, lookups miss and
+ * inserts refuse, and after the grace period none is still mapping. The
+ * flush drops every entry, then the collector is taken. When the
+ * driver is only starting to unbind, its transfers may still be in
+ * flight, so a slot that one of them holds keeps the range linked until
+ * the unbind completes. Otherwise whatever the reserved range still links
+ * is unlinked, including the slots of entries a retired transfer has yet
+ * to put, and the range is given back. The cache stays registered, since
+ * its device is pinned there, and dead until a ring on the rebound device
+ * revives it. A device that comes back after removal is a new one, and
+ * the removed device's cache gives its registry slot up once it has given
+ * back its slot arrays (io_pfn_cache_release()). The
+ * caller holds c->life_lock, so a cache found dead and not gone is one
+ * whose retire the start of an unbind left for its completion.
+ */
+static void io_pfn_cache_kill(struct io_pfn_cache *c, unsigned long action)
+{
+	unsigned int start, end;
+
+	if (READ_ONCE(c->gone))
+		return;
+	if (!READ_ONCE(c->dead)) {
+		WRITE_ONCE(c->dead, true);
+		synchronize_rcu();
+		io_pfn_cache_flush(c, true);
+		while (atomic_cmpxchg(&c->gc_busy, 0, 1))
+			cond_resched();
+		if (action == BUS_NOTIFY_UNBIND_DRIVER && c->nslots &&
+		    find_first_bit(c->slots, c->nslots) < c->nslots)
+			return;
+	}
+	/* Nothing hands out or collects slots now, so the bitmap is stable. */
+	for (start = c->nslots ? find_first_bit(c->slots, c->nslots) : 0;
+	     start < c->nslots;
+	     start = find_next_bit(c->slots, c->nslots, end)) {
+		end = find_next_zero_bit(c->slots, c->nslots, start);
+		end = min(end, start + IO_PFN_GC_RUN_MAX);
+		dma_iova_unlink(c->dev, &c->iova,
+				(size_t)start << c->quantum_shift,
+				(size_t)(end - start) << c->quantum_shift,
+				DMA_BIDIRECTIONAL, DMA_ATTR_SKIP_CPU_SYNC);
+		cond_resched();
+	}
+	if (c->nslots)
+		dma_iova_free(c->dev, &c->iova);
+	WRITE_ONCE(c->gone, true);
+	dev_info(c->dev, "io_uring DMA: mapping cache retired %s\n",
+		 action == BUS_NOTIFY_DEL_DEVICE ? "for device removal" :
+		 action == BUS_NOTIFY_UNBOUND_DRIVER ?
+		 "once the driver unbound" : "for driver unbind");
+}
+
+static void io_pfn_cache_flush_all(void)
+{
+	int i;
+
+	for (i = 0; i < IO_PFN_CACHE_DEVS; i++) {
+		/* Pairs with the slot-publishing release in io_pfn_cache_get(). */
+		if (!smp_load_acquire(&io_pfn_cache_devs[i]))
+			break;
+		io_pfn_cache_flush(io_pfn_caches[i], false);
+	}
+}
+
+static ssize_t io_pfn_cache_flush_write(struct file *file,
+					const char __user *ubuf,
+					size_t len, loff_t *ppos)
+{
+	io_pfn_cache_flush_all();
+	return len;
+}
+
+static const struct file_operations io_pfn_cache_flush_fops = {
+	.owner		= THIS_MODULE,
+	.open		= simple_open,
+	.write		= io_pfn_cache_flush_write,
+	.llseek		= noop_llseek,
+};
+
+/*
+ * Capping the cache at nothing has to revoke the mappings it already
+ * holds. With the cap at zero the datapath never asks for the cache,
+ * so no lookup runs and no sweep with it, neither the CLOCK walk nor
+ * the age retirement: "off" would otherwise leave standing device
+ * access to every folio the cache had touched, past even the age
+ * bound, until the cap was raised again.
+ */
+static int io_pfn_cache_cap_get(void *data, u64 *val)
+{
+	*val = READ_ONCE(io_dma_pfn_cache_cap_mb);
+	return 0;
+}
+
+static int io_pfn_cache_cap_set(void *data, u64 val)
+{
+	if (val > U32_MAX)
+		return -ERANGE;
+	if (!val) {
+		atomic_inc(&io_pfn_cache_clearing);
+		/*
+		 * The count is raised before the store, so that a put that
+		 * sees the zero also sees the clear under way
+		 * (io_pfn_slots_gc_cleared()).
+		 */
+		smp_mb__after_atomic();
+	}
+	WRITE_ONCE(io_dma_pfn_cache_cap_mb, val);
+	if (!val) {
+		/*
+		 * Pairs with the barrier after the publish in
+		 * io_pfn_map_lookup(): an insert that read the old cap
+		 * either lands where this flush's walk still finds it,
+		 * or sees the zero and takes its own entry back out.
+		 * Pairs too with the barrier in io_pfn_map_unmap(): a put
+		 * that retires a slot either sees the zero and has the slot
+		 * collected, or the flush finds the slot dirty.
+		 */
+		smp_mb();
+		io_pfn_cache_flush_all();
+		atomic_dec(&io_pfn_cache_clearing);
+		/*
+		 * A put during the flushes left its slot to this clear, so
+		 * every cache is flushed once more after the clear is seen
+		 * to be over. The barrier pairs with the one in
+		 * io_pfn_map_unmap(): a put either sees the clear over and
+		 * collects, or this flush finds its slot dirty. With the cap
+		 * still at zero the caches are empty by then, so the second
+		 * flush only collects what those puts left.
+		 */
+		smp_mb__after_atomic();
+		io_pfn_cache_flush_all();
+	}
+	return 0;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(io_pfn_cache_cap_fops, io_pfn_cache_cap_get,
+			 io_pfn_cache_cap_set, "%llu\n");
+
+/*
+ * A walk armed under the old age can lie a quarter of that age ahead,
+ * which would hold a lowered bound off for as long, so a write re-arms
+ * every cache and the next lookup starts a walk under the new age.
+ */
+static int io_pfn_cache_max_age_get(void *data, u64 *val)
+{
+	*val = READ_ONCE(io_dma_pfn_cache_max_age_ms);
+	return 0;
+}
+
+static int io_pfn_cache_max_age_set(void *data, u64 val)
+{
+	int i;
+
+	if (val > U32_MAX)
+		return -ERANGE;
+	WRITE_ONCE(io_dma_pfn_cache_max_age_ms, val);
+	/* Pairs with the barrier in io_pfn_cache_evict(). */
+	smp_wmb();
+	for (i = 0; i < IO_PFN_CACHE_DEVS; i++) {
+		/* Pairs with the release in __io_pfn_cache_get(). */
+		if (!smp_load_acquire(&io_pfn_cache_devs[i]))
+			break;
+		WRITE_ONCE(io_pfn_caches[i]->next_age, jiffies);
+	}
+	return 0;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(io_pfn_cache_max_age_fops, io_pfn_cache_max_age_get,
+			 io_pfn_cache_max_age_set, "%llu\n");
 
 /*
  * Busy-poll budget in microseconds for draining in-flight DMA
@@ -175,6 +2876,21 @@ void io_dma_debugfs_init(void)
 	debugfs_create_file("latency", 0444, dir, NULL, &io_dma_lat_fops);
 	debugfs_create_file("latency_reset", 0200, dir, NULL,
 			    &io_dma_lat_reset_fops);
+	debugfs_create_file("pfn_cache", 0444, dir, NULL,
+			    &io_pfn_cache_stats_fops);
+	debugfs_create_file_unsafe("pfn_cache_cap_mb", 0644, dir, NULL,
+				   &io_pfn_cache_cap_fops);
+	debugfs_create_u32("pfn_cache_auto", 0644, dir,
+			   &io_dma_pfn_cache_auto);
+	debugfs_create_u32("pfn_cache_auto_budget_mb", 0644, dir,
+			   &io_dma_pfn_cache_auto_budget_mb);
+	debugfs_create_file_unsafe("pfn_cache_max_age_ms", 0644, dir, NULL,
+				   &io_pfn_cache_max_age_fops);
+	debugfs_create_file("pfn_cache_flush", 0200, dir, NULL,
+			    &io_pfn_cache_flush_fops);
+	debugfs_create_u32("pfn_cache_iova_reserve_mb", 0644, dir,
+			   &io_dma_pfn_iova_reserve_mb);
+	debugfs_create_u32("pfn_cache_wait_us", 0644, dir, &io_dma_pfn_wait_us);
 }
 
 /* Datapath allocation takes from the pool first and then falls back
@@ -459,6 +3175,7 @@ static ssize_t io_dma_submit_single_entry(struct io_kiocb *req,
 	dma->off = off;
 	dma->src_map_addr = entry->src_dma;
 	dma->src_map_len = entry->src_len;
+	dma->src_pfn_map = entry->pfn_map;
 	dma->src_folio = entry->folio;
 	dma->src_is_page = true;
 	dma->is_batch = false;
@@ -493,9 +3210,21 @@ static void io_dma_unmap_batch_entries(struct io_kiocb *req,
 {
 	unsigned int i;
 
-	for (i = 0; i < nr; i++)
-		dma_unmap_page(dev, entries[i].src_dma,
-			       entries[i].src_len, DMA_TO_DEVICE);
+	for (i = 0; i < nr; i++) {
+		struct io_dma_batch_entry *e = &entries[i];
+
+		if (e->pfn_map) {
+			/*
+			 * This is a cached mapping, so we drop the in-flight
+			 * reference. The unmap belongs to eviction or flush
+			 * and not to this I/O.
+			 */
+			io_pfn_map_put(e->pfn_map);
+		} else {
+			dma_unmap_page(dev, e->src_dma, e->src_len,
+				       DMA_TO_DEVICE);
+		}
+	}
 }
 
 /*
@@ -540,6 +3269,176 @@ static ssize_t io_dma_flush_batch(struct io_kiocb *req,
 	return ret;
 }
 
+/*
+ * File-position striping. A region's transfers go to the same device
+ * from every ring that holds the same devices in the same order, at
+ * this granule, so the per-device PFN caches each hold one share of a
+ * shared working set instead of a full copy each.
+ * The granule index is hashed so block-aligned op starts do not
+ * resonate with the stripe modulus. Position-consistent placement only
+ * pays when mappings persist: uncached or parked it would concentrate
+ * convoyed readers on one device for no dedup benefit, so a ring
+ * rotates instead. Reads and writes share both rules; that is what
+ * lets the entry a write inserts serve the read that follows it.
+ */
+#define IO_DMA_STRIPE_SHIFT	20
+
+/*
+ * Return the first stripe at or after @stripe, wrapping, whose channel
+ * its provider has not orphaned, or @stripe when every one is. @stripe
+ * is below the ring's channel count. An orphaned channel completes
+ * nothing for the rest of the ring's life, so the rotation passes over
+ * it, and a lost device narrows the stripe instead of taking every op
+ * that would start on it to the CPU.
+ */
+static unsigned int io_dma_stripe_live(struct io_ring_ctx *ctx,
+				       unsigned int stripe)
+{
+	unsigned int i;
+
+	for (i = 0; i < ctx->dma.nr_chans; i++) {
+		if (!dma_chan_orphaned(ctx->dma.chans[stripe]))
+			break;
+		if (++stripe == ctx->dma.nr_chans)
+			stripe = 0;
+	}
+	return stripe;
+}
+
+/*
+ * The stripe of @granule when placement follows position. A region whose
+ * channel its provider orphaned goes to a live channel picked by the hash
+ * bits the modulus left over, so that the live channels share the
+ * orphan's regions evenly instead of the next one taking them all. Only
+ * the orphan's regions move, so every other region stays on the device
+ * that holds its standing mappings, and rings that hold the same
+ * channels, with the same ones orphaned, still agree on placement.
+ */
+static unsigned int io_dma_stripe_hashed(struct io_ring_ctx *ctx,
+					 u64 granule)
+{
+	unsigned int nr_chans = ctx->dma.nr_chans;
+	u32 hash = hash_64(granule, 32);
+	unsigned int stripe, nr_live = 0, k, i;
+
+	if (nr_chans <= 1)
+		return 0;
+	stripe = hash % nr_chans;
+	if (!dma_chan_orphaned(ctx->dma.chans[stripe]))
+		return stripe;
+	for (i = 0; i < nr_chans; i++)
+		nr_live += !dma_chan_orphaned(ctx->dma.chans[i]);
+	if (!nr_live)
+		return stripe;
+	k = (hash / nr_chans) % nr_live;
+	for (i = 0; i < nr_chans; i++) {
+		if (dma_chan_orphaned(ctx->dma.chans[i]))
+			continue;
+		if (!k)
+			return i;
+		k--;
+	}
+	/*
+	 * The walk runs out only when a channel was orphaned after the
+	 * count. The region then takes the next live channel, so that a
+	 * pick returns an orphan only when every channel is one.
+	 */
+	return io_dma_stripe_live(ctx, stripe);
+}
+
+static bool io_dma_stripe_deterministic(struct io_ring_ctx *ctx)
+{
+	u64 hard = (u64)READ_ONCE(io_dma_pfn_cache_cap_mb) << 20;
+	struct io_pfn_cache *pc;
+
+	if (!io_pfn_cache_usable() || ctx->dma.nr_chans <= 1)
+		return false;
+	/*
+	 * The cache of the first channel not orphaned decides, one that
+	 * this ring's lookups, which run a cache's adapt tick, still
+	 * drive. They no longer reach the cache of an orphaned channel's
+	 * device, which after a removal nothing drives at all.
+	 */
+	pc = io_pfn_cache_get(
+		ctx->dma.chans[io_dma_stripe_live(ctx, 0)]->device->dev);
+	return pc && io_pfn_cache_target(pc, hard);
+}
+
+/*
+ * The stripe for @pos: by position when deterministic, else the first
+ * live one at or after @rr, where the rotation stands. A write group's
+ * later granules step on from there, see io_dma_piece_stripe().
+ */
+static unsigned int io_dma_stripe_index(struct io_ring_ctx *ctx, loff_t pos,
+					bool det, unsigned int rr)
+{
+	unsigned int nr_chans = ctx->dma.nr_chans ? ctx->dma.nr_chans : 1;
+	u64 granule = (u64)pos >> IO_DMA_STRIPE_SHIFT;
+
+	if (det)
+		return io_dma_stripe_hashed(ctx, granule);
+	return io_dma_stripe_live(ctx, rr % nr_chans);
+}
+
+/* The stripe of the read batch starting at @pos: by position while the
+ * cache is engaged, the next live one in the rotation otherwise.
+ */
+static unsigned int io_dma_next_stripe(struct io_ring_ctx *ctx, bool det,
+				       unsigned int stripe, loff_t pos)
+{
+	unsigned int nr_chans = ctx->dma.nr_chans ? ctx->dma.nr_chans : 1;
+
+	if (det)
+		return io_dma_stripe_index(ctx, pos, true, 0);
+	return io_dma_stripe_live(ctx, (stripe + 1) % nr_chans);
+}
+
+/*
+ * The stripe of the write piece at @pos in a group placed by @det, whose
+ * rotation starts at @rr. Every piece of a granule goes to the same
+ * stripe, so the group derives it again only when a piece starts in
+ * another granule, which keeps the hash and the divisions of a
+ * derivation off the per-piece path. @granule and @stripe hold the last
+ * derivation, and @granule is U64_MAX before the group's first. In the
+ * rotation the first granule takes the first live stripe at or after
+ * @rr, and each later one the next live stripe after the last, so a
+ * group's granules take its live channels in turn and a group of one
+ * granule runs where the rotation stands. Counting from the absolute
+ * granule instead would step a stream of one-granule groups by two per
+ * group, against the rotation's one, and leave half of a four-channel
+ * ring idle. A channel orphaned within a granule leaves the granule's
+ * remaining pieces to the CPU redo, through the orphan check of each
+ * piece.
+ */
+static unsigned int io_dma_piece_stripe(struct io_ring_ctx *ctx, loff_t pos,
+					bool det, unsigned int rr,
+					u64 *granule, unsigned int *stripe)
+{
+	unsigned int nr_chans = ctx->dma.nr_chans ? ctx->dma.nr_chans : 1;
+	u64 g = (u64)pos >> IO_DMA_STRIPE_SHIFT;
+
+	if (g == *granule)
+		return *stripe;
+	if (det || *granule == U64_MAX)
+		*stripe = io_dma_stripe_index(ctx, pos, det, rr);
+	else
+		*stripe = io_dma_stripe_live(ctx, (*stripe + 1) % nr_chans);
+	*granule = g;
+	return *stripe;
+}
+
+/* The cache instance the datapath uses for @dev, or NULL when it is off. */
+static struct io_pfn_cache *io_pfn_cache_for(struct device *dev)
+{
+	return io_pfn_cache_usable() ? io_pfn_cache_get(dev) : NULL;
+}
+
+static struct dma_chan *io_dma_stripe_chan(struct io_ring_ctx *ctx,
+					   unsigned int stripe)
+{
+	return ctx->dma.nr_chans ? ctx->dma.chans[stripe] : ctx->dma.chan;
+}
+
 /* Reads at or below this size fall back to the CPU copy path */
 #define IO_DMA_MIN_READ_BYTES	SZ_16K
 
@@ -578,8 +3477,30 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 	 * addresses, the PFN cache instance, and the flush target,
 	 * follows the current stripe.
 	 */
-#define IO_DMA_STRIPE_SHIFT	20
 	unsigned int nr_chans = ctx->dma.nr_chans ? ctx->dma.nr_chans : 1;
+	/*
+	 * Position-consistent mapping only pays when mappings persist:
+	 * uncached or parked, it concentrates convoyed readers' copies
+	 * on one device for no dedup benefit, so rotate instead. The
+	 * regime is sampled per call; a flip mid-workload only changes
+	 * which device new batches land on.
+	 */
+	bool det_stripe;
+	unsigned int stripe;
+	struct dma_chan *chan;
+	struct device *dev;
+	struct io_pfn_cache *pfn_cache;
+	size_t map_quantum;
+	struct folio_batch fbatch;
+	struct io_dma_batch_entry *entries;
+	unsigned int nr_entries = 0;
+	ssize_t total_read = 0;
+	ssize_t submitted = 0;
+	size_t batch_bytes = 0;
+	size_t dst_offset = 0;
+	loff_t start_pos = iocb->ki_pos;
+
+	det_stripe = io_dma_stripe_deterministic(ctx);
 	/*
 	 * Hash the granule index rather than using it raw: block-aligned
 	 * op starts otherwise resonate with the stripe modulus, opening
@@ -590,19 +3511,16 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 	 * The hash keeps the mapping deterministic, so the dedup holds,
 	 * while decorrelating it from any alignment.
 	 */
-	unsigned int stripe = hash_64((u64)iocb->ki_pos >> IO_DMA_STRIPE_SHIFT,
-				      32) % nr_chans;
-	struct dma_chan *chan = ctx->dma.nr_chans ?
-		ctx->dma.chans[stripe] : ctx->dma.chan;
-	struct device *dev = chan->device->dev;
-	struct folio_batch fbatch;
-	struct io_dma_batch_entry *entries;
-	unsigned int nr_entries = 0;
-	ssize_t total_read = 0;
-	ssize_t submitted = 0;
-	size_t batch_bytes = 0;
-	size_t dst_offset = 0;
-	loff_t start_pos = iocb->ki_pos;
+	if (det_stripe)
+		stripe = io_dma_stripe_hashed(ctx,
+				(u64)iocb->ki_pos >> IO_DMA_STRIPE_SHIFT);
+	else
+		stripe = io_dma_stripe_live(ctx,
+				READ_ONCE(ctx->dma.stripe_rr) % nr_chans);
+	chan = ctx->dma.nr_chans ? ctx->dma.chans[stripe] : ctx->dma.chan;
+	dev = chan->device->dev;
+	pfn_cache = io_pfn_cache_usable() ? io_pfn_cache_get(dev) : NULL;
+	map_quantum = io_dma_map_quantum(dev);
 	loff_t isize;
 	int i, error = 0;
 	bool writably_mapped;
@@ -616,7 +3534,10 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 	/*
 	 * A channel its provider orphaned at unbind completes nothing any
 	 * more, and its device may be on its way out. A read that starts
-	 * on its stripe takes the CPU path without mapping anything.
+	 * on its stripe takes the CPU path without mapping anything. The
+	 * pick above passes over such channels, so a read gets here only
+	 * when every channel of the ring is orphaned, or when its channel
+	 * was orphaned since the pick.
 	 */
 	if (dma_chan_orphaned(chan))
 		return -EAGAIN;
@@ -697,6 +3618,7 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 			 * at destination registered buffer folio boundaries.
 			 */
 			while (copied < bytes) {
+				struct io_pfn_map *pm = NULL;
 				dma_addr_t dst_dma, src_dma;
 				size_t dst_seg_remain;
 				size_t chunk;
@@ -711,17 +3633,45 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 
 				chunk = min_t(size_t, bytes - copied,
 					      dst_seg_remain);
+				/* Split at source map-quantum boundaries so
+				 * that one cache segment covers each entry
+				 * and no transient map exceeds the rcache
+				 * classes.
+				 */
+				chunk = min_t(size_t, chunk, map_quantum -
+					((offset + copied) & (map_quantum - 1)));
 
-				src_dma = dma_map_page(dev, &folio->page,
+				pm = io_pfn_map_lookup(pfn_cache, folio,
 						       offset + copied,
-						       chunk, DMA_TO_DEVICE);
-				if (dma_mapping_error(dev, src_dma)) {
-					error = -EFAULT;
-					goto flush_and_put;
+						       chunk,
+						       folio_size(folio),
+						       !copied ||
+						       !((offset + copied) &
+							 (map_quantum - 1)),
+						       &src_dma);
+				if (pm) {
+					/* A standing mapping is synced by
+					 * nobody but us: hand the chunk to
+					 * the device, since the CPU may have
+					 * written the folio since the mapping
+					 * was made.
+					 */
+					dma_sync_single_for_device(dev, src_dma,
+								   chunk,
+								   DMA_TO_DEVICE);
+				} else {
+					src_dma = dma_map_page(dev, &folio->page,
+							       offset + copied,
+							       chunk, DMA_TO_DEVICE);
+					if (dma_mapping_error(dev, src_dma)) {
+						error = -EFAULT;
+						goto flush_and_put;
+					}
 				}
 
 				/* Collect entry for batch submission */
 				entries[nr_entries].src_dma = src_dma;
+				entries[nr_entries].pfn_map = pm;
 				entries[nr_entries].dst_dma = dst_dma;
 				entries[nr_entries].src_len = chunk;
 				entries[nr_entries].folio = folio;
@@ -750,6 +3700,7 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 						(size_t)SZ_256K,
 						(size_t)SZ_1M)) {
 					ssize_t ret;
+					loff_t next;
 
 					ret = io_dma_flush_batch(req, dev, chan,
 						entries, nr_entries,
@@ -765,20 +3716,24 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 					 * reload keeps every device-scoped
 					 * hand, the dst addresses and the
 					 * PFN cache, consistent with the
-					 * new target.
+					 * new target. ki_pos still points at
+					 * this folio's start, and copied is
+					 * the part of it collected so far.
+					 * A read with nothing left to collect
+					 * has no next batch. A stripe derived
+					 * for one anyway would move the
+					 * rotation on twice and leave a
+					 * device out of it.
 					 */
+					next = iocb->ki_pos + copied;
 					if (nr_chans > 1 &&
-					    ret == (ssize_t)batch_bytes) {
-						/* ki_pos still points at this
-						 * folio's start; copied is the
-						 * part of it collected so far.
-						 */
-						stripe = hash_64((u64)(iocb->ki_pos +
-							copied) >>
-							IO_DMA_STRIPE_SHIFT,
-							32) % nr_chans;
+					    ret == (ssize_t)batch_bytes &&
+					    next < end_offset) {
+						stripe = io_dma_next_stripe(ctx,
+							det_stripe, stripe, next);
 						chan = ctx->dma.chans[stripe];
 						dev = chan->device->dev;
+						pfn_cache = io_pfn_cache_for(dev);
 					}
 					/*
 					 * Count only what the flush actually
@@ -801,9 +3756,15 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 						goto put_folios;
 					}
 					batch_bytes = 0;
-					/* The next batch's channel was orphaned:
-					 * end the claim at what was submitted
-					 * and leave the rest to the CPU tail.
+					/* The pick and the re-derive above
+					 * pass over orphaned channels, so this
+					 * one was orphaned since its pick, or
+					 * every channel is. End the claim at
+					 * what was submitted and leave any
+					 * rest to the CPU tail. Without a
+					 * re-derive, on the read's last batch
+					 * or on a ring of one channel, this is
+					 * the channel just used.
 					 */
 					if (dma_chan_orphaned(chan)) {
 						error = -EAGAIN;
@@ -852,11 +3813,12 @@ flush_and_put:
 			 */
 			if (nr_chans > 1 && !error && dst_offset < want &&
 			    iocb->ki_pos < isize) {
-				stripe = hash_64((u64)iocb->ki_pos >>
-						 IO_DMA_STRIPE_SHIFT,
-						 32) % nr_chans;
+				stripe = io_dma_next_stripe(ctx, det_stripe,
+							    stripe,
+							    iocb->ki_pos);
 				chan = ctx->dma.chans[stripe];
 				dev = chan->device->dev;
+				pfn_cache = io_pfn_cache_for(dev);
 				/* See the orphan check of the in-loop flush. */
 				if (dma_chan_orphaned(chan))
 					error = -EAGAIN;
@@ -881,6 +3843,11 @@ put_folios:
 						ctx->dma.chans[c] :
 						ctx->dma.chan);
 	}
+	/* Persist the rotation for the uncached regime's spread, past the
+	 * last stripe this read used.
+	 */
+	if (!det_stripe)
+		WRITE_ONCE(ctx->dma.stripe_rr, stripe + 1);
 	kfree(entries);
 
 	/*
@@ -933,14 +3900,37 @@ struct io_dma_fmw_folio {
 	bool redo;		/* some of it was not handed to the device */
 	bool targeted;		/* a descriptor for it was submitted */
 	bool lost;		/* the disk may lack what it held */
-	dma_addr_t dst_dma;	/* 0 means nothing to unmap */
-	unsigned int map_len;
+};
+
+/* One destination mapping piece, bounded by the map quantum so cached
+ * segments serve it. A folio chunk larger than the quantum spans
+ * several pieces; the release and the wedge fence walk this array
+ * rather than per-chunk mappings.
+ */
+struct io_dma_fmw_dst {
+	dma_addr_t dma;
+	unsigned int len;
+	unsigned int off;		/* offset in its folio */
+	struct folio *folio;
+	struct io_pfn_map *pm;		/* NULL = plain per-piece mapping */
+	struct dma_chan *chan;		/* the piece's stripe */
+	struct device *dev;
+	unsigned int stripe;
+};
+
+/* One in-flight write descriptor and the channel it was submitted on. */
+struct io_dma_fmw_ck {
+	dma_cookie_t ck;
+	struct dma_chan *chan;
 };
 
 /*
  * Poll every outstanding cookie to completion.  Sets *redo on any
  * DMA_ERROR.  Returns 0, or -ETIMEDOUT with cookies possibly still in
  * flight, in which case the caller must treat every dst as poisoned.
+ * On -ETIMEDOUT *stuck is the channel of the cookie that ran out of
+ * time. A group's cookies can be on several devices, so the caller
+ * names that channel and not the one it submitted to last.
  *
  * We spin only briefly.  DSA transfers normally complete in
  * single-digit microseconds, but under contention with many rings
@@ -949,22 +3939,44 @@ struct io_dma_fmw_folio {
  * and starved application heartbeats at O(100) shared rings.
  * Therefore we back off to sleeping once the fast path misses.
  */
-static int io_dma_fmw_wait(struct dma_chan *chan, dma_cookie_t *cookies,
-			   unsigned int *nr, bool *redo)
+static int io_dma_fmw_wait(struct io_dma_fmw_ck *cookies, unsigned int *nr,
+			   bool *redo, struct dma_chan **stuck)
 {
 	unsigned int wait_ms = READ_ONCE(io_dma_fmw_wait_ms);
 	unsigned long deadline = jiffies + msecs_to_jiffies(wait_ms);
 	u64 spin_end = ktime_get_ns() +
 		READ_ONCE(io_dma_fmw_spin_us) * NSEC_PER_USEC;
-	unsigned int i, spins;
+	unsigned int i, j, spins;
 
 	for (i = 0; i < *nr; i++) {
 		enum dma_status st;
 
+		struct dma_chan *chan = cookies[i].chan;
+
 		spins = 0;
-		while ((st = dmaengine_async_is_tx_complete(chan, cookies[i]))
+		while ((st = dmaengine_async_is_tx_complete(chan, cookies[i].ck))
 		       == DMA_IN_PROGRESS) {
 			if (time_after(jiffies, deadline)) {
+				/* The group is wedged on this cookie. A polled
+				 * descriptor's only completion path is this
+				 * status query, so an abandoned cookie keeps
+				 * its descriptor until its work queue is
+				 * disabled and no client holds the channel any
+				 * more, which frees the pool. Freeing the
+				 * descriptor earlier would let the device write
+				 * a completion record into recycled memory. The
+				 * group's pieces may be placed on several
+				 * devices, and the later cookies on healthy
+				 * ones have most likely finished, so each is
+				 * queried once, which hands a finished
+				 * descriptor back to its pool. Only the
+				 * descriptors that query does not retire are
+				 * leaked, and the caller fences them.
+				 */
+				for (j = i + 1; j < *nr; j++)
+					dmaengine_async_is_tx_complete(
+						cookies[j].chan, cookies[j].ck);
+				*stuck = chan;
 				*nr = 0;
 				return -ETIMEDOUT;
 			}
@@ -1040,6 +4052,16 @@ static ssize_t io_dma_fmw_cpu_chunk(struct kiocb *iocb,
 	return status;
 }
 
+/* Ring the doorbell of every stripe with submitted, unissued work. */
+static void io_dma_fmw_issue(struct io_ring_ctx *ctx, unsigned long *issued)
+{
+	unsigned int i;
+
+	for_each_set_bit(i, issued, IO_DMA_RING_CHANS)
+		dma_async_issue_pending(io_dma_stripe_chan(ctx, i));
+	*issued = 0;
+}
+
 /*
  * Take a folio that a wedged group leaks out of the page cache, as memory
  * failure takes out a poisoned one, then unlock it. The caller keeps the
@@ -1084,8 +4106,10 @@ static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
 				size_t base, size_t room,
 				struct io_dma_fmw_folio *fol,
 				unsigned int *fol_cap,
-				dma_cookie_t *cookies,
-				unsigned int max_cookies)
+				struct io_dma_fmw_ck *cookies,
+				unsigned int max_cookies,
+				struct io_dma_fmw_dst *dsts,
+				unsigned int max_dst)
 {
 	struct io_ring_ctx *ctx = req->ctx;
 	struct file *file = iocb->ki_filp;
@@ -1123,6 +4147,33 @@ static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
 	 * appends.
 	 */
 	bool eof_alone = file->f_op->fop_flags & FOP_TRUNCATE_FAILED_WRITE;
+	/*
+	 * Each destination piece is placed by file position like a read
+	 * batch, so the entry a write inserts is on the device the read
+	 * of that region will use. The pieces are split at quantum
+	 * boundaries aligned to file position, so none crosses a stripe
+	 * granule. Rotation, when the cache is parked, advances per group.
+	 * A rotating group starts at the first live stripe, as a read does,
+	 * and moves the rotation on past it.
+	 */
+	bool det = io_dma_stripe_deterministic(ctx);
+	unsigned int rr = det ? 0 : io_dma_stripe_index(ctx, 0, false,
+					READ_ONCE(ctx->dma.stripe_rr));
+	/* The granule of the last piece placed, and its stripe. */
+	u64 piece_granule = U64_MAX;
+	unsigned int piece_stripe = 0;
+	unsigned long issued = 0;
+	/*
+	 * Destination folios are mapped in pieces of at most one
+	 * IOVA-rcache-served quantum, split at quantum boundaries, and only
+	 * whole-quantum segments are cached. The quantum splits only the
+	 * pieces. It never shortens a chunk, whose length must stay what
+	 * write_begin() prepared.
+	 */
+	size_t map_quantum = io_dma_map_quantum(dev);
+	struct io_dma_fmw_dst *cur_dst = NULL;
+	size_t cur_dst_remain = 0;
+	unsigned int nr_dst = 0;
 	unsigned int nr_fol = 0, nr_cookies = 0, i;
 	unsigned int prep_fails = 0;
 	/* redo: a completion could not be trusted, so every folio is
@@ -1134,6 +4185,11 @@ static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
 	ssize_t collected = 0, committed = 0;
 	ssize_t err = 0;
 	int wedged = 0;
+	/* The channel a wedge timed out on, which the warning names. */
+	struct dma_chan *stuck = NULL;
+
+	if (!det)
+		WRITE_ONCE(ctx->dma.stripe_rr, rr + 1);
 
 	while (collected < room && nr_fol < max_fol &&
 	       collected < IO_DMA_FMW_GROUP_BYTES) {
@@ -1142,7 +4198,6 @@ static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
 				     max_chunk - (pos & (max_chunk - 1)),
 				     room - collected);
 		size_t offset, sub;
-		dma_addr_t dst_dma;
 		struct folio *folio;
 		void *fsdata;
 		bool chunk_redo = false, targeted = false, was_dirty, lost;
@@ -1307,36 +4362,103 @@ static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
 			 * chunks. This beats paying a drain-wait per chunk
 			 * while dozens of other rings hold the pools empty.
 			 */
-			dst_dma = 0;
 			chunk_redo = true;
 			goto record;
 		}
-		dst_dma = dma_map_page(dev, folio_page(folio, 0),
-				       offset, bytes, DMA_FROM_DEVICE);
-		if (dma_mapping_error(dev, dst_dma)) {
-			/* Commit this chunk via the CPU-redo pass instead. */
-			dst_dma = 0;
-			chunk_redo = true;
-			goto record;
-		}
-
-		/* Split at the source registered-buffer folio boundaries. */
+		/* Split at source registered-buffer folio boundaries and
+		 * at map-quantum boundaries of the destination folio. The
+		 * dst folios are the same page-cache folios reads source
+		 * from and cache entries are bidirectional, so quantum
+		 * sized dst pieces let the cache serve the write side.
+		 * A folio chunk mapped whole would exceed the IOVA
+		 * rcache class under a strict IOMMU and pay the
+		 * allocator slow path on every chunk, which is most of
+		 * the write path's gap to passthrough.
+		 */
 		for (sub = 0; sub < bytes; ) {
 			u64 uaddr = src_user_addr + base + collected + sub;
-			size_t src_seg_remain, len;
+			size_t src_seg_remain, len, dst_remain;
 			struct dma_async_tx_descriptor *tx;
 			dma_addr_t src_dma, dst;
 			dma_cookie_t ck;
 
+			/* Acquire the dst piece covering offset + sub; it
+			 * picks the stripe every descriptor into it uses.
+			 */
+			if (!cur_dst || !cur_dst_remain) {
+				size_t doff = offset + sub;
+				size_t plen = min_t(size_t, bytes - sub,
+						map_quantum -
+						(doff & (map_quantum - 1)));
+				unsigned int stripe = io_dma_piece_stripe(ctx,
+							pos + sub, det, rr,
+							&piece_granule,
+							&piece_stripe);
+				struct dma_chan *pchan =
+					io_dma_stripe_chan(ctx, stripe);
+				struct device *pdev = pchan->device->dev;
+				struct io_pfn_cache *pc = io_pfn_cache_usable() ?
+					io_pfn_cache_get(pdev) : NULL;
+				struct io_pfn_map *pm = NULL;
+				dma_addr_t d;
+
+				if (nr_dst == max_dst) {
+					chunk_redo = true;
+					break;
+				}
+				/* An orphaned channel completes nothing: leave
+				 * this piece to the CPU-redo pass, mapping
+				 * nothing.
+				 */
+				if (dma_chan_orphaned(pchan)) {
+					chunk_redo = true;
+					break;
+				}
+				pm = pc ?
+					io_pfn_map_lookup(pc, folio,
+							  doff, plen,
+							  folio_size(folio),
+							  (!collected && !sub) ||
+							  !(doff & (map_quantum - 1)),
+							  &d) : NULL;
+				if (pm) {
+					/* The device is about to write it;
+					 * it owns the piece until the wait
+					 * below hands it back.
+					 */
+					dma_sync_single_for_device(pdev, d, plen,
+								   DMA_FROM_DEVICE);
+				} else {
+					d = dma_map_page(pdev,
+							 folio_page(folio, 0),
+							 doff, plen,
+							 DMA_FROM_DEVICE);
+					if (dma_mapping_error(pdev, d)) {
+						chunk_redo = true;
+						break;
+					}
+				}
+				dsts[nr_dst] = (struct io_dma_fmw_dst){
+					.dma = d, .len = plen, .off = doff,
+					.folio = folio, .pm = pm,
+					.chan = pchan, .dev = pdev,
+					.stripe = stripe,
+				};
+				cur_dst = &dsts[nr_dst++];
+				cur_dst_remain = plen;
+			}
+			chan = cur_dst->chan;
 			src_dma = io_reg_buf_dma_addr(imu, uaddr,
 						      &src_seg_remain,
-						      dev);
-			dst = dst_dma + sub;
+						      cur_dst->dev);
 			if (unlikely(!src_dma)) {
 				chunk_redo = true; /* The CPU re-copies this folio. */
 				break;
 			}
-			len = min3(bytes - sub, src_seg_remain, max_chunk);
+			dst = cur_dst->dma +
+			      (cur_dst->len - cur_dst_remain);
+			dst_remain = cur_dst_remain;
+			len = min3(bytes - sub, src_seg_remain, dst_remain);
 
 			tx = dmaengine_prep_dma_memcpy(chan, dst, src_dma, len,
 						       io_dma_prep_flags());
@@ -1344,9 +4466,9 @@ static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
 				/* The pool is exhausted. Drain in-flight
 				 * work and retry once.
 				 */
-				dma_async_issue_pending(chan);
-				wedged = io_dma_fmw_wait(chan, cookies,
-							 &nr_cookies, &redo);
+				io_dma_fmw_issue(ctx, &issued);
+				wedged = io_dma_fmw_wait(cookies, &nr_cookies,
+							 &redo, &stuck);
 				if (wedged)
 					goto record;
 				tx = dmaengine_prep_dma_memcpy(chan, dst,
@@ -1371,23 +4493,31 @@ static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
 				if (dma_submit_error(ck)) {
 					chunk_redo = true;
 				} else {
-					cookies[nr_cookies++] = ck;
+					cookies[nr_cookies++] =
+						(struct io_dma_fmw_ck){
+							.ck = ck, .chan = chan,
+						};
+					issued |= BIT(cur_dst->stripe);
 					targeted = true;
 				}
 				if (nr_cookies == max_cookies) {
-					dma_async_issue_pending(chan);
-					wedged = io_dma_fmw_wait(chan, cookies,
-							&nr_cookies, &redo);
+					io_dma_fmw_issue(ctx, &issued);
+					wedged = io_dma_fmw_wait(cookies,
+							&nr_cookies, &redo,
+							&stuck);
 					if (wedged)
 						goto record;
 				}
 			}
 			sub += len;
+			cur_dst_remain -= len;
 		}
+		cur_dst = NULL;
+		cur_dst_remain = 0;
 record:
 		fol[nr_fol++] = (struct io_dma_fmw_folio){
 			.folio = folio, .fsdata = fsdata, .pos = pos,
-			.len = bytes, .dst_dma = dst_dma, .map_len = bytes,
+			.len = bytes,
 			.redo = chunk_redo, .targeted = targeted, .lost = lost,
 		};
 		/*
@@ -1404,8 +4534,9 @@ record:
 	}
 
 	if (!wedged) {
-		dma_async_issue_pending(chan);
-		wedged = io_dma_fmw_wait(chan, cookies, &nr_cookies, &redo);
+		io_dma_fmw_issue(ctx, &issued);
+		wedged = io_dma_fmw_wait(cookies, &nr_cookies, &redo,
+					 &stuck);
 	}
 
 	/* Unmap the dst IOVAs, except after a timeout. An unmap frees the
@@ -1416,10 +4547,31 @@ record:
 	 * wedge leaks the mappings with the folios below, which stay
 	 * referenced, and a late write can only land there.
 	 */
-	for (i = 0; i < nr_fol; i++)
-		if (fol[i].dst_dma && likely(!wedged))
-			dma_unmap_page(dev, fol[i].dst_dma, fol[i].map_len,
+	for (i = 0; i < nr_dst; i++) {
+		if (dsts[i].pm) {
+			/* The device wrote it, or on a wedge may have:
+			 * hand the piece back to the CPU before the folio
+			 * is unlocked or leaked.
+			 */
+			dma_sync_single_for_cpu(dsts[i].dev, dsts[i].dma,
+						dsts[i].len, DMA_FROM_DEVICE);
+			/* On a wedge the cached mapping leaves the cache,
+			 * so no other I/O is handed it, and keeps this
+			 * write's reference. The mapping is then never
+			 * unmapped, and a slot-backed one's slot is never
+			 * collected or linked to another folio.
+			 */
+			if (unlikely(wedged)) {
+				io_pfn_map_displace(dsts[i].pm->cache,
+						    dsts[i].pm);
+				continue;
+			}
+			io_pfn_map_put(dsts[i].pm);
+		} else if (likely(!wedged)) {
+			dma_unmap_page(dsts[i].dev, dsts[i].dma, dsts[i].len,
 				       DMA_FROM_DEVICE);
+		}
+	}
 
 	if (unlikely(wedged)) {
 		unsigned int leaked = 0, dropped = 0;
@@ -1473,7 +4625,7 @@ record:
 		}
 		pr_warn_ratelimited("io_uring DMA write: wedged after %ums, leaking %u folios, %u of them dropped from the page cache (%s)\n",
 				    READ_ONCE(io_dma_fmw_wait_ms), leaked, dropped,
-				    dma_chan_name(chan));
+				    dma_chan_name(stuck));
 		io_dma_fmw_record(IO_DMA_FMW_ERROR);
 		return -EIO;
 	}
@@ -1564,8 +4716,10 @@ ssize_t io_dma_filemap_write(struct io_kiocb *req, struct kiocb *iocb,
 	struct file *file = iocb->ki_filp;
 	struct inode *inode = file->f_mapping->host;
 	struct io_dma_fmw_folio *fol = NULL;
-	dma_cookie_t *cookies = NULL;
-	unsigned int max_fol, max_cookies;
+	struct io_dma_fmw_ck *cookies = NULL;
+	struct io_dma_fmw_dst *dsts = NULL;
+	unsigned int max_fol, max_cookies, max_dst;
+	size_t max_folio, quantum;
 	ssize_t want, written = 0, err = 0;
 
 	/* At or below this size the per-folio write_begin and write_end
@@ -1612,9 +4766,27 @@ ssize_t io_dma_filemap_write(struct io_kiocb *req, struct kiocb *iocb,
 	 */
 	max_cookies = max_fol + DIV_ROUND_UP(want, 1UL << imu->folio_shift) + 8;
 	max_cookies = min_t(unsigned int, max_cookies, 4 * max_fol + 8);
+	/*
+	 * One dst piece per folio chunk, plus one per map-quantum boundary
+	 * inside a chunk. A folio is aligned to its size, so in a folio
+	 * larger than the quantum those boundaries are quantum multiples of
+	 * the file position, and a group spans at most the write, or
+	 * IO_DMA_FMW_GROUP_BYTES plus its last folio. Bounding by that span
+	 * rather than by a maximum-size folio per chunk keeps the array,
+	 * which every write allocates and frees, small enough for the
+	 * per-CPU page lists.
+	 */
+	max_folio = mapping_max_folio_size(file->f_mapping);
+	quantum = io_dma_map_quantum(req->ctx->dma.chan->device->dev);
+	max_dst = min_t(size_t,
+			max_fol * (1 + DIV_ROUND_UP(max_folio, quantum)),
+			max_fol + DIV_ROUND_UP(min_t(size_t, want,
+					IO_DMA_FMW_GROUP_BYTES + max_folio),
+					quantum));
 	fol = kvmalloc_array(max_fol, sizeof(*fol), GFP_KERNEL);
 	cookies = kvmalloc_array(max_cookies, sizeof(*cookies), GFP_KERNEL);
-	if (!fol || !cookies) {
+	dsts = kvmalloc_array(max_dst, sizeof(*dsts), GFP_KERNEL);
+	if (!fol || !cookies || !dsts) {
 		err = -EAGAIN;	/* Fall back to the normal write path. */
 		goto out_unlock;
 	}
@@ -1641,7 +4813,8 @@ ssize_t io_dma_filemap_write(struct io_kiocb *req, struct kiocb *iocb,
 		}
 		done = io_dma_fmw_group(req, iocb, from, src_user_addr,
 					written, want - written, fol,
-					&max_fol, cookies, max_cookies);
+					&max_fol, cookies, max_cookies,
+					dsts, max_dst);
 		if (done <= 0) {
 			/* A zero-progress group falls back to the normal
 			 * write path rather than completing as a zero-byte
@@ -1660,6 +4833,7 @@ out_unlock:
 	inode_unlock(inode);
 	kvfree(fol);
 	kvfree(cookies);
+	kvfree(dsts);
 	if (written > 0)
 		return generic_write_sync(iocb, written) ?: written;
 	return err;
@@ -1680,15 +4854,26 @@ static void io_dma_task_release_res(struct io_ring_ctx *ctx, struct device *dev,
 		int i;
 
 		for (i = 0; i < dma->batch_nr; i++) {
-			dma_unmap_page(dev,
-				       dma->batch_entries[i].src_dma,
-				       dma->batch_entries[i].src_len,
-				       DMA_TO_DEVICE);
-			folio_put(dma->batch_entries[i].folio);
+			struct io_dma_batch_entry *e = &dma->batch_entries[i];
+
+			if (e->pfn_map) {
+				/*
+				 * This is a cached mapping, so we drop the
+				 * in-flight reference. The unmap belongs to
+				 * eviction or flush and not to this I/O.
+				 */
+				io_pfn_map_put(e->pfn_map);
+			} else {
+				dma_unmap_page(dev, e->src_dma, e->src_len,
+					       DMA_TO_DEVICE);
+			}
+			folio_put(e->folio);
 		}
 		kfree(dma->batch_entries);
 	} else {
-		if (dma->src_map_len) {
+		if (dma->src_pfn_map) {
+			io_pfn_map_put(dma->src_pfn_map);
+		} else if (dma->src_map_len) {
 			if (dma->src_is_page)
 				dma_unmap_page(dev, dma->src_map_addr,
 					       dma->src_map_len,
