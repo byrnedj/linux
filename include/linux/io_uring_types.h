@@ -368,8 +368,14 @@ struct io_dma_kiocb {
 	u64			dst_user_addr;	/* user VA for reg buf DMA lookup */
 };
 
+struct io_pfn_map;
+
 struct io_dma_batch_entry {
 	dma_addr_t		src_dma;	/* DMA-mapped source address */
+	struct io_pfn_map	*pfn_map;	/* persistent-mapping cache entry
+						 * backing src_dma (ref held), or
+						 * NULL when src_dma is a plain
+						 * per-chunk mapping */
 	dma_addr_t		dst_dma;	/* pre-mapped dest DMA address */
 	u32			src_len;	/* source mapping length */
 	struct folio		*folio;		/* page cache folio ref */
@@ -386,6 +392,9 @@ struct io_dma_task {
 	u32			len;
 	dma_addr_t		src_map_addr;	/* for dma_unmap at completion */
 	u32			src_map_len;
+	struct io_pfn_map	*src_pfn_map;	/* cache entry backing the single
+						 * source mapping (ref dropped at
+						 * completion instead of unmap) */
 	struct folio		*src_folio;	/* page cache folio ref to put on completion */
 	bool			src_is_page;	/* true → dma_unmap_page, false → dma_unmap_single */
 	bool			is_batch;	/* true → batch task with batch_entries */

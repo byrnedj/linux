@@ -42,6 +42,339 @@ static inline unsigned long io_dma_prep_flags(void)
 }
 
 /*
+ * PFN-keyed persistent source-mapping cache.
+ *
+ * Under translated IOMMU domains the dominant recoverable submit cost on
+ * the DMA source paths is per-chunk dma_map/dma_unmap (measured via the
+ * temporary iommu=pt experiment: buffered reads 10.7 -> 53.7 GB/s).
+ * Destinations are already persistent -- registered buffers map once at
+ * registration; this
+ * gives sources the same discipline, lazily: the first chunk that touches
+ * a folio maps the whole folio DMA_TO_DEVICE and caches {folio-head PFN
+ * -> dma_addr} in a per-DSA-device xarray; every later chunk on that
+ * folio is pure arithmetic.  dma_unmap leaves the per-I/O path entirely,
+ * running only on CLOCK eviction (bytes-capped) and explicit flush.
+ *
+ * Correctness keystone: struct page <-> physical address is immutable,
+ * and descriptors are only issued against pages held live by the I/O
+ * being processed (skb reference on the recv path, folio reference on
+ * the filemap path).  A stale cached translation therefore can never
+ * misdirect DMA -- if the page was freed and recycled since insertion it
+ * is by definition the same physical page legitimately holding the new
+ * data.  Staleness costs IOVA space and a lingering device *read*
+ * permission window, bounded by the cap (the same class of trade
+ * page_pool's persistent NIC mappings make).
+ *
+ * Entry lifetime: refs = 1 cache bias + one per in-flight batch entry.
+ * Lookup takes a reference with atomic_inc_not_zero() under RCU;
+ * eviction erases the entry from the tree and drops the bias, so the
+ * mapping survives until its last in-flight user completes.  The
+ * refs>1 test in the CLOCK sweep is only a preference for idle entries;
+ * correctness comes from the bias protocol.
+ *
+ * Limitation: mappings are keyed to the DSA struct device and are not
+ * torn down on driver unbind -- flush via debugfs before unbinding idxd.
+ */
+
+struct io_pfn_map {
+	unsigned long		pfn;		/* folio-head PFN: cache key */
+	dma_addr_t		dma_base;	/* whole-folio DMA_TO_DEVICE mapping */
+	unsigned int		size;		/* mapped bytes (folio_size at insert) */
+	atomic_t		refs;		/* cache bias + in-flight users */
+	bool			referenced;	/* CLOCK second-chance bit */
+	struct device		*dev;		/* unmap handle */
+	struct rcu_head		rcu;
+};
+
+struct io_pfn_cache {
+	struct xarray		xa;
+	spinlock_t		lock;		/* serializes the CLOCK sweep */
+	unsigned long		hand;		/* next PFN the sweep visits */
+	struct device		*dev;
+	atomic64_t		covered;	/* bytes mapped through the tree */
+	atomic64_t		hits;
+	atomic64_t		misses;
+	atomic64_t		inserts;
+	atomic64_t		insert_fails;	/* alloc/map/xa failure -> plain map */
+	atomic64_t		range_fallbacks;/* chunk not coverable by one entry */
+	atomic64_t		evictions;
+	atomic64_t		ref_skips;	/* sweep passed an in-flight entry */
+};
+
+#define IO_PFN_CACHE_DEVS	16
+static struct io_pfn_cache *io_pfn_caches[IO_PFN_CACHE_DEVS];
+static struct device *io_pfn_cache_devs[IO_PFN_CACHE_DEVS];
+static DEFINE_SPINLOCK(io_pfn_cache_reg_lock);
+
+/*
+ * Covered-bytes cap in MiB; 0 disables the cache entirely.  Generous by
+ * default: oversizing only widens the exposure window, while a cap under
+ * a cycling working set makes the sweep thrash (evict+remap per I/O,
+ * worse than no cache).  Size it above the source working set -- the
+ * hot file set for reads.
+ */
+static u32 io_dma_pfn_cache_cap_mb __read_mostly = 4096;
+
+/* Sweep visit budget per eviction call: bounds datapath latency when the
+ * table is large and mostly referenced/in-flight (soft cap). */
+#define IO_PFN_EVICT_BUDGET	1024
+
+static struct io_pfn_cache *io_pfn_cache_get(struct device *dev)
+{
+	struct io_pfn_cache *c;
+	int i;
+
+	for (i = 0; i < IO_PFN_CACHE_DEVS; i++) {
+		if (smp_load_acquire(&io_pfn_cache_devs[i]) == dev)
+			return io_pfn_caches[i];
+		if (!READ_ONCE(io_pfn_cache_devs[i]))
+			break;
+	}
+
+	c = kzalloc(sizeof(*c), GFP_NOWAIT | __GFP_NOWARN);
+	if (!c)
+		return NULL;
+	xa_init(&c->xa);
+	spin_lock_init(&c->lock);
+	c->dev = dev;
+
+	spin_lock(&io_pfn_cache_reg_lock);
+	for (i = 0; i < IO_PFN_CACHE_DEVS; i++) {
+		if (io_pfn_cache_devs[i] == dev) {	/* insert race */
+			spin_unlock(&io_pfn_cache_reg_lock);
+			kfree(c);
+			return io_pfn_caches[i];
+		}
+		if (!io_pfn_cache_devs[i]) {
+			io_pfn_caches[i] = c;
+			/* pairs with the lockless load above */
+			smp_store_release(&io_pfn_cache_devs[i], dev);
+			spin_unlock(&io_pfn_cache_reg_lock);
+			return c;
+		}
+	}
+	spin_unlock(&io_pfn_cache_reg_lock);
+	kfree(c);	/* registry full: this device runs uncached */
+	return NULL;
+}
+
+/* Drop one reference; the last dropper unmaps and frees. Safe from any
+ * context (IRQ-mode completions run in dmaengine callback context). */
+static void io_pfn_map_put(struct io_pfn_map *pm)
+{
+	if (!atomic_dec_and_test(&pm->refs))
+		return;
+	dma_unmap_page(pm->dev, pm->dma_base, pm->size, DMA_TO_DEVICE);
+	kfree_rcu(pm, rcu);
+}
+
+/*
+ * CLOCK sweep: advance the hand from where it last stopped, giving
+ * referenced entries a second chance (scan resistance: a streaming
+ * pattern cannot flush the recycling working set, whose entries keep
+ * their bit set) and skipping entries with in-flight users.  Runs on
+ * the submit path after an insert pushes covered past the cap, so both
+ * the trylock (another submitter is already sweeping) and the visit
+ * budget bound the added latency.
+ */
+static void io_pfn_cache_evict(struct io_pfn_cache *c, u64 cap)
+{
+	struct io_pfn_map *pm;
+	unsigned long index;
+	int budget = IO_PFN_EVICT_BUDGET;
+	int pass;
+
+	if (!spin_trylock(&c->lock))
+		return;
+
+	for (pass = 0; pass < 2 && atomic64_read(&c->covered) > cap; pass++) {
+		unsigned long start = pass ? 0 : c->hand;
+
+		xa_for_each_start(&c->xa, index, pm, start) {
+			if (--budget <= 0) {
+				c->hand = index + 1;
+				goto out;
+			}
+			if (READ_ONCE(pm->referenced)) {
+				WRITE_ONCE(pm->referenced, false);
+			} else if (atomic_read(&pm->refs) > 1) {
+				atomic64_inc(&c->ref_skips);
+			} else {
+				xa_erase(&c->xa, index);
+				atomic64_sub(pm->size, &c->covered);
+				atomic64_inc(&c->evictions);
+				io_pfn_map_put(pm);	/* drop cache bias */
+				if (atomic64_read(&c->covered) <= cap) {
+					c->hand = index + 1;
+					goto out;
+				}
+			}
+		}
+		c->hand = 0;
+	}
+out:
+	spin_unlock(&c->lock);
+}
+
+/*
+ * Look up (or create) the persistent mapping covering [offset, offset+len)
+ * of @folio and return it with an in-flight reference taken; *dma is set
+ * to the chunk's device address.  NULL means the caller should fall back
+ * to a plain per-chunk map (never an error).
+ */
+static struct io_pfn_map *io_pfn_map_lookup(struct io_pfn_cache *c,
+					    struct folio *folio,
+					    size_t offset, size_t len,
+					    dma_addr_t *dma)
+{
+	unsigned long pfn = folio_pfn(folio);
+	u64 cap = (u64)READ_ONCE(io_dma_pfn_cache_cap_mb) << 20;
+	struct io_pfn_map *pm, *old;
+	dma_addr_t base;
+
+	if (!c || !cap)
+		return NULL;
+
+	rcu_read_lock();
+	pm = xa_load(&c->xa, pfn);
+	if (pm && atomic_inc_not_zero(&pm->refs)) {
+		rcu_read_unlock();
+		if (unlikely(offset + len > pm->size)) {
+			/*
+			 * The PFN was recycled into a larger folio than the
+			 * cached mapping covers.  Serve this chunk plainly;
+			 * the stale entry ages out via the sweep.
+			 */
+			atomic64_inc(&c->range_fallbacks);
+			io_pfn_map_put(pm);
+			return NULL;
+		}
+		WRITE_ONCE(pm->referenced, true);
+		atomic64_inc(&c->hits);
+		*dma = pm->dma_base + offset;
+		return pm;
+	}
+	rcu_read_unlock();
+	atomic64_inc(&c->misses);
+
+	pm = kmalloc(sizeof(*pm), GFP_NOWAIT | __GFP_NOWARN);
+	if (!pm)
+		goto fail;
+	base = dma_map_page(c->dev, folio_page(folio, 0), 0,
+			    folio_size(folio), DMA_TO_DEVICE);
+	if (dma_mapping_error(c->dev, base)) {
+		kfree(pm);
+		goto fail;
+	}
+	pm->pfn = pfn;
+	pm->dma_base = base;
+	pm->size = folio_size(folio);
+	pm->dev = c->dev;
+	pm->referenced = true;
+	atomic_set(&pm->refs, 2);	/* cache bias + this I/O */
+
+	rcu_read_lock();
+	old = xa_cmpxchg(&c->xa, pfn, NULL, pm, GFP_NOWAIT | __GFP_NOWARN);
+	if (old) {
+		/* Lost an insert race, or xarray node allocation failed. */
+		dma_unmap_page(c->dev, base, pm->size, DMA_TO_DEVICE);
+		kfree(pm);
+		if (!xa_is_err(old) && atomic_inc_not_zero(&old->refs)) {
+			rcu_read_unlock();
+			if (unlikely(offset + len > old->size)) {
+				atomic64_inc(&c->range_fallbacks);
+				io_pfn_map_put(old);
+				return NULL;
+			}
+			WRITE_ONCE(old->referenced, true);
+			atomic64_inc(&c->hits);
+			*dma = old->dma_base + offset;
+			return old;
+		}
+		rcu_read_unlock();
+		goto fail;
+	}
+	rcu_read_unlock();
+	atomic64_inc(&c->inserts);
+	if (atomic64_add_return(pm->size, &c->covered) > cap)
+		io_pfn_cache_evict(c, cap);
+	*dma = pm->dma_base + offset;
+	return pm;
+fail:
+	atomic64_inc(&c->insert_fails);
+	return NULL;
+}
+
+/* Erase everything; in-flight users keep their mappings alive until
+ * their references drop. */
+static void io_pfn_cache_flush(struct io_pfn_cache *c)
+{
+	struct io_pfn_map *pm;
+	unsigned long index;
+
+	spin_lock(&c->lock);
+	xa_for_each(&c->xa, index, pm) {
+		xa_erase(&c->xa, index);
+		atomic64_sub(pm->size, &c->covered);
+		io_pfn_map_put(pm);
+	}
+	c->hand = 0;
+	spin_unlock(&c->lock);
+}
+
+static bool io_pfn_cache_usable(struct io_ring_ctx *ctx)
+{
+	return !ctx->dma.use_phys_addrs &&
+	       READ_ONCE(io_dma_pfn_cache_cap_mb) != 0;
+}
+
+static int io_pfn_cache_stats_show(struct seq_file *m, void *p)
+{
+	int i;
+
+	seq_printf(m, "cap_mb %u\n", READ_ONCE(io_dma_pfn_cache_cap_mb));
+	for (i = 0; i < IO_PFN_CACHE_DEVS; i++) {
+		struct io_pfn_cache *c;
+
+		if (!smp_load_acquire(&io_pfn_cache_devs[i]))
+			break;
+		c = io_pfn_caches[i];
+		seq_printf(m,
+			   "dev %s covered_kb %lld hits %lld misses %lld inserts %lld insert_fails %lld range_fallbacks %lld evictions %lld ref_skips %lld\n",
+			   dev_name(c->dev),
+			   atomic64_read(&c->covered) >> 10,
+			   atomic64_read(&c->hits),
+			   atomic64_read(&c->misses),
+			   atomic64_read(&c->inserts),
+			   atomic64_read(&c->insert_fails),
+			   atomic64_read(&c->range_fallbacks),
+			   atomic64_read(&c->evictions),
+			   atomic64_read(&c->ref_skips));
+	}
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(io_pfn_cache_stats);
+
+static ssize_t io_pfn_cache_flush_write(struct file *file,
+					const char __user *ubuf,
+					size_t len, loff_t *ppos)
+{
+	int i;
+
+	for (i = 0; i < IO_PFN_CACHE_DEVS; i++) {
+		if (!smp_load_acquire(&io_pfn_cache_devs[i]))
+			break;
+		io_pfn_cache_flush(io_pfn_caches[i]);
+	}
+	return len;
+}
+
+static const struct file_operations io_pfn_cache_flush_fops = {
+	.owner	= THIS_MODULE,
+	.write	= io_pfn_cache_flush_write,
+};
+
+/*
  * Busy-poll budget (in microseconds) for draining in-flight DMA completions
  * from the CQ-wait path (io_dma_cq_wait_poll()) before the waiting task
  * commits to sleeping. A DSA transfer for a typical read chunk completes
@@ -108,7 +441,6 @@ static const struct file_operations io_dma_lat_reset_fops = {
 	.write		= io_dma_lat_reset_write,
 	.llseek		= noop_llseek,
 };
-
 
 /*
  * Optional global CPU latency QoS request. DMA completion latency includes
@@ -182,6 +514,12 @@ void io_dma_debugfs_init(void)
 			    &io_dma_lat_fops);
 	debugfs_create_file("io_uring_dma_latency_reset", 0200, NULL, NULL,
 			    &io_dma_lat_reset_fops);
+	debugfs_create_file("io_uring_dma_pfn_cache", 0444, NULL, NULL,
+			    &io_pfn_cache_stats_fops);
+	debugfs_create_u32("io_uring_dma_pfn_cache_cap_mb", 0644, NULL,
+			   &io_dma_pfn_cache_cap_mb);
+	debugfs_create_file("io_uring_dma_pfn_cache_flush", 0200, NULL, NULL,
+			    &io_pfn_cache_flush_fops);
 }
 
 /* Datapath alloc: pool first, then non-blocking slab, never sleeps. */
@@ -439,6 +777,7 @@ static ssize_t io_dma_submit_single_entry(struct io_kiocb *req,
 	dma->len = entry->src_len;
 	dma->src_map_addr = entry->src_dma;
 	dma->src_map_len = entry->src_len;
+	dma->src_pfn_map = entry->pfn_map;
 	dma->src_folio = entry->folio;
 	dma->src_is_page = true;
 	dma->is_batch = false;
@@ -476,9 +815,18 @@ static void io_dma_unmap_batch_entries(struct io_kiocb *req,
 	if (req->ctx->dma.use_phys_addrs)
 		return;
 
-	for (i = 0; i < nr; i++)
-		dma_unmap_page(dev, entries[i].src_dma,
-			       entries[i].src_len, DMA_TO_DEVICE);
+	for (i = 0; i < nr; i++) {
+		struct io_dma_batch_entry *e = &entries[i];
+
+		if (e->pfn_map) {
+			/* Cached mapping: drop the in-flight reference; the
+			 * unmap belongs to eviction/flush, not this I/O. */
+			io_pfn_map_put(e->pfn_map);
+		} else {
+			dma_unmap_page(dev, e->src_dma, e->src_len,
+				       DMA_TO_DEVICE);
+		}
+	}
 }
 
 /*
@@ -540,6 +888,8 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 	struct io_mapped_ubuf *imu = req->buf_node->buf;
 	struct device *dev = ctx->dma.chan->device->dev;
 	struct dma_chan *chan = ctx->dma.chan;
+	struct io_pfn_cache *pfn_cache =
+		io_pfn_cache_usable(ctx) ? io_pfn_cache_get(dev) : NULL;
 	struct folio_batch fbatch;
 	struct io_dma_batch_entry *entries;
 	unsigned int nr_entries = 0;
@@ -627,6 +977,7 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 			 * at destination registered buffer folio boundaries.
 			 */
 			while (copied < bytes) {
+				struct io_pfn_map *pm = NULL;
 				dma_addr_t dst_dma, src_dma;
 				size_t dst_folio_remain;
 				size_t chunk;
@@ -654,17 +1005,23 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 					src_dma = page_to_phys(folio_page(folio, 0)) +
 						  offset + copied;
 				} else {
-					src_dma = dma_map_page(dev, &folio->page,
+					pm = io_pfn_map_lookup(pfn_cache, folio,
 							       offset + copied,
-							       chunk, DMA_TO_DEVICE);
-					if (dma_mapping_error(dev, src_dma)) {
-						error = -EFAULT;
-						goto flush_and_put;
+							       chunk, &src_dma);
+					if (!pm) {
+						src_dma = dma_map_page(dev, &folio->page,
+								       offset + copied,
+								       chunk, DMA_TO_DEVICE);
+						if (dma_mapping_error(dev, src_dma)) {
+							error = -EFAULT;
+							goto flush_and_put;
+						}
 					}
 				}
 
 				/* Collect entry for batch submission */
 				entries[nr_entries].src_dma = src_dma;
+				entries[nr_entries].pfn_map = pm;
 				entries[nr_entries].dst_dma = dst_dma;
 				entries[nr_entries].src_len = chunk;
 				entries[nr_entries].folio = folio;
@@ -1080,16 +1437,24 @@ void io_dma_task_release_res(struct io_ring_ctx *ctx, struct device *dev,
 		int i;
 
 		for (i = 0; i < dma->batch_nr; i++) {
-			if (!ctx->dma.use_phys_addrs)
-				dma_unmap_page(dev,
-					       dma->batch_entries[i].src_dma,
-					       dma->batch_entries[i].src_len,
+			struct io_dma_batch_entry *e = &dma->batch_entries[i];
+
+			if (e->pfn_map) {
+				/* Cached mapping: drop the in-flight
+				 * reference; the unmap belongs to
+				 * eviction/flush, not this I/O. */
+				io_pfn_map_put(e->pfn_map);
+			} else if (!ctx->dma.use_phys_addrs) {
+				dma_unmap_page(dev, e->src_dma, e->src_len,
 					       DMA_TO_DEVICE);
-			folio_put(dma->batch_entries[i].folio);
+			}
+			folio_put(e->folio);
 		}
 		kfree(dma->batch_entries);
 	} else {
-		if (dma->src_map_len && !ctx->dma.use_phys_addrs) {
+		if (dma->src_pfn_map) {
+			io_pfn_map_put(dma->src_pfn_map);
+		} else if (dma->src_map_len && !ctx->dma.use_phys_addrs) {
 			if (dma->src_is_page)
 				dma_unmap_page(dev, dma->src_map_addr,
 					       dma->src_map_len,
