@@ -633,6 +633,7 @@ void io_dma_fmw_record(unsigned int reason);
 ssize_t io_dma_filemap_write(struct io_kiocb *req, struct kiocb *iocb,
 			     struct iov_iter *from, u64 src_user_addr);
 extern unsigned int io_dma_stripe_chans;
+void io_pfn_cache_prepare(struct device *dev);
 int kiocb_done(struct io_kiocb *req, ssize_t ret, struct io_br_sel *sel, unsigned int issue_flags);
 void io_submit_flush_completions(struct io_ring_ctx *ctx);
 
