@@ -479,6 +479,17 @@ static unsigned int io_dma_cq_poll_us __read_mostly = 20;
 static unsigned int io_dma_mwait_us __read_mostly = 50;
 
 /*
+ * 0 (default): UMONITOR/UMWAIT C0.2 -- ~100-200ns wake, TSC deadline
+ * bounds every doze (stale monitors, rescue kicks on the runnable
+ * thread, kthread_stop all recover at io_uring_dma_mwait_us).
+ * 1: CPL0 MONITOR/MWAIT C1 -- deeper power state, but ~1-2us C1 exit on
+ * every wake and NO deadline: only the next interrupt (typically the
+ * scheduler tick, ~1ms) bounds a stale doze. A/B knob; debugfs
+ * io_uring_dma_mwait_deep.
+ */
+static unsigned int io_dma_mwait_deep __read_mostly;
+
+/*
  * Keep DMA completion detection on the ring task where possible, instead of
  * bouncing every completion through the kworker poller plus a second
  * task_work wakeup:
@@ -1082,6 +1093,8 @@ void io_dma_debugfs_init(void)
 			   &io_dma_cq_poll_us);
 	debugfs_create_u32("io_uring_dma_mwait_us", 0644, NULL,
 			   &io_dma_mwait_us);
+	debugfs_create_u32("io_uring_dma_mwait_deep", 0644, NULL,
+			   &io_dma_mwait_deep);
 	debugfs_create_file("io_uring_dma_cpu_latency_us", 0644, NULL, NULL,
 			    &io_dma_cpu_lat_fops);
 	debugfs_create_file("io_uring_dma_pfn_cache", 0444, NULL, NULL,
@@ -1271,6 +1284,7 @@ void io_dma_poll_workfn(struct work_struct *w)
  */
 #ifdef CONFIG_X86
 #include <asm/cpufeature.h>
+#include <asm/mwait.h>
 #include <asm/tsc.h>
 
 static inline void io_umonitor(const void *addr)
@@ -1302,8 +1316,10 @@ static inline void io_umwait(u32 state, u64 tsc_deadline)
 static void io_dma_mwait_wait(struct io_ring_ctx *ctx)
 {
 	const u8 *status = NULL;
+	bool deep = READ_ONCE(io_dma_mwait_deep) &&
+		    static_cpu_has(X86_FEATURE_MWAIT);
 
-	if (!static_cpu_has(X86_FEATURE_WAITPKG)) {
+	if (!deep && !static_cpu_has(X86_FEATURE_WAITPKG)) {
 		cpu_relax();
 		return;
 	}
@@ -1321,11 +1337,19 @@ static void io_dma_mwait_wait(struct io_ring_ctx *ctx)
 	}
 
 	/* Monitor protocol: arm, re-check, then wait -- a record write
-	 * between the check and the UMWAIT still ends the wait. */
-	io_umonitor(status);
-	if (READ_ONCE(*status) == 0 && !kthread_should_stop())
-		io_umwait(0 /* C0.2 */, rdtsc() +
-			  (u64)READ_ONCE(io_dma_mwait_us) * tsc_khz / 1000);
+	 * between the check and the wait still ends it. A context switch
+	 * between MONITOR and MWAIT clears the armed state, in which case
+	 * MWAIT retires immediately (SDM) -- no lost wake either way. */
+	if (deep) {
+		__monitor(status, 0, 0);
+		if (READ_ONCE(*status) == 0 && !kthread_should_stop())
+			__mwait(0x00 /* C1 */, MWAIT_ECX_INTERRUPT_BREAK);
+	} else {
+		io_umonitor(status);
+		if (READ_ONCE(*status) == 0 && !kthread_should_stop())
+			io_umwait(0 /* C0.2 */, rdtsc() +
+				  (u64)READ_ONCE(io_dma_mwait_us) * tsc_khz / 1000);
+	}
 }
 #else
 static void io_dma_mwait_wait(struct io_ring_ctx *ctx)
