@@ -2499,6 +2499,7 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 	atomic64_set(&ctx->dma.dbg_kick_elided, 0);
 	atomic64_set(&ctx->dma.dbg_workfn_runs, 0);
 	atomic64_set(&ctx->dma.dbg_workfn_resumes, 0);
+	atomic64_set(&ctx->dma.dbg_rescue_kicks, 0);
 	ctx->dma.dbg_workfn_exit_ns = 0;
 	INIT_LIST_HEAD(&ctx->dma.dbg_node);
 
