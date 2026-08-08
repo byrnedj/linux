@@ -309,6 +309,23 @@ struct io_dma_channel {
 	atomic_t		diag_refs_taken;
 	atomic_t		diag_refs_dropped;
 
+	/* Lost-wakeup instrumentation for the poll_active kick-elision
+	 * protocol: submit-side kick outcomes, workfn drain entries and
+	 * exit-race resumes, and the ktime of the last workfn exit. A
+	 * stalled task whose submit_ns is AFTER dbg_workfn_exit_ns was
+	 * published with no poller running and no kick delivered
+	 * (submit-side hole); BEFORE means the workfn's exit re-check
+	 * missed it (exit-protocol hole). Dumped via the debugfs file
+	 * io_uring_dma_poll_state; dbg_node links the ctx into the
+	 * global dump registry while it owns a channel.
+	 */
+	atomic64_t		dbg_kick_queued;
+	atomic64_t		dbg_kick_elided;
+	atomic64_t		dbg_workfn_runs;
+	atomic64_t		dbg_workfn_resumes;
+	u64			dbg_workfn_exit_ns;
+	struct list_head	dbg_node;
+
 	spinlock_t		lock;
 
 	/* Pending pollable tasks, split for lock-free producer/consumer:
