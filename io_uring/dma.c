@@ -241,13 +241,21 @@ static struct io_pfn_map *io_pfn_map_lookup(struct io_pfn_cache *c,
 		rcu_read_unlock();
 		if (unlikely(offset + len > pm->size)) {
 			/*
-			 * The PFN was recycled into a larger folio than the
-			 * cached mapping covers.  Serve this chunk plainly;
-			 * the stale entry ages out via the sweep.
+			 * The run outgrew the cached region (fused striding
+			 * runs vary in length, and a recycled PFN may carry a
+			 * shorter mapping).  Displace the entry and fall
+			 * through to remap the larger run under the same key;
+			 * in-flight users of the old mapping stay safe via
+			 * the bias protocol.
 			 */
+			if (xa_cmpxchg(&c->xa, pfn, pm, NULL,
+				       GFP_NOWAIT | __GFP_NOWARN) == pm) {
+				atomic64_sub(pm->size, &c->covered);
+				io_pfn_map_put(pm);	/* cache bias */
+			}
+			io_pfn_map_put(pm);		/* lookup ref */
 			atomic64_inc(&c->range_fallbacks);
-			io_pfn_map_put(pm);
-			return NULL;
+			goto miss;
 		}
 		WRITE_ONCE(pm->referenced, true);
 		atomic64_inc(&c->hits);
@@ -255,6 +263,7 @@ static struct io_pfn_map *io_pfn_map_lookup(struct io_pfn_cache *c,
 		return pm;
 	}
 	rcu_read_unlock();
+miss:
 	atomic64_inc(&c->misses);
 
 	pm = kmalloc(sizeof(*pm), GFP_NOWAIT | __GFP_NOWARN);
