@@ -220,13 +220,21 @@ out:
 
 /*
  * Look up (or create) the persistent mapping covering [offset, offset+len)
- * of @folio and return it with an in-flight reference taken; *dma is set
- * to the chunk's device address.  NULL means the caller should fall back
- * to a plain per-chunk map (never an error).
+ * from the head of @folio and return it with an in-flight reference taken;
+ * *dma is set to the chunk's device address.  NULL means the caller should
+ * fall back to a plain per-chunk map (never an error).
+ *
+ * @map_len is how much to map from the folio head on a miss: folio_size()
+ * for page-cache folios, but a kvec run may extend past a 4KB folio across
+ * physically-contiguous neighbours (mlx5 striding-RQ buffers), and mapping
+ * the whole run as one entry is what keeps its IOVA contiguous -- the
+ * property descriptor coalescing needs.  Overlapping entries from runs
+ * that start mid-region are allowed (correct, just IOVA-wasteful).
  */
 static struct io_pfn_map *io_pfn_map_lookup(struct io_pfn_cache *c,
 					    struct folio *folio,
 					    size_t offset, size_t len,
+					    size_t map_len,
 					    dma_addr_t *dma)
 {
 	unsigned long pfn = folio_pfn(folio);
@@ -263,14 +271,14 @@ static struct io_pfn_map *io_pfn_map_lookup(struct io_pfn_cache *c,
 	if (!pm)
 		goto fail;
 	base = dma_map_page(c->dev, folio_page(folio, 0), 0,
-			    folio_size(folio), DMA_TO_DEVICE);
+			    map_len, DMA_TO_DEVICE);
 	if (dma_mapping_error(c->dev, base)) {
 		kfree(pm);
 		goto fail;
 	}
 	pm->pfn = pfn;
 	pm->dma_base = base;
-	pm->size = folio_size(folio);
+	pm->size = map_len;
 	pm->dev = c->dev;
 	pm->referenced = true;
 	atomic_set(&pm->refs, 2);	/* cache bias + this I/O */
@@ -309,9 +317,12 @@ fail:
 
 /*
  * Kernel-virtual variant for skb kvec sources (recv path).  Direct-map
- * addresses only; a chunk that crosses its folio's end (two adjacent
- * but separately-allocated pages, which dma_map_single would handle as
- * one range) falls back to the plain map.
+ * addresses only.  A chunk (possibly a merged run of physically
+ * contiguous frags) may extend past its head folio; the miss path then
+ * maps the entire [folio head, chunk end) range as one entry, keeping
+ * the run's IOVA contiguous.  Direct-map virtual contiguity implies
+ * physical contiguity, so the linear mapping is valid; the caller's
+ * merge step only fuses chunks it verified adjacent.
  */
 static struct io_pfn_map *io_pfn_map_lookup_kaddr(struct io_pfn_cache *c,
 						  const void *kaddr, size_t len,
@@ -324,11 +335,7 @@ static struct io_pfn_map *io_pfn_map_lookup_kaddr(struct io_pfn_cache *c,
 		return NULL;
 	folio = page_folio(virt_to_page(kaddr));
 	offset = (const char *)kaddr - (const char *)folio_address(folio);
-	if (offset + len > folio_size(folio)) {
-		atomic64_inc(&c->range_fallbacks);
-		return NULL;
-	}
-	return io_pfn_map_lookup(c, folio, offset, len, dma);
+	return io_pfn_map_lookup(c, folio, offset, len, offset + len, dma);
 }
 
 /* Erase everything; in-flight users keep their mappings alive until
@@ -1963,6 +1970,40 @@ static ssize_t io_dma_submit_batch_sg(struct io_kiocb *req, struct device *dev,
  * a batch_entries cleanup array, instead of the dma_map_sg() path whose
  * single mapping the cache cannot represent.
  */
+/*
+ * Fuse adjacent collected chunks whose source is physically contiguous
+ * and whose destination is contiguous in both device and user space
+ * (dst contiguity in user space keeps the CPU-fallback copy correct).
+ * A 64KB GRO skb whose frags sit in one striding-RQ buffer collapses to
+ * a single entry, which then submits as one plain MEMMOVE descriptor
+ * instead of a batch of per-frag sub-descriptors -- and gives the PFN
+ * cache one run-sized region to map, keeping its IOVA contiguous.
+ * Direct-map virtual adjacency implies physical adjacency; anything
+ * outside the direct map is left unfused.  Returns the new entry count.
+ */
+static unsigned int io_dma_merge_entries(struct io_dma_batch_entry *entries,
+					 unsigned int nr)
+{
+	unsigned int out = 0, i;
+
+	for (i = 1; i < nr; i++) {
+		struct io_dma_batch_entry *a = &entries[out];
+		struct io_dma_batch_entry *b = &entries[i];
+
+		if (virt_addr_valid(a->src_kaddr) &&
+		    virt_addr_valid(b->src_kaddr) &&
+		    (char *)a->src_kaddr + a->src_len == b->src_kaddr &&
+		    a->dst_dma + a->src_len == b->dst_dma &&
+		    a->dst_uaddr + a->src_len == b->dst_uaddr &&
+		    (size_t)a->src_len + b->src_len <= SZ_1M) {
+			a->src_len += b->src_len;
+			continue;
+		}
+		entries[++out] = *b;
+	}
+	return out + 1;
+}
+
 static ssize_t io_dma_recv_flush(struct io_kiocb *req, struct device *dev,
 				 struct dma_chan *chan,
 				 struct io_dma_batch_entry *entries,
@@ -1972,6 +2013,9 @@ static ssize_t io_dma_recv_flush(struct io_kiocb *req, struct device *dev,
 	unsigned int i;
 	ssize_t ret;
 	dma_addr_t src_dma;
+
+	if (nr_entries > 1)
+		nr_entries = io_dma_merge_entries(entries, nr_entries);
 
 	if (io_pfn_cache_usable(req->ctx))
 		cache = io_pfn_cache_get(dev);
@@ -2314,7 +2358,9 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 				} else {
 					pm = io_pfn_map_lookup(pfn_cache, folio,
 							       offset + copied,
-							       chunk, &src_dma);
+							       chunk,
+							       folio_size(folio),
+							       &src_dma);
 					if (!pm) {
 						src_dma = dma_map_page(dev, &folio->page,
 								       offset + copied,
