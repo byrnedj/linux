@@ -916,6 +916,9 @@ void io_dma_init_freelist(struct io_ring_ctx *ctx, struct io_uring_params *p)
 	}
 }
 
+static int io_dma_poll_pass(struct io_ring_ctx *ctx, bool rescue);
+static void io_dma_rescue_kick(struct io_ring_ctx *ctx);
+
 void io_dma_poll_workfn(struct work_struct *w)
 {
 	/* work_struct is embedded in ctx->dma (struct io_dma_channel) */
@@ -936,9 +939,10 @@ void io_dma_poll_workfn(struct work_struct *w)
 	 */
 	atomic_set(&d->poll_active, 1);
 	for (;;) {
-		/* Drain until the list is empty */
+		/* Drain until the list is empty; this loop re-checks the
+		 * pending lists itself, so no per-pass rescue kick. */
 		do {
-			__io_dma_poll(ctx);
+			io_dma_poll_pass(ctx, false);
 			cpu_relax();
 		} while (io_dma_pending(ctx));
 
@@ -973,7 +977,7 @@ static int io_dma_compl_thread_fn(void *data)
 					 kthread_should_stop());
 
 		while (io_dma_pending(ctx) && !kthread_should_stop()) {
-			__io_dma_poll(ctx);
+			io_dma_poll_pass(ctx, false);
 			if (!io_dma_pending(ctx))
 				break;
 			/*
@@ -2970,7 +2974,36 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 	return ret;
 }
 
+/*
+ * Ensure a persistent poller is scheduled for work left parked on the
+ * pending lists, under the same poll_active elision rule as the submit
+ * path. This is the lost-wakeup closure (see the out_disarm comment in
+ * io_dma_poll_pass()); persistent polling loops call it once on their
+ * exit edge instead of once per drain pass.
+ */
+static void io_dma_rescue_kick(struct io_ring_ctx *ctx)
+{
+	if (IS_ERR_OR_NULL(ctx->dma.chan))
+		return;
+	if (READ_ONCE(io_dma_completion_mode) == IO_DMA_COMP_MWAIT &&
+	    ctx->dma.compl_thread) {
+		/* The compl thread's own drain passes re-check
+		 * io_dma_pending() in its loop condition; only
+		 * foreign callers need to wake it. */
+		if (ctx->dma.compl_thread != current) {
+			wake_up(&ctx->dma.compl_wait);
+		}
+	} else if (atomic_read(&ctx->dma.poll_active) == 0) {
+		queue_work(system_unbound_wq, &ctx->dma.poll_work);
+	}
+}
+
 int __io_dma_poll(struct io_ring_ctx *ctx)
+{
+	return io_dma_poll_pass(ctx, true);
+}
+
+static int io_dma_poll_pass(struct io_ring_ctx *ctx, bool rescue)
 {
 	struct io_dma_task *dma, *next;
 	int ret;
@@ -3119,23 +3152,16 @@ out_disarm:
 	 * end-of-run stalls in kworker/busypoll modes on 64KB xnode recv).
 	 * Close the hole here, on the disarm edge every poller passes
 	 * through: whenever we leave pollable work behind, ensure a
-	 * persistent poller is scheduled, under the same poll_active elision
-	 * rule as the submit path. The workfn's own drain passes skip this
-	 * (poll_active is set), so steady state pays one smp_mb and one
-	 * atomic read per drain pass.
+	 * persistent poller is scheduled. Callers that poll in a loop and
+	 * re-check io_dma_pending() before abandoning the ring (workfn,
+	 * compl thread, inline/cq-wait spinners) pass rescue=false: kicking
+	 * a kworker for a descriptor this loop will re-examine nanoseconds
+	 * later is pure overhead (observed as 260K-700K redundant
+	 * queue_work()s per 20GB at cq_poll_us=50). They instead fire
+	 * io_dma_rescue_kick() once on their exit edge if work remains.
 	 */
-	if (!IS_ERR_OR_NULL(ctx->dma.chan)) {
-		if (READ_ONCE(io_dma_completion_mode) == IO_DMA_COMP_MWAIT &&
-		    ctx->dma.compl_thread) {
-			/* The compl thread's own drain passes re-check
-			 * io_dma_pending() in its loop condition; only
-			 * foreign callers need to wake it. */
-			if (ctx->dma.compl_thread != current)
-				wake_up(&ctx->dma.compl_wait);
-		} else if (atomic_read(&ctx->dma.poll_active) == 0) {
-			queue_work(system_unbound_wq, &ctx->dma.poll_work);
-		}
-	}
+	if (rescue)
+		io_dma_rescue_kick(ctx);
 	return 1;
 }
 
@@ -3180,14 +3206,18 @@ bool io_dma_inline_wait(struct io_kiocb *req, unsigned int budget_us)
 
 	end_ns = ktime_get_ns() + (u64)budget_us * NSEC_PER_USEC;
 	do {
-		__io_dma_poll(ctx);
+		io_dma_poll_pass(ctx, false);
 		if (!READ_ONCE(req->dma.dma_refcnt))
-			return true;
+			break;
 		if (need_resched())
 			break;
 		cpu_relax();
 	} while (ktime_get_ns() < end_ns);
 
+	/* Leaving the polling loop: anything still parked (this req's or
+	 * another's) needs a persistent poller scheduled. */
+	if (io_dma_pending(ctx))
+		io_dma_rescue_kick(ctx);
 	return !READ_ONCE(req->dma.dma_refcnt);
 }
 
@@ -3203,18 +3233,34 @@ bool io_dma_cq_wait_poll(struct io_ring_ctx *ctx, struct io_wait_queue *iowq)
 
 	end_ns = ktime_get_ns() + (u64)budget_us * NSEC_PER_USEC;
 	for (;;) {
-		__io_dma_poll(ctx);
+		bool ret;
+
+		io_dma_poll_pass(ctx, false);
 
 		if (task_work_pending(current) || io_local_work_pending(ctx) ||
 		    io_should_wake(iowq))
-			return true;
-		if (!io_dma_pending(ctx))
+			ret = true;
+		else if (!io_dma_pending(ctx))
 			return false;
-		if (need_resched() || task_sigpending(current))
-			return false;
-		if (ktime_get_ns() >= end_ns)
-			return false;
-		cpu_relax();
+		else if (need_resched() || task_sigpending(current) ||
+			 ktime_get_ns() >= end_ns)
+			ret = false;
+		else {
+			cpu_relax();
+			continue;
+		}
+
+		/*
+		 * Leaving the polling loop with DMA still parked. On the
+		 * false path this task is about to schedule() and stops
+		 * detecting; on the true path a return to the wait loop (or
+		 * userspace) is not guaranteed to poll again. Either way the
+		 * parked work needs a persistent poller -- one kick per
+		 * budget window, not one per drain pass.
+		 */
+		if (io_dma_pending(ctx))
+			io_dma_rescue_kick(ctx);
+		return ret;
 	}
 }
 
