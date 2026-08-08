@@ -540,6 +540,22 @@ static void idxd_dma_free_chan_resources(struct dma_chan *chan)
 }
 
 
+/*
+ * Completion records live in the wq's dma_alloc_coherent pool, which outlives
+ * every descriptor, so handing this address out for monitor-based waits is
+ * safe even if the descriptor is reaped and recycled mid-wait: the reader
+ * sees a stale byte, never unmapped memory. The status byte is offset 0 of
+ * both the DSA and IAX record layouts.
+ */
+static const u8 *idxd_dma_completion_status_addr(struct dma_async_tx_descriptor *tx)
+{
+	struct idxd_desc *desc = container_of(tx, struct idxd_desc, txd);
+
+	/* The uapi record declares its fields volatile; readers of the
+	 * returned pointer use READ_ONCE, so the qualifier can drop. */
+	return (const u8 *)&desc->completion->status;
+}
+
 static enum dma_status idxd_dma_tx_status(struct dma_chan *dma_chan,
 					  dma_cookie_t cookie,
 					  struct dma_tx_state *txstate)
@@ -746,6 +762,7 @@ int idxd_register_dma_device(struct idxd_device *idxd)
 	}
 
 	dma->device_tx_status = idxd_dma_tx_status;
+	dma->device_completion_status_addr = idxd_dma_completion_status_addr;
 	dma->device_issue_pending = idxd_dma_issue_pending;
 	dma->device_alloc_chan_resources = idxd_dma_alloc_chan_resources;
 	dma->device_free_chan_resources = idxd_dma_free_chan_resources;

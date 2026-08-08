@@ -427,6 +427,10 @@ struct io_dma_task {
 	struct io_kiocb		*req;
 	struct llist_node	llnode;		/* ctx submit_list linkage */
 	dma_cookie_t		cookie;
+	const u8		*compl_status;	/* device completion-record status
+						 * byte (0 = in flight), for
+						 * monitor-based waits; NULL if
+						 * the channel can't provide it */
 	u64			submit_ns;	/* ktime at hw submit, for latency stats */
 	dma_addr_t		src_dma;	/* DMA-mapped source address */
 	dma_addr_t		dst_dma;	/* pre-mapped dest DMA address */

@@ -442,6 +442,20 @@ static const char * const io_dma_comp_mode_names[IO_DMA_COMP_NR] = {
 /* Default to the original kworker path so behaviour is unchanged until set. */
 static unsigned int io_dma_completion_mode __read_mostly = IO_DMA_COMP_KWORKER;
 
+/* Modes whose detection context is the per-ctx compl thread. */
+static inline bool io_dma_mode_wakes_thread(unsigned int mode)
+{
+	return mode == IO_DMA_COMP_BUSYPOLL || mode == IO_DMA_COMP_MWAIT;
+}
+
+static inline const u8 *io_dma_tx_compl_status(struct dma_chan *chan,
+					       struct dma_async_tx_descriptor *tx)
+{
+	if (!chan->device->device_completion_status_addr)
+		return NULL;
+	return chan->device->device_completion_status_addr(tx);
+}
+
 /*
  * Busy-poll budget (in microseconds) for draining in-flight DMA completions
  * from the CQ-wait path (io_dma_cq_wait_poll()) before the waiting task
@@ -452,6 +466,17 @@ static unsigned int io_dma_completion_mode __read_mostly = IO_DMA_COMP_KWORKER;
  * debugfs io_uring_dma_cq_poll_us.
  */
 static unsigned int io_dma_cq_poll_us __read_mostly = 20;
+
+/*
+ * Per-doze deadline (microseconds) for the mwait completion mode's
+ * UMWAIT on the head task's completion record. The wait normally ends
+ * sub-microsecond after the device writes the record; the deadline only
+ * bounds staleness when the monitored record was recycled under us or a
+ * later-cookie completion is what's actually pending. IA32_UMWAIT_CONTROL
+ * additionally caps each doze globally (typically ~100k TSC cycles).
+ * Tunable via debugfs io_uring_dma_mwait_us.
+ */
+static unsigned int io_dma_mwait_us __read_mostly = 50;
 
 /*
  * Keep DMA completion detection on the ring task where possible, instead of
@@ -805,8 +830,9 @@ static ssize_t io_dma_comp_mode_write(struct file *file, const char __user *ubuf
 	for (i = 0; i < IO_DMA_COMP_NR; i++) {
 		if (strcmp(mode, io_dma_comp_mode_names[i]))
 			continue;
-		/* mwait is not wired up yet. */
-		if (i == IO_DMA_COMP_MWAIT)
+		/* mwait needs WAITPKG (UMONITOR/UMWAIT). */
+		if (i == IO_DMA_COMP_MWAIT &&
+		    !(IS_ENABLED(CONFIG_X86) && boot_cpu_has(X86_FEATURE_WAITPKG)))
 			return -EOPNOTSUPP;
 		WRITE_ONCE(io_dma_completion_mode, i);
 		return len;
@@ -1054,6 +1080,8 @@ void io_dma_debugfs_init(void)
 			   &io_dma_drain_wait_us);
 	debugfs_create_u32("io_uring_dma_cq_poll_us", 0644, NULL,
 			   &io_dma_cq_poll_us);
+	debugfs_create_u32("io_uring_dma_mwait_us", 0644, NULL,
+			   &io_dma_mwait_us);
 	debugfs_create_file("io_uring_dma_cpu_latency_us", 0644, NULL, NULL,
 			    &io_dma_cpu_lat_fops);
 	debugfs_create_file("io_uring_dma_pfn_cache", 0444, NULL, NULL,
@@ -1241,6 +1269,71 @@ void io_dma_poll_workfn(struct work_struct *w)
  * serialized against the teardown drain via ctx->dma.poll_armed, so it is safe
  * to run here concurrently with io_ring_exit_work().
  */
+#ifdef CONFIG_X86
+#include <asm/cpufeature.h>
+#include <asm/tsc.h>
+
+static inline void io_umonitor(const void *addr)
+{
+	asm volatile("umonitor %0" : : "r" (addr));
+}
+
+static inline void io_umwait(u32 state, u64 tsc_deadline)
+{
+	asm volatile("umwait %0" : : "r" (state),
+		     "a" ((u32)tsc_deadline), "d" ((u32)(tsc_deadline >> 32)));
+}
+
+/*
+ * Doze on the head task's completion record instead of spinning cookie
+ * queries: UMONITOR the status byte the device will write, UMWAIT until
+ * that write (typical), the TSC deadline, or an interrupt. Detection
+ * becomes a single cache-line wake with the core in C0.1/C0.2 -- no
+ * polling while waiting, no C1-exit/HWP-ramp tax on wake.
+ *
+ * The task -> record lookup runs under poll_armed so a concurrent poller
+ * can't complete and recycle the head task mid-peek; the record memory
+ * itself is a per-WQ pool that outlives descriptors, so once we hold the
+ * address a stale read is harmless (bounded by the deadline). Falls back
+ * to one cpu_relax() when the peek loses the race, the channel can't
+ * provide record addresses, or the head is a later-cookie completion
+ * whose record byte is already set.
+ */
+static void io_dma_mwait_wait(struct io_ring_ctx *ctx)
+{
+	const u8 *status = NULL;
+
+	if (!static_cpu_has(X86_FEATURE_WAITPKG)) {
+		cpu_relax();
+		return;
+	}
+
+	if (atomic_cmpxchg(&ctx->dma.poll_armed, 0, 1) == 0) {
+		struct io_dma_task *t = READ_ONCE(ctx->dma.poll_list);
+
+		if (t)
+			status = t->compl_status;
+		atomic_set_release(&ctx->dma.poll_armed, 0);
+	}
+	if (!status) {
+		cpu_relax();
+		return;
+	}
+
+	/* Monitor protocol: arm, re-check, then wait -- a record write
+	 * between the check and the UMWAIT still ends the wait. */
+	io_umonitor(status);
+	if (READ_ONCE(*status) == 0 && !kthread_should_stop())
+		io_umwait(0 /* C0.2 */, rdtsc() +
+			  (u64)READ_ONCE(io_dma_mwait_us) * tsc_khz / 1000);
+}
+#else
+static void io_dma_mwait_wait(struct io_ring_ctx *ctx)
+{
+	cpu_relax();
+}
+#endif
+
 static int io_dma_compl_thread_fn(void *data)
 {
 	struct io_ring_ctx *ctx = data;
@@ -1254,12 +1347,13 @@ static int io_dma_compl_thread_fn(void *data)
 			io_dma_poll_pass(ctx, false);
 			if (!io_dma_pending(ctx))
 				break;
-			/*
-			 * Wait between drains. mwait mode (UMONITOR/UMWAIT on
-			 * the head completion record) lands in a later step; for
-			 * now both busypoll and a mwait selection spin.
-			 */
-			cpu_relax();
+			/* Wait between drains: busypoll spins; mwait dozes on
+			 * the head completion record until the device writes
+			 * it (or the deadline/an interrupt ends the doze). */
+			if (READ_ONCE(io_dma_completion_mode) == IO_DMA_COMP_MWAIT)
+				io_dma_mwait_wait(ctx);
+			else
+				cpu_relax();
 		}
 	}
 	return 0;
@@ -1636,6 +1730,9 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 		tx->callback_param = dma;
 	}
 
+	/* Capture before the doorbell: dmaengine_submit() makes the descriptor
+	 * eligible for a concurrent reap-and-recycle. */
+	dma->compl_status = io_dma_tx_compl_status(req->ctx->dma.chan, tx);
 	dma->submit_ns = ktime_get_ns();
 	dma->cookie = dmaengine_submit(tx);
 	if (dma_submit_error(dma->cookie)) {
@@ -2139,6 +2236,9 @@ static ssize_t io_dma_submit_batch_sg(struct io_kiocb *req, struct device *dev,
 		tx->callback_param = dma;
 	}
 
+	/* Capture before the doorbell: dmaengine_submit() makes the descriptor
+	 * eligible for a concurrent reap-and-recycle. */
+	dma->compl_status = io_dma_tx_compl_status(req->ctx->dma.chan, tx);
 	dma->submit_ns = ktime_get_ns();
 	dma->cookie = dmaengine_submit(tx);
 	if (dma_submit_error(dma->cookie)) {
@@ -2320,6 +2420,9 @@ static ssize_t io_dma_submit_single_entry(struct io_kiocb *req,
 		tx->callback_param = dma;
 	}
 
+	/* Capture before the doorbell: dmaengine_submit() makes the descriptor
+	 * eligible for a concurrent reap-and-recycle. */
+	dma->compl_status = io_dma_tx_compl_status(req->ctx->dma.chan, tx);
 	dma->submit_ns = ktime_get_ns();
 	dma->cookie = dmaengine_submit(tx);
 	if (dma_submit_error(dma->cookie)) {
@@ -3294,7 +3397,7 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 				   &ctx->dma.diag_irq_submitted);
 			dma_async_issue_pending(ctx->dma.chan);
 		} else if (io_dma_pending(ctx)) {
-			if (READ_ONCE(io_dma_completion_mode) == IO_DMA_COMP_BUSYPOLL &&
+			if (io_dma_mode_wakes_thread(READ_ONCE(io_dma_completion_mode)) &&
 			    ctx->dma.compl_thread)
 				wake_up(&ctx->dma.compl_wait);
 			else
@@ -3353,7 +3456,7 @@ static void io_dma_rescue_kick(struct io_ring_ctx *ctx)
 {
 	if (IS_ERR_OR_NULL(ctx->dma.chan))
 		return;
-	if (READ_ONCE(io_dma_completion_mode) == IO_DMA_COMP_BUSYPOLL &&
+	if (io_dma_mode_wakes_thread(READ_ONCE(io_dma_completion_mode)) &&
 	    ctx->dma.compl_thread) {
 		/* The compl thread's own drain passes re-check
 		 * io_dma_pending() in its loop condition; only

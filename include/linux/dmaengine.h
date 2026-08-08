@@ -991,6 +991,15 @@ struct dma_device {
 	enum dma_status (*device_tx_status)(struct dma_chan *chan,
 					    dma_cookie_t cookie,
 					    struct dma_tx_state *txstate);
+	/*
+	 * Optional: address of the byte the device writes nonzero when this
+	 * descriptor completes, for monitor-based waits (UMONITOR/UMWAIT).
+	 * Valid from prep until the descriptor is reaped; must point into
+	 * memory that outlives the descriptor (e.g. a per-queue completion
+	 * record pool), so a stale read after reap is harmless. Detection
+	 * only -- callers still reap through device_tx_status.
+	 */
+	const u8 *(*device_completion_status_addr)(struct dma_async_tx_descriptor *tx);
 	void (*device_issue_pending)(struct dma_chan *chan);
 	void (*device_release)(struct dma_device *dev);
 	/* debugfs support */
