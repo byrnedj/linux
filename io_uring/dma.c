@@ -879,6 +879,160 @@ static const struct file_operations io_dma_cpu_lat_fops = {
 	.release	= single_release,
 };
 
+/*
+ * Lost-wakeup diagnostics: a global registry of channel-owning ctxs and a
+ * debugfs dump of each one's poll machinery. The dump arms poll_armed so it
+ * owns poll_list for the walk, queries each parked task's dmaengine
+ * completion state WITHOUT completing it (the evidence must survive the
+ * read), and reports it against the kick/elide/workfn counters. A task
+ * whose descriptor is DMA_COMPLETE but which is still parked while
+ * poll_active==0 and the work item is idle is a lost wakeup, not lost
+ * hardware; whether its submit_ns is before or after dbg_workfn_exit_ns
+ * says which side of the elision handshake dropped it.
+ */
+static LIST_HEAD(io_dma_dbg_ctxs);
+static DEFINE_SPINLOCK(io_dma_dbg_lock);
+
+void io_dma_dbg_register(struct io_ring_ctx *ctx)
+{
+	spin_lock(&io_dma_dbg_lock);
+	list_add_tail(&ctx->dma.dbg_node, &io_dma_dbg_ctxs);
+	spin_unlock(&io_dma_dbg_lock);
+}
+
+void io_dma_dbg_unregister(struct io_ring_ctx *ctx)
+{
+	/* Never initialized (ring did not go through DMA channel setup). */
+	if (!ctx->dma.dbg_node.next)
+		return;
+	spin_lock(&io_dma_dbg_lock);
+	list_del_init(&ctx->dma.dbg_node);
+	spin_unlock(&io_dma_dbg_lock);
+}
+
+#define IO_DMA_DBG_TASK_DUMP_MAX 8
+
+static int io_dma_poll_state_show(struct seq_file *m, void *v)
+{
+	struct io_dma_channel *d;
+	u64 now = ktime_get_ns();
+
+	spin_lock(&io_dma_dbg_lock);
+	list_for_each_entry(d, &io_dma_dbg_ctxs, dbg_node) {
+		struct io_ring_ctx *ctx = container_of(d, struct io_ring_ctx, dma);
+		unsigned int busy = work_busy(&d->poll_work);
+		u64 exit_ns = READ_ONCE(d->dbg_workfn_exit_ns);
+
+		seq_printf(m, "ctx=%p chan=%s poll_active=%d poll_armed=%d work=%s%s%s compl_thread=%d\n",
+			   ctx,
+			   IS_ERR_OR_NULL(d->chan) ? "none" : dma_chan_name(d->chan),
+			   atomic_read(&d->poll_active),
+			   atomic_read(&d->poll_armed),
+			   (busy & WORK_BUSY_PENDING) ? "P" : "",
+			   (busy & WORK_BUSY_RUNNING) ? "R" : "",
+			   busy ? "" : "idle",
+			   !!d->compl_thread);
+		seq_printf(m, "  kick_queued=%lld kick_elided=%lld workfn_runs=%lld workfn_resumes=%lld workfn_exit_age_us=%lld\n",
+			   (long long)atomic64_read(&d->dbg_kick_queued),
+			   (long long)atomic64_read(&d->dbg_kick_elided),
+			   (long long)atomic64_read(&d->dbg_workfn_runs),
+			   (long long)atomic64_read(&d->dbg_workfn_resumes),
+			   exit_ns ? (long long)((now - exit_ns) / 1000) : -1LL);
+		seq_printf(m, "  refs_taken=%d refs_dropped=%d irq_submitted=%d irq_completed=%d irq_orphaned=%d\n",
+			   atomic_read(&d->diag_refs_taken),
+			   atomic_read(&d->diag_refs_dropped),
+			   atomic_read(&d->diag_irq_submitted),
+			   atomic_read(&d->diag_irq_completed),
+			   atomic_read(&d->diag_irq_orphaned));
+
+		if (IS_ERR_OR_NULL(d->chan))
+			continue;
+
+		/* Arm the poller slot so poll_list is ours to walk; if a real
+		 * poller owns it the lists are being drained right now and
+		 * there is nothing wedged to inspect. */
+		if (atomic_cmpxchg(&d->poll_armed, 0, 1) != 0) {
+			seq_puts(m, "  lists: poller armed, not walked\n");
+			continue;
+		}
+		{
+			struct io_dma_task *t;
+			struct llist_node *n;
+			int nsub = 0, npoll = 0, ncomp = 0, ninprog = 0, shown = 0;
+
+			/* Owning poll_armed means no consumer can splice or
+			 * free these entries under us; read-only iteration. */
+			llist_for_each(n, READ_ONCE(d->submit_list.first))
+				nsub++;
+			for (t = READ_ONCE(d->poll_list); t; t = t->next) {
+				enum dma_status st =
+					dmaengine_async_is_tx_complete(d->chan,
+								       t->cookie);
+
+				npoll++;
+				if (st == DMA_IN_PROGRESS)
+					ninprog++;
+				else
+					ncomp++;
+				if (shown++ < IO_DMA_DBG_TASK_DUMP_MAX)
+					seq_printf(m, "  task=%p cookie=%d len=%u submitted_after_workfn_exit=%d age_us=%lld hw=%s\n",
+						   t, t->cookie, t->len,
+						   exit_ns ? t->submit_ns > exit_ns : -1,
+						   (long long)((now - t->submit_ns) / 1000),
+						   st == DMA_IN_PROGRESS ? "IN_PROGRESS" :
+						   st == DMA_COMPLETE ? "COMPLETE" : "ERROR");
+			}
+			atomic_set_release(&d->poll_armed, 0);
+			seq_printf(m, "  lists: submit=%d poll=%d (hw_complete=%d hw_in_progress=%d)\n",
+				   nsub, npoll, ncomp, ninprog);
+		}
+	}
+	spin_unlock(&io_dma_dbg_lock);
+	return 0;
+}
+
+static int io_dma_poll_state_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, io_dma_poll_state_show, NULL);
+}
+
+static const struct file_operations io_dma_poll_state_fops = {
+	.owner		= THIS_MODULE,
+	.open		= io_dma_poll_state_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
+/* Manual un-wedge: re-kick the poll worker of every ctx with pending tasks.
+ * If stalled connections complete right after a write here, the descriptors
+ * finished long ago and only the wakeup was lost — the definitive test.
+ */
+static ssize_t io_dma_poll_kick_write(struct file *file, const char __user *ubuf,
+				      size_t len, loff_t *ppos)
+{
+	struct io_dma_channel *d;
+	int kicked = 0;
+
+	spin_lock(&io_dma_dbg_lock);
+	list_for_each_entry(d, &io_dma_dbg_ctxs, dbg_node) {
+		struct io_ring_ctx *ctx = container_of(d, struct io_ring_ctx, dma);
+
+		if (!IS_ERR_OR_NULL(d->chan) && io_dma_pending(ctx)) {
+			queue_work(system_unbound_wq, &d->poll_work);
+			kicked++;
+		}
+	}
+	spin_unlock(&io_dma_dbg_lock);
+	pr_info("io_uring DMA: manual poll kick delivered to %d ctx(s)\n", kicked);
+	return len;
+}
+
+static const struct file_operations io_dma_poll_kick_fops = {
+	.owner		= THIS_MODULE,
+	.write		= io_dma_poll_kick_write,
+};
+
 void io_dma_debugfs_init(void)
 {
 	debugfs_create_file("io_uring_dma_latency", 0444, NULL, NULL,
@@ -907,6 +1061,10 @@ void io_dma_debugfs_init(void)
 			   &io_dma_pfn_cache_cap_mb);
 	debugfs_create_file("io_uring_dma_pfn_cache_flush", 0200, NULL, NULL,
 			    &io_pfn_cache_flush_fops);
+	debugfs_create_file("io_uring_dma_poll_state", 0444, NULL, NULL,
+			    &io_dma_poll_state_fops);
+	debugfs_create_file("io_uring_dma_poll_kick", 0200, NULL, NULL,
+			    &io_dma_poll_kick_fops);
 }
 
 /*
@@ -1046,6 +1204,7 @@ void io_dma_poll_workfn(struct work_struct *w)
 	 * our post-clear re-check and we resume. Either way no task is left
 	 * behind with nobody scheduled to reap it.
 	 */
+	atomic64_inc(&d->dbg_workfn_runs);
 	atomic_set(&d->poll_active, 1);
 	for (;;) {
 		/* Drain until the list is empty */
@@ -1064,8 +1223,10 @@ void io_dma_poll_workfn(struct work_struct *w)
 		if (!io_dma_pending(ctx))
 			break;
 		/* A publish raced our exit and its kick was elided; resume. */
+		atomic64_inc(&d->dbg_workfn_resumes);
 		atomic_set(&d->poll_active, 1);
 	}
+	WRITE_ONCE(d->dbg_workfn_exit_ns, ktime_get_ns());
 }
 
 /*
@@ -3132,9 +3293,13 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 				 * this skips the workqueue pool lock entirely
 				 * (was 3.7% of node cycles at 20GB/s).
 				 */
-				if (atomic_read(&ctx->dma.poll_active) == 0)
+				if (atomic_read(&ctx->dma.poll_active) == 0) {
+					atomic64_inc(&ctx->dma.dbg_kick_queued);
 					queue_work(system_unbound_wq,
 						   &ctx->dma.poll_work);
+				} else {
+					atomic64_inc(&ctx->dma.dbg_kick_elided);
+				}
 		}
 	} else if (atomic_read(&ctx->dma.poll_armed) == 0) {
 		/*

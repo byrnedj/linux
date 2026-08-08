@@ -666,6 +666,8 @@ static inline void io_dma_reap_inline(struct io_ring_ctx *ctx)
 }
 void io_dma_dump_stuck(struct io_ring_ctx *ctx);
 bool io_dma_irq_mode(void);
+void io_dma_dbg_register(struct io_ring_ctx *ctx);
+void io_dma_dbg_unregister(struct io_ring_ctx *ctx);
 void io_dma_compl_thread_start(struct io_ring_ctx *ctx);
 void io_dma_compl_thread_stop(struct io_ring_ctx *ctx);
 int kiocb_done(struct io_kiocb *req, ssize_t ret, struct io_br_sel *sel, unsigned int issue_flags);
