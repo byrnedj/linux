@@ -2198,6 +2198,13 @@ static void io_release_dma_chan(struct io_ring_ctx *ctx)
 	int ret;
 
 	/*
+	 * Unlink from the debugfs poll-state registry first: the dump walks
+	 * this ctx's lists under its own lock, and everything below frees
+	 * them. After this returns no dump can be looking at us.
+	 */
+	io_dma_dbg_unregister(ctx);
+
+	/*
 	 * Stop the completion kthread first, before tearing down any ctx->dma
 	 * state it touches. kthread_stop() waits for it to finish its current
 	 * __io_dma_poll() and exit, so no drain races the teardown below.
@@ -2490,6 +2497,13 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 	atomic_set(&ctx->dma.diag_irq_orphaned, 0);
 	atomic_set(&ctx->dma.diag_refs_taken, 0);
 	atomic_set(&ctx->dma.diag_refs_dropped, 0);
+	atomic64_set(&ctx->dma.dbg_kick_queued, 0);
+	atomic64_set(&ctx->dma.dbg_kick_elided, 0);
+	atomic64_set(&ctx->dma.dbg_workfn_runs, 0);
+	atomic64_set(&ctx->dma.dbg_workfn_resumes, 0);
+	atomic64_set(&ctx->dma.dbg_rescue_kicks, 0);
+	ctx->dma.dbg_workfn_exit_ns = 0;
+	INIT_LIST_HEAD(&ctx->dma.dbg_node);
 
 	/* Prefer a channel whose DSA device sits on the caller's NUMA
 	 * node: a cross-socket engine pays UPI hops on every descriptor
@@ -2538,6 +2552,7 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 
 	io_dma_init_freelist(ctx, p);
 	io_dma_compl_thread_start(ctx);
+	io_dma_dbg_register(ctx);
 
 	return 0;
 failed:
