@@ -323,6 +323,10 @@ struct io_dma_channel {
 	atomic64_t		dbg_kick_elided;
 	atomic64_t		dbg_workfn_runs;
 	atomic64_t		dbg_workfn_resumes;
+	/* Pollers that disarmed with tasks still parked and (re)scheduled a
+	 * persistent poller from __io_dma_poll's exit -- the lost-wakeup
+	 * closure path. */
+	atomic64_t		dbg_rescue_kicks;
 	u64			dbg_workfn_exit_ns;
 	struct list_head	dbg_node;
 

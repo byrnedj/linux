@@ -932,11 +932,12 @@ static int io_dma_poll_state_show(struct seq_file *m, void *v)
 			   (busy & WORK_BUSY_RUNNING) ? "R" : "",
 			   busy ? "" : "idle",
 			   !!d->compl_thread);
-		seq_printf(m, "  kick_queued=%lld kick_elided=%lld workfn_runs=%lld workfn_resumes=%lld workfn_exit_age_us=%lld\n",
+		seq_printf(m, "  kick_queued=%lld kick_elided=%lld workfn_runs=%lld workfn_resumes=%lld rescue_kicks=%lld workfn_exit_age_us=%lld\n",
 			   (long long)atomic64_read(&d->dbg_kick_queued),
 			   (long long)atomic64_read(&d->dbg_kick_elided),
 			   (long long)atomic64_read(&d->dbg_workfn_runs),
 			   (long long)atomic64_read(&d->dbg_workfn_resumes),
+			   (long long)atomic64_read(&d->dbg_rescue_kicks),
 			   exit_ns ? (long long)((now - exit_ns) / 1000) : -1LL);
 		seq_printf(m, "  refs_taken=%d refs_dropped=%d irq_submitted=%d irq_completed=%d irq_orphaned=%d\n",
 			   atomic_read(&d->diag_refs_taken),
@@ -3437,7 +3438,53 @@ out_disarm:
 	/* Release ordering hands poll_list (written lock-free above) to
 	 * whichever thread arms the poller next. */
 	atomic_set_release(&ctx->dma.poll_armed, 0);
-	return io_dma_pending(ctx) ? 1 : 0;
+
+	/*
+	 * Full store-load barrier: the poll_list/submit_list writes above must
+	 * be visible before the poll_active read below, pairing with the
+	 * workfn's clear-poll_active -> smp_mb -> re-check exit protocol
+	 * (mirrors the submitter's llist_add full barrier).
+	 */
+	smp_mb();
+	if (!io_dma_pending(ctx))
+		return 0;
+
+	/*
+	 * Tasks remain parked: still DMA_IN_PROGRESS at walk time, or
+	 * published during our splice. The splice above (llist_del_all, then
+	 * the poll_list write) has a window where those tasks are invisible
+	 * to io_dma_pending() -- a concurrently exiting workfn can read both
+	 * lists empty at its post-clear re-check and leave, while the
+	 * submitter's kick was already consumed (elided against that same
+	 * workfn). If this caller is a one-shot drain (inline reap on enter,
+	 * CQ-wait poll, the no-task issue-path drain), nothing is scheduled
+	 * to ever look at the parked task again: its completion record is
+	 * written and nobody reads it, the in-flight ref pins the req
+	 * forever, and the connection starves (observed as deterministic
+	 * end-of-run stalls in kworker/busypoll modes on 64KB xnode recv).
+	 * Close the hole here, on the disarm edge every poller passes
+	 * through: whenever we leave pollable work behind, ensure a
+	 * persistent poller is scheduled, under the same poll_active elision
+	 * rule as the submit path. The workfn's own drain passes skip this
+	 * (poll_active is set), so steady state pays one smp_mb and one
+	 * atomic read per drain pass.
+	 */
+	if (!IS_ERR_OR_NULL(ctx->dma.chan)) {
+		if (READ_ONCE(io_dma_completion_mode) == IO_DMA_COMP_BUSYPOLL &&
+		    ctx->dma.compl_thread) {
+			/* The compl thread's own drain passes re-check
+			 * io_dma_pending() in its loop condition; only
+			 * foreign callers need to wake it. */
+			if (ctx->dma.compl_thread != current) {
+				atomic64_inc(&ctx->dma.dbg_rescue_kicks);
+				wake_up(&ctx->dma.compl_wait);
+			}
+		} else if (atomic_read(&ctx->dma.poll_active) == 0) {
+			atomic64_inc(&ctx->dma.dbg_rescue_kicks);
+			queue_work(system_unbound_wq, &ctx->dma.poll_work);
+		}
+	}
+	return 1;
 }
 
 /*
