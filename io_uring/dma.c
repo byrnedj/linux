@@ -1284,8 +1284,31 @@ void io_dma_compl_thread_start(struct io_ring_ctx *ctx)
 	}
 
 	node = dev_to_node(ctx->dma.chan->device->dev);
-	cpu = (node != NUMA_NO_NODE) ? cpumask_first(cpumask_of_node(node))
-				     : nr_cpu_ids;
+	cpu = nr_cpu_ids;
+	if (node != NUMA_NO_NODE) {
+		const struct cpumask *mask = cpumask_of_node(node);
+		unsigned int weight = cpumask_weight(mask);
+
+		/*
+		 * Spread the spinning threads across the node from the TOP of
+		 * its cpumask down, one CPU per ring (global sequence).
+		 * cpumask_first put every ring's thread on the node's first
+		 * CPU -- where applications also pin their first worker --
+		 * so N rings meant N busy-spinners plus the app thread
+		 * timesharing one CPU while the rest of the node idled
+		 * (measured: 32x32 64KB xnode recv at 11.5 GB/s vs 19.8 for
+		 * the CQ-wait-poll path; the mode's own floor is the best of
+		 * all, 6.4us). High CPUs are the least likely to collide
+		 * with low-CPU-first application pinning conventions.
+		 */
+		if (weight) {
+			static atomic_t seq;
+			unsigned int idx = weight - 1 -
+				((unsigned int)atomic_fetch_inc(&seq) % weight);
+
+			cpu = cpumask_nth(idx, mask);
+		}
+	}
 	if (cpu >= nr_cpu_ids)
 		cpu = cpumask_first(cpu_online_mask);
 	kthread_bind(t, cpu);
