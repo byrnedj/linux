@@ -490,6 +490,42 @@ static unsigned int io_dma_mwait_us __read_mostly = 50;
 static unsigned int io_dma_mwait_deep __read_mostly;
 
 /*
+ * Post-drain grace window (microseconds) for the completion thread: after
+ * the pending lists empty, doze on the submit_list head cacheline for this
+ * long before sleeping in wait_event. A submitter's llist_add write wakes
+ * the doze directly -- no wake_up -> schedule round trip -- and the core
+ * stays in C0.x instead of cooling into C1 + HWP downclock between ops
+ * (the measured ~10us cold-floor tax). 0 disables (thread sleeps
+ * immediately, legacy behavior). debugfs io_uring_dma_grace_us.
+ */
+static unsigned int io_dma_grace_us __read_mostly;
+
+/*
+ * TPAUSE slice (nanoseconds) used when UMONITOR is not effective (see
+ * io_uring_dma_umonitor_effective below). TPAUSE C0.2 needs no address
+ * monitor -- Intel's MONITOR/UMONITOR performance guidance (doc 826393)
+ * lists it as unaffected -- so waits become slice-bounded polls: doze one
+ * slice, re-check, repeat. Detection staleness is at most one slice.
+ * debugfs io_uring_dma_tpause_ns.
+ */
+static unsigned int io_dma_tpause_ns __read_mostly = 1000;
+
+/*
+ * Whether UMONITOR actually arms an address monitor on this machine.
+ * Per Intel doc 826393 (MONITOR/UMONITOR performance guidance): on
+ * affected parts (SPR/EMR/SRF/GNR) the microcode mitigation sets
+ * IA32_MCU_OPT_CTRL[6] IGN_UMONITOR, making UMONITOR a silent no-op --
+ * a subsequent UMWAIT retires immediately -- while CPUID still
+ * advertises WAITPKG. Detected once at init: effective iff
+ * CPUID.7.2.EDX[7] MONITOR_MITG_NO, or the mitigation MSR bit is
+ * absent/clear. Read-only debugfs io_uring_dma_umonitor_effective; the
+ * mwait mode falls back to TPAUSE slices when 0. CPL0 MONITOR (the
+ * mwait_deep path) is not gated by IGN_UMONITOR.
+ */
+static unsigned int io_dma_umonitor_eff;
+static void io_dma_umonitor_detect(void);
+
+/*
  * Completion-thread placement. 0 (default): affine to the DMA device's
  * whole NUMA node and let the scheduler place each wake -- wake affinity
  * pulls the thread toward the submitting (busy, HWP-warm) core, avoiding
@@ -1108,6 +1144,15 @@ void io_dma_debugfs_init(void)
 			   &io_dma_mwait_deep);
 	debugfs_create_u32("io_uring_dma_compl_pin", 0644, NULL,
 			   &io_dma_compl_pin);
+	io_dma_umonitor_detect();
+	/* Writable: an operator who flips IA32_MCU_OPT_CTRL[6] at runtime
+	 * (wrmsr) can update the cached verdict without rebooting. */
+	debugfs_create_u32("io_uring_dma_umonitor_effective", 0644, NULL,
+			   &io_dma_umonitor_eff);
+	debugfs_create_u32("io_uring_dma_grace_us", 0644, NULL,
+			   &io_dma_grace_us);
+	debugfs_create_u32("io_uring_dma_tpause_ns", 0644, NULL,
+			   &io_dma_tpause_ns);
 	debugfs_create_file("io_uring_dma_cpu_latency_us", 0644, NULL, NULL,
 			    &io_dma_cpu_lat_fops);
 	debugfs_create_file("io_uring_dma_pfn_cache", 0444, NULL, NULL,
@@ -1311,6 +1356,43 @@ static inline void io_umwait(u32 state, u64 tsc_deadline)
 		     "a" ((u32)tsc_deadline), "d" ((u32)(tsc_deadline >> 32)));
 }
 
+/* One C0.2 TPAUSE slice; no monitor involved (Intel doc 826393: TPAUSE
+ * is unaffected by the MONITOR/UMONITOR tracking-table issue). */
+static inline void io_tpause_slice(void)
+{
+	u64 dl = rdtsc() +
+		 (u64)READ_ONCE(io_dma_tpause_ns) * tsc_khz / 1000000;
+
+	__tpause(0 /* C0.2 */, (u32)(dl >> 32), (u32)dl);
+}
+
+/* Detect once whether UMONITOR arms a monitor here (see the knob's
+ * comment; Intel doc 826393). Called from io_dma_debugfs_init(). */
+static void io_dma_umonitor_detect(void)
+{
+	unsigned int eax, ebx, ecx, edx;
+	u64 arch, mcu;
+
+	if (!boot_cpu_has(X86_FEATURE_WAITPKG))
+		return;
+	cpuid_count(0x7, 2, &eax, &ebx, &ecx, &edx);
+	if (edx & BIT(7)) {		/* MONITOR_MITG_NO: unaffected part */
+		io_dma_umonitor_eff = 1;
+		return;
+	}
+	if (rdmsrq_safe(MSR_IA32_ARCH_CAPABILITIES, &arch))
+		arch = 0;
+	if (!(arch & BIT_ULL(29))) {	/* no IGN_UMONITOR support: ucode
+					 * predates the mitigation, UMONITOR
+					 * still arms (overflow risk applies:
+					 * we arm at most once per doze) */
+		io_dma_umonitor_eff = 1;
+		return;
+	}
+	if (!rdmsrq_safe(MSR_IA32_MCU_OPT_CTRL, &mcu))
+		io_dma_umonitor_eff = !(mcu & BIT_ULL(6)); /* IGN_UMONITOR */
+}
+
 /*
  * Doze on the head task's completion record instead of spinning cookie
  * queries: UMONITOR the status byte the device will write, UMWAIT until
@@ -1352,16 +1434,52 @@ static void io_dma_mwait_wait(struct io_ring_ctx *ctx)
 	/* Monitor protocol: arm, re-check, then wait -- a record write
 	 * between the check and the wait still ends it. A context switch
 	 * between MONITOR and MWAIT clears the armed state, in which case
-	 * MWAIT retires immediately (SDM) -- no lost wake either way. */
+	 * MWAIT retires immediately (SDM) -- no lost wake either way.
+	 * One arm per doze, never re-armed in a tight loop, keeping the
+	 * monitor-table pressure at the completion rate (doc 826393).
+	 * When UMONITOR is a mitigation no-op, TPAUSE-slice instead:
+	 * same C0.2 residency, staleness bounded by one slice. */
 	if (deep) {
 		__monitor(status, 0, 0);
 		if (READ_ONCE(*status) == 0 && !kthread_should_stop())
 			__mwait(0x00 /* C1 */, MWAIT_ECX_INTERRUPT_BREAK);
-	} else {
+	} else if (io_dma_umonitor_eff) {
 		io_umonitor(status);
 		if (READ_ONCE(*status) == 0 && !kthread_should_stop())
 			io_umwait(0 /* C0.2 */, rdtsc() +
 				  (u64)READ_ONCE(io_dma_mwait_us) * tsc_khz / 1000);
+	} else {
+		io_tpause_slice();
+	}
+}
+
+/*
+ * One doze slice of the post-drain grace window: wait for the next
+ * submission with the core kept in C0.x. Monitor target is the
+ * submit_list head -- the submitter's llist_add write ends the doze
+ * directly. Same primitive selection as the record wait; spurious
+ * wakes from neighboring fields on the monitored cacheline only cost
+ * an extra loop in the caller.
+ */
+static void io_dma_idle_doze(struct io_ring_ctx *ctx)
+{
+	const void *addr = &ctx->dma.submit_list.first;
+	bool deep = READ_ONCE(io_dma_mwait_deep) &&
+		    static_cpu_has(X86_FEATURE_MWAIT);
+
+	if (deep) {
+		__monitor(addr, 0, 0);
+		if (!io_dma_pending(ctx) && !kthread_should_stop())
+			__mwait(0x00 /* C1 */, MWAIT_ECX_INTERRUPT_BREAK);
+	} else if (!static_cpu_has(X86_FEATURE_WAITPKG)) {
+		cpu_relax();
+	} else if (io_dma_umonitor_eff) {
+		io_umonitor(addr);
+		if (!io_dma_pending(ctx) && !kthread_should_stop())
+			io_umwait(0 /* C0.2 */, rdtsc() +
+				  (u64)READ_ONCE(io_dma_mwait_us) * tsc_khz / 1000);
+	} else {
+		io_tpause_slice();
 	}
 }
 #else
@@ -1369,7 +1487,48 @@ static void io_dma_mwait_wait(struct io_ring_ctx *ctx)
 {
 	cpu_relax();
 }
+
+static void io_dma_idle_doze(struct io_ring_ctx *ctx)
+{
+	cpu_relax();
+}
+
+static void io_dma_umonitor_detect(void)
+{
+}
 #endif
+
+/*
+ * Post-drain grace window: instead of sleeping the moment the pending
+ * lists empty, doze/spin on the next submission for io_dma_grace_us.
+ * Returns true when work arrived (caller re-drains without ever having
+ * scheduled out); false when the window expired, grace is disabled, or
+ * the thread must stop/reschedule -- caller falls back to wait_event.
+ * The submit-side wake_up remains armed regardless: if we do go back to
+ * sleep, the ordinary waitqueue path covers submissions as before.
+ */
+static bool io_dma_grace_wait(struct io_ring_ctx *ctx)
+{
+	unsigned int grace = READ_ONCE(io_dma_grace_us);
+	u64 end;
+
+	if (!grace ||
+	    !io_dma_mode_wakes_thread(READ_ONCE(io_dma_completion_mode)))
+		return false;
+
+	end = ktime_get_ns() + (u64)grace * NSEC_PER_USEC;
+	while (!kthread_should_stop()) {
+		if (io_dma_pending(ctx))
+			return true;
+		if (need_resched() || ktime_get_ns() >= end)
+			return io_dma_pending(ctx);
+		if (READ_ONCE(io_dma_completion_mode) == IO_DMA_COMP_MWAIT)
+			io_dma_idle_doze(ctx);
+		else
+			cpu_relax();
+	}
+	return false;
+}
 
 static int io_dma_compl_thread_fn(void *data)
 {
@@ -1380,18 +1539,23 @@ static int io_dma_compl_thread_fn(void *data)
 					 io_dma_pending(ctx) ||
 					 kthread_should_stop());
 
-		while (io_dma_pending(ctx) && !kthread_should_stop()) {
-			io_dma_poll_pass(ctx, false);
-			if (!io_dma_pending(ctx))
-				break;
-			/* Wait between drains: busypoll spins; mwait dozes on
-			 * the head completion record until the device writes
-			 * it (or the deadline/an interrupt ends the doze). */
-			if (READ_ONCE(io_dma_completion_mode) == IO_DMA_COMP_MWAIT)
-				io_dma_mwait_wait(ctx);
-			else
-				cpu_relax();
-		}
+		do {
+			while (io_dma_pending(ctx) && !kthread_should_stop()) {
+				io_dma_poll_pass(ctx, false);
+				if (!io_dma_pending(ctx))
+					break;
+				/* Wait between drains: busypoll spins; mwait
+				 * dozes on the head completion record until
+				 * the device writes it (or the deadline/an
+				 * interrupt ends the doze). */
+				if (READ_ONCE(io_dma_completion_mode) == IO_DMA_COMP_MWAIT)
+					io_dma_mwait_wait(ctx);
+				else
+					cpu_relax();
+			}
+			/* Drained dry: hold the core warm through the grace
+			 * window in case the next submission is imminent. */
+		} while (!kthread_should_stop() && io_dma_grace_wait(ctx));
 	}
 	return 0;
 }
