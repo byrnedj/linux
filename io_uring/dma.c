@@ -103,6 +103,9 @@ struct io_pfn_cache {
 	atomic64_t		ref_skips;	/* sweep passed an in-flight entry */
 };
 
+/* Batches whose page-pool sources sent them down the plain sg path. */
+static atomic64_t io_pfn_pp_bypass_batches;
+
 #define IO_PFN_CACHE_DEVS	16
 static struct io_pfn_cache *io_pfn_caches[IO_PFN_CACHE_DEVS];
 static struct device *io_pfn_cache_devs[IO_PFN_CACHE_DEVS];
@@ -112,10 +115,20 @@ static DEFINE_SPINLOCK(io_pfn_cache_reg_lock);
  * Covered-bytes cap in MiB; 0 disables the cache entirely.  Generous by
  * default: oversizing only widens the exposure window, while a cap under
  * a cycling working set makes the sweep thrash (evict+remap per I/O,
- * worse than no cache).  Size it above the source working set -- NIC
- * page_pool posted buffers for recv, the hot file set for reads.
+ * worse than no cache).  Size it above the source working set -- the hot
+ * file set for reads.  (Recv sources bypass the cache entirely by
+ * default; see io_dma_pfn_cache_pp_bypass.)
  */
 static u32 io_dma_pfn_cache_cap_mb __read_mostly = 4096;
+
+/*
+ * Skip the cache for page-pool-backed sources (NIC recv).  Those pages
+ * are filled once and recycled, so a cached mapping never gets a second
+ * use while its reference blocks the recycler.  1 = bypass (default),
+ * 0 = cache them like any other source (pre-bypass behavior, for A/B).
+ * debugfs io_uring_dma_pfn_cache_pp_bypass.
+ */
+static u32 io_dma_pfn_cache_pp_bypass __read_mostly = 1;
 
 /* Sweep visit budget per eviction call: bounds datapath latency when the
  * table is large and mostly referenced/in-flight (soft cap). */
@@ -374,7 +387,10 @@ static int io_pfn_cache_stats_show(struct seq_file *m, void *p)
 {
 	int i;
 
-	seq_printf(m, "cap_mb %u\n", READ_ONCE(io_dma_pfn_cache_cap_mb));
+	seq_printf(m, "cap_mb %u pp_bypass %u pp_bypass_batches %lld\n",
+		   READ_ONCE(io_dma_pfn_cache_cap_mb),
+		   READ_ONCE(io_dma_pfn_cache_pp_bypass),
+		   (long long)atomic64_read(&io_pfn_pp_bypass_batches));
 	for (i = 0; i < IO_PFN_CACHE_DEVS; i++) {
 		struct io_pfn_cache *c;
 
@@ -1159,6 +1175,8 @@ void io_dma_debugfs_init(void)
 			    &io_pfn_cache_stats_fops);
 	debugfs_create_u32("io_uring_dma_pfn_cache_cap_mb", 0644, NULL,
 			   &io_dma_pfn_cache_cap_mb);
+	debugfs_create_u32("io_uring_dma_pfn_cache_pp_bypass", 0644, NULL,
+			   &io_dma_pfn_cache_pp_bypass);
 	debugfs_create_file("io_uring_dma_pfn_cache_flush", 0200, NULL, NULL,
 			    &io_pfn_cache_flush_fops);
 	debugfs_create_file("io_uring_dma_poll_state", 0444, NULL, NULL,
@@ -2517,6 +2535,43 @@ static unsigned int io_dma_merge_entries(struct io_dma_batch_entry *entries,
 	return out + 1;
 }
 
+/*
+ * Should this batch skip the PFN cache and take the plain sg path?
+ *
+ * NIC receive buffers are strictly streaming: the driver fills a page
+ * once, the stack consumes it, and the page pool recycles it.  A cached
+ * source mapping is therefore never reused, while the cache reference it
+ * holds is one the recycler has to wait on.  Measured on 64KB memcached
+ * recv, caching page-pool sources spent ~5.4% of node cycles (lookup,
+ * xarray walk, page-pool ref release, flush) to avoid ~2.3% of mapping
+ * work.
+ *
+ * The decision has to be made per batch, not per chunk: declining an
+ * individual lookup only drops that chunk to its own dma_map_single,
+ * whereas skipping the cache entirely routes the batch through
+ * dma_map_sg(), which coalesces physically contiguous frags into one
+ * IOVA segment (a 64KB GRO skb becomes ~1 descriptor instead of 16).
+ * Per-chunk bypass measured 14% SLOWER than the sg path for exactly
+ * that reason.
+ *
+ * Recv batches are homogeneous -- every chunk is an skb frag from the
+ * same NIC page pool -- so sampling the first chunk decides the batch.
+ */
+static bool io_dma_batch_bypasses_cache(struct io_dma_batch_entry *entries,
+					unsigned int nr_entries)
+{
+	const void *kaddr;
+
+	if (!READ_ONCE(io_dma_pfn_cache_pp_bypass) || !nr_entries)
+		return false;
+	kaddr = entries[0].src_kaddr;
+	if (!virt_addr_valid(kaddr) ||
+	    !page_pool_page_is_pp(virt_to_page(kaddr)))
+		return false;
+	atomic64_inc(&io_pfn_pp_bypass_batches);
+	return true;
+}
+
 static ssize_t io_dma_recv_flush(struct io_kiocb *req, struct device *dev,
 				 struct dma_chan *chan,
 				 struct io_dma_batch_entry *entries,
@@ -2530,7 +2585,8 @@ static ssize_t io_dma_recv_flush(struct io_kiocb *req, struct device *dev,
 	if (nr_entries > 1)
 		nr_entries = io_dma_merge_entries(entries, nr_entries);
 
-	if (io_pfn_cache_usable(req->ctx))
+	if (io_pfn_cache_usable(req->ctx) &&
+	    !io_dma_batch_bypasses_cache(entries, nr_entries))
 		cache = io_pfn_cache_get(dev);
 
 	if (cache) {
