@@ -490,6 +490,17 @@ static unsigned int io_dma_mwait_us __read_mostly = 50;
 static unsigned int io_dma_mwait_deep __read_mostly;
 
 /*
+ * Completion-thread placement. 0 (default): affine to the DMA device's
+ * whole NUMA node and let the scheduler place each wake -- wake affinity
+ * pulls the thread toward the submitting (busy, HWP-warm) core, avoiding
+ * the ~10us C-exit + frequency-ramp tax a cold pinned CPU pays per wake.
+ * 1: legacy behavior, hard-pin each ring's thread to its own CPU taken
+ * from the top of the node mask (predictable placement, cold floors).
+ * Read at thread start (ring creation); debugfs io_uring_dma_compl_pin.
+ */
+static unsigned int io_dma_compl_pin __read_mostly;
+
+/*
  * Keep DMA completion detection on the ring task where possible, instead of
  * bouncing every completion through the kworker poller plus a second
  * task_work wakeup:
@@ -1095,6 +1106,8 @@ void io_dma_debugfs_init(void)
 			   &io_dma_mwait_us);
 	debugfs_create_u32("io_uring_dma_mwait_deep", 0644, NULL,
 			   &io_dma_mwait_deep);
+	debugfs_create_u32("io_uring_dma_compl_pin", 0644, NULL,
+			   &io_dma_compl_pin);
 	debugfs_create_file("io_uring_dma_cpu_latency_us", 0644, NULL, NULL,
 			    &io_dma_cpu_lat_fops);
 	debugfs_create_file("io_uring_dma_pfn_cache", 0444, NULL, NULL,
@@ -1406,34 +1419,48 @@ void io_dma_compl_thread_start(struct io_ring_ctx *ctx)
 	}
 
 	node = dev_to_node(ctx->dma.chan->device->dev);
-	cpu = nr_cpu_ids;
-	if (node != NUMA_NO_NODE) {
-		const struct cpumask *mask = cpumask_of_node(node);
-		unsigned int weight = cpumask_weight(mask);
-
+	if (!READ_ONCE(io_dma_compl_pin)) {
 		/*
-		 * Spread the spinning threads across the node from the TOP of
-		 * its cpumask down, one CPU per ring (global sequence).
-		 * cpumask_first put every ring's thread on the node's first
-		 * CPU -- where applications also pin their first worker --
-		 * so N rings meant N busy-spinners plus the app thread
-		 * timesharing one CPU while the rest of the node idled
-		 * (measured: 32x32 64KB xnode recv at 11.5 GB/s vs 19.8 for
-		 * the CQ-wait-poll path; the mode's own floor is the best of
-		 * all, 6.4us). High CPUs are the least likely to collide
-		 * with low-CPU-first application pinning conventions.
+		 * Node-mask affinity: let the scheduler place each wake.
+		 * Wake affinity pulls the thread next to the waker -- the
+		 * submitting server thread's busy, frequency-ramped core --
+		 * so the doze/spin runs warm instead of paying the cold-CPU
+		 * HWP tax (~10us/wake measured on pinned quiet CPUs), while
+		 * load balancing still spreads threads when cores fill up.
 		 */
-		if (weight) {
-			static atomic_t seq;
-			unsigned int idx = weight - 1 -
-				((unsigned int)atomic_fetch_inc(&seq) % weight);
+		if (node != NUMA_NO_NODE)
+			kthread_bind_mask(t, cpumask_of_node(node));
+	} else {
+		cpu = nr_cpu_ids;
+		if (node != NUMA_NO_NODE) {
+			const struct cpumask *mask = cpumask_of_node(node);
+			unsigned int weight = cpumask_weight(mask);
 
-			cpu = cpumask_nth(idx, mask);
+			/*
+			 * Spread the spinning threads across the node from the
+			 * TOP of its cpumask down, one CPU per ring (global
+			 * sequence). cpumask_first put every ring's thread on
+			 * the node's first CPU -- where applications also pin
+			 * their first worker -- so N rings meant N busy-
+			 * spinners plus the app thread timesharing one CPU
+			 * while the rest of the node idled (measured: 32x32
+			 * 64KB xnode recv at 11.5 GB/s vs 19.8 for the
+			 * CQ-wait-poll path). High CPUs are the least likely
+			 * to collide with low-CPU-first application pinning
+			 * conventions.
+			 */
+			if (weight) {
+				static atomic_t seq;
+				unsigned int idx = weight - 1 -
+					((unsigned int)atomic_fetch_inc(&seq) % weight);
+
+				cpu = cpumask_nth(idx, mask);
+			}
 		}
+		if (cpu >= nr_cpu_ids)
+			cpu = cpumask_first(cpu_online_mask);
+		kthread_bind(t, cpu);
 	}
-	if (cpu >= nr_cpu_ids)
-		cpu = cpumask_first(cpu_online_mask);
-	kthread_bind(t, cpu);
 
 	ctx->dma.compl_thread = t;
 	wake_up_process(t);
