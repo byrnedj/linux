@@ -697,6 +697,33 @@ static unsigned int io_dma_umonitor_eff;
 static void io_dma_umonitor_detect(void);
 
 /*
+ * Zero the admission sketch (debugfs write).  Touch-driven halving only
+ * decays frequency mass while NEW touches arrive -- a finished
+ * workload's saturated counters otherwise misclassify the next
+ * workload's colliding PFNs as reused for millions of touches (observed:
+ * a prior fio storm made a Spark spill stream admit everything).
+ */
+static ssize_t io_pfn_sketch_reset_write(struct file *file,
+					 const char __user *ubuf,
+					 size_t len, loff_t *ppos)
+{
+	if (io_pfn_sketch) {
+		spin_lock(&io_pfn_sketch_reset_lock);
+		memset(io_pfn_sketch, 0, 1UL << IO_PFN_SKETCH_ORDER);
+		atomic64_set(&io_pfn_sketch_ops, 0);
+		spin_unlock(&io_pfn_sketch_reset_lock);
+	}
+	return len;
+}
+
+static const struct file_operations io_pfn_sketch_reset_fops = {
+	.owner		= THIS_MODULE,
+	.open		= simple_open,
+	.write		= io_pfn_sketch_reset_write,
+	.llseek		= noop_llseek,
+};
+
+/*
  * Completion-thread placement. 0 (default): affine to the DMA device's
  * whole NUMA node and let the scheduler place each wake -- wake affinity
  * pulls the thread toward the submitting (busy, HWP-warm) core, avoiding
@@ -1336,6 +1363,8 @@ void io_dma_debugfs_init(void)
 			   &io_dma_pfn_cache_admit);
 	debugfs_create_u32("io_uring_dma_pfn_cache_window_mb", 0644, NULL,
 			   &io_dma_pfn_cache_window_mb);
+	debugfs_create_file("io_uring_dma_pfn_cache_sketch_reset", 0200, NULL,
+			    NULL, &io_pfn_sketch_reset_fops);
 	/* Admission frequency sketch; on failure admission degrades to
 	 * admit-everything (legacy behavior). */
 	io_pfn_sketch = kvzalloc(1UL << IO_PFN_SKETCH_ORDER, GFP_KERNEL);
