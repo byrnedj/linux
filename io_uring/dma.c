@@ -13,6 +13,7 @@
 #include <linux/fs.h>
 #include <linux/scatterlist.h>
 #include <linux/timekeeping.h>
+#include <linux/hash.h>
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
 #include <linux/kthread.h>
@@ -84,6 +85,11 @@ struct io_pfn_map {
 	unsigned int		size;		/* mapped bytes (folio_size at insert) */
 	atomic_t		refs;		/* cache bias + in-flight users */
 	bool			referenced;	/* CLOCK second-chance bit */
+	atomic_t		probation;	/* 1 = window resident awaiting reuse
+						 * evidence; 0 = admitted to main */
+	unsigned long		inserted_j;	/* jiffies at insert: separates
+						 * same-pass spatial hits from
+						 * cross-pass temporal reuse */
 	struct device		*dev;		/* unmap handle */
 	struct rcu_head		rcu;
 };
@@ -101,6 +107,10 @@ struct io_pfn_cache {
 	atomic64_t		range_fallbacks;/* chunk not coverable by one entry */
 	atomic64_t		evictions;
 	atomic64_t		ref_skips;	/* sweep passed an in-flight entry */
+	atomic64_t		probation_bytes; /* window residency (subset of covered) */
+	atomic64_t		admits;		/* misses admitted straight to main */
+	atomic64_t		promotions;	/* probation -> main on aged re-touch */
+	atomic64_t		prob_evictions;	/* probation entries swept unpromoted */
 };
 
 /* Batches whose page-pool sources sent them down the plain sg path. */
@@ -129,6 +139,90 @@ static u32 io_dma_pfn_cache_cap_mb __read_mostly = 4096;
  * debugfs io_uring_dma_pfn_cache_pp_bypass.
  */
 static u32 io_dma_pfn_cache_pp_bypass __read_mostly = 1;
+
+/*
+ * TinyLFU-style admission (default on; 0 = legacy admit-everything).
+ *
+ * The standing cache only pays for temporal reuse (the same folio
+ * DMA'd again later); streaming sources get only spatial hits, and
+ * their accumulated entries bloat the IOVA allocator rbtree that every
+ * future miss must search.  A miss therefore consults a global
+ * count-min sketch of per-folio touch frequency: first-touch folios
+ * insert on probation into a small window
+ * (io_uring_dma_pfn_cache_window_mb), serve their pass's spatial hits,
+ * and are reclaimed with no second chance -- a pure stream holds only
+ * ~window bytes of standing IOVA regardless of cap.  Reuse promotes to
+ * main residency: a probation hit after IO_PFN_PROBATION_AGE (the age
+ * gate keeps same-pass spatial hits from promoting), or sketch
+ * frequency >= 2 at miss time.  Main entries keep the CLOCK second
+ * chance under the cap.
+ */
+static u32 io_dma_pfn_cache_admit __read_mostly = 1;
+static u32 io_dma_pfn_cache_window_mb __read_mostly = 256;
+
+/* Cross-pass discriminator: spatial hits on a folio arrive within its
+ * read pass (micro-to-milliseconds); a genuine temporal re-touch comes
+ * from a later pass.  100ms cleanly separates them at any measured
+ * spill cadence. */
+#define IO_PFN_PROBATION_AGE	(HZ / 10)
+
+/*
+ * Global 4-hash count-min sketch, byte counters saturating at 15,
+ * halved every IO_PFN_SKETCH_RESET touches (TinyLFU aging).  Racy
+ * increments are fine -- frequency estimates tolerate lost updates.
+ */
+#define IO_PFN_SKETCH_ORDER	20	/* 1M counters, 1MB */
+#define IO_PFN_SKETCH_MASK	((1UL << IO_PFN_SKETCH_ORDER) - 1)
+#define IO_PFN_SKETCH_RESET	(2UL << IO_PFN_SKETCH_ORDER)
+static u8 *io_pfn_sketch;
+static atomic64_t io_pfn_sketch_ops;
+static DEFINE_SPINLOCK(io_pfn_sketch_reset_lock);
+
+static void io_pfn_sketch_positions(unsigned long pfn, u32 idx[4])
+{
+	u64 h = pfn * GOLDEN_RATIO_64;
+
+	idx[0] = h & IO_PFN_SKETCH_MASK;
+	idx[1] = (h >> 16) & IO_PFN_SKETCH_MASK;
+	idx[2] = (h >> 32) & IO_PFN_SKETCH_MASK;
+	idx[3] = (h >> 44) & IO_PFN_SKETCH_MASK;
+}
+
+static void io_pfn_sketch_reset(void)
+{
+	u64 *p = (u64 *)io_pfn_sketch;
+	size_t i;
+
+	if (!spin_trylock(&io_pfn_sketch_reset_lock))
+		return;
+	/* Halve every byte counter in u64 gulps (top bit of each byte is
+	 * always 0: counters saturate at 15). */
+	for (i = 0; i < (1UL << IO_PFN_SKETCH_ORDER) / 8; i++)
+		p[i] = (p[i] >> 1) & 0x7f7f7f7f7f7f7f7fULL;
+	spin_unlock(&io_pfn_sketch_reset_lock);
+}
+
+/* Record one logical touch and return the updated frequency estimate. */
+static unsigned int io_pfn_sketch_touch(unsigned long pfn)
+{
+	u32 idx[4];
+	unsigned int est = 15;
+	int i;
+
+	if (!io_pfn_sketch)
+		return 15;	/* sketch alloc failed: admit everything */
+	io_pfn_sketch_positions(pfn, idx);
+	for (i = 0; i < 4; i++) {
+		u8 v = READ_ONCE(io_pfn_sketch[idx[i]]);
+
+		if (v < 15)
+			WRITE_ONCE(io_pfn_sketch[idx[i]], v + 1);
+		est = min_t(unsigned int, est, v + 1);
+	}
+	if ((atomic64_inc_return(&io_pfn_sketch_ops) % IO_PFN_SKETCH_RESET) == 0)
+		io_pfn_sketch_reset();
+	return est;
+}
 
 /* Sweep visit budget per eviction call: bounds datapath latency when the
  * table is large and mostly referenced/in-flight (soft cap). */
@@ -194,6 +288,7 @@ static void io_pfn_map_put(struct io_pfn_map *pm)
  */
 static void io_pfn_cache_evict(struct io_pfn_cache *c, u64 cap)
 {
+	u64 window = (u64)READ_ONCE(io_dma_pfn_cache_window_mb) << 20;
 	struct io_pfn_map *pm;
 	unsigned long index;
 	int budget = IO_PFN_EVICT_BUDGET;
@@ -202,24 +297,41 @@ static void io_pfn_cache_evict(struct io_pfn_cache *c, u64 cap)
 	if (!spin_trylock(&c->lock))
 		return;
 
-	for (pass = 0; pass < 2 && atomic64_read(&c->covered) > cap; pass++) {
+	for (pass = 0; pass < 2 &&
+	     (atomic64_read(&c->covered) > cap ||
+	      atomic64_read(&c->probation_bytes) > window); pass++) {
 		unsigned long start = pass ? 0 : c->hand;
 
 		xa_for_each_start(&c->xa, index, pm, start) {
+			bool prob = atomic_read(&pm->probation) != 0;
+
 			if (--budget <= 0) {
 				c->hand = index + 1;
 				goto out;
 			}
-			if (READ_ONCE(pm->referenced)) {
+			/* Probation entries get NO second chance: their
+			 * referenced bit only records same-pass spatial
+			 * hits, which are not evidence of future value.
+			 * Aged re-touches promote out of probation before
+			 * the sweep ever sees them. */
+			if (!prob && READ_ONCE(pm->referenced)) {
 				WRITE_ONCE(pm->referenced, false);
 			} else if (atomic_read(&pm->refs) > 1) {
 				atomic64_inc(&c->ref_skips);
-			} else {
+			} else if (prob ||
+				   atomic64_read(&c->covered) > cap) {
 				xa_erase(&c->xa, index);
 				atomic64_sub(pm->size, &c->covered);
-				atomic64_inc(&c->evictions);
+				if (prob &&
+				    atomic_cmpxchg(&pm->probation, 1, 0) == 1) {
+					atomic64_sub(pm->size, &c->probation_bytes);
+					atomic64_inc(&c->prob_evictions);
+				} else {
+					atomic64_inc(&c->evictions);
+				}
 				io_pfn_map_put(pm);	/* drop cache bias */
-				if (atomic64_read(&c->covered) <= cap) {
+				if (atomic64_read(&c->covered) <= cap &&
+				    atomic64_read(&c->probation_bytes) <= window) {
 					c->hand = index + 1;
 					goto out;
 				}
@@ -274,6 +386,8 @@ static struct io_pfn_map *io_pfn_map_lookup(struct io_pfn_cache *c,
 			if (xa_cmpxchg(&c->xa, pfn, pm, NULL,
 				       GFP_NOWAIT | __GFP_NOWARN) == pm) {
 				atomic64_sub(pm->size, &c->covered);
+				if (atomic_cmpxchg(&pm->probation, 1, 0) == 1)
+					atomic64_sub(pm->size, &c->probation_bytes);
 				io_pfn_map_put(pm);	/* cache bias */
 			}
 			io_pfn_map_put(pm);		/* lookup ref */
@@ -282,6 +396,18 @@ static struct io_pfn_map *io_pfn_map_lookup(struct io_pfn_cache *c,
 		}
 		WRITE_ONCE(pm->referenced, true);
 		atomic64_inc(&c->hits);
+		/* Aged re-touch of a window entry = cross-pass temporal
+		 * reuse: promote to main residency.  The cmpxchg makes
+		 * concurrent hitters promote exactly once (accounting),
+		 * and the age gate keeps the pass's own spatial hits
+		 * from counting as evidence. */
+		if (atomic_read(&pm->probation) &&
+		    time_after(jiffies, pm->inserted_j + IO_PFN_PROBATION_AGE) &&
+		    atomic_cmpxchg(&pm->probation, 1, 0) == 1) {
+			atomic64_sub(pm->size, &c->probation_bytes);
+			atomic64_inc(&c->promotions);
+			io_pfn_sketch_touch(pfn);
+		}
 		*dma = pm->dma_base + offset;
 		return pm;
 	}
@@ -303,6 +429,17 @@ miss:
 	pm->size = map_len;
 	pm->dev = c->dev;
 	pm->referenced = true;
+	pm->inserted_j = jiffies;
+	if (READ_ONCE(io_dma_pfn_cache_admit) &&
+	    io_pfn_sketch_touch(pfn) < 2) {
+		/* First sighting: window residency only.  It serves this
+		 * pass's spatial hits, then the sweep reclaims it unless
+		 * reuse evidence promotes it first. */
+		atomic_set(&pm->probation, 1);
+	} else {
+		atomic_set(&pm->probation, 0);
+		atomic64_inc(&c->admits);
+	}
 	atomic_set(&pm->refs, 2);	/* cache bias + this I/O */
 
 	rcu_read_lock();
@@ -328,7 +465,11 @@ miss:
 	}
 	rcu_read_unlock();
 	atomic64_inc(&c->inserts);
-	if (atomic64_add_return(pm->size, &c->covered) > cap)
+	if (atomic_read(&pm->probation))
+		atomic64_add(pm->size, &c->probation_bytes);
+	if (atomic64_add_return(pm->size, &c->covered) > cap ||
+	    atomic64_read(&c->probation_bytes) >
+			((u64)READ_ONCE(io_dma_pfn_cache_window_mb) << 20))
 		io_pfn_cache_evict(c, cap);
 	*dma = pm->dma_base + offset;
 	return pm;
@@ -371,6 +512,8 @@ static void io_pfn_cache_flush(struct io_pfn_cache *c)
 	xa_for_each(&c->xa, index, pm) {
 		xa_erase(&c->xa, index);
 		atomic64_sub(pm->size, &c->covered);
+		if (atomic_cmpxchg(&pm->probation, 1, 0) == 1)
+			atomic64_sub(pm->size, &c->probation_bytes);
 		io_pfn_map_put(pm);
 	}
 	c->hand = 0;
@@ -387,10 +530,12 @@ static int io_pfn_cache_stats_show(struct seq_file *m, void *p)
 {
 	int i;
 
-	seq_printf(m, "cap_mb %u pp_bypass %u pp_bypass_batches %lld\n",
+	seq_printf(m, "cap_mb %u pp_bypass %u pp_bypass_batches %lld admit %u window_mb %u\n",
 		   READ_ONCE(io_dma_pfn_cache_cap_mb),
 		   READ_ONCE(io_dma_pfn_cache_pp_bypass),
-		   (long long)atomic64_read(&io_pfn_pp_bypass_batches));
+		   (long long)atomic64_read(&io_pfn_pp_bypass_batches),
+		   READ_ONCE(io_dma_pfn_cache_admit),
+		   READ_ONCE(io_dma_pfn_cache_window_mb));
 	for (i = 0; i < IO_PFN_CACHE_DEVS; i++) {
 		struct io_pfn_cache *c;
 
@@ -398,7 +543,7 @@ static int io_pfn_cache_stats_show(struct seq_file *m, void *p)
 			break;
 		c = io_pfn_caches[i];
 		seq_printf(m,
-			   "dev %s covered_kb %lld hits %lld misses %lld inserts %lld insert_fails %lld range_fallbacks %lld evictions %lld ref_skips %lld\n",
+			   "dev %s covered_kb %lld hits %lld misses %lld inserts %lld insert_fails %lld range_fallbacks %lld evictions %lld ref_skips %lld probation_kb %lld admits %lld promotions %lld prob_evictions %lld\n",
 			   dev_name(c->dev),
 			   atomic64_read(&c->covered) >> 10,
 			   atomic64_read(&c->hits),
@@ -407,7 +552,11 @@ static int io_pfn_cache_stats_show(struct seq_file *m, void *p)
 			   atomic64_read(&c->insert_fails),
 			   atomic64_read(&c->range_fallbacks),
 			   atomic64_read(&c->evictions),
-			   atomic64_read(&c->ref_skips));
+			   atomic64_read(&c->ref_skips),
+			   atomic64_read(&c->probation_bytes) >> 10,
+			   atomic64_read(&c->admits),
+			   atomic64_read(&c->promotions),
+			   atomic64_read(&c->prob_evictions));
 	}
 	return 0;
 }
@@ -526,6 +675,33 @@ static unsigned int io_dma_tpause_ns __read_mostly = 1000;
  */
 static unsigned int io_dma_umonitor_eff;
 static void io_dma_umonitor_detect(void);
+
+/*
+ * Zero the admission sketch (debugfs write).  Touch-driven halving only
+ * decays frequency mass while NEW touches arrive -- a finished
+ * workload's saturated counters otherwise misclassify the next
+ * workload's colliding PFNs as reused for millions of touches (observed:
+ * a prior fio storm made a Spark spill stream admit everything).
+ */
+static ssize_t io_pfn_sketch_reset_write(struct file *file,
+					 const char __user *ubuf,
+					 size_t len, loff_t *ppos)
+{
+	if (io_pfn_sketch) {
+		spin_lock(&io_pfn_sketch_reset_lock);
+		memset(io_pfn_sketch, 0, 1UL << IO_PFN_SKETCH_ORDER);
+		atomic64_set(&io_pfn_sketch_ops, 0);
+		spin_unlock(&io_pfn_sketch_reset_lock);
+	}
+	return len;
+}
+
+static const struct file_operations io_pfn_sketch_reset_fops = {
+	.owner		= THIS_MODULE,
+	.open		= simple_open,
+	.write		= io_pfn_sketch_reset_write,
+	.llseek		= noop_llseek,
+};
 
 /*
  * Completion-thread placement. 0 (default): affine to the DMA device's
@@ -884,6 +1060,17 @@ void io_dma_debugfs_init(void)
 			   &io_dma_pfn_cache_cap_mb);
 	debugfs_create_u32("io_uring_dma_pfn_cache_pp_bypass", 0644, NULL,
 			   &io_dma_pfn_cache_pp_bypass);
+	debugfs_create_u32("io_uring_dma_pfn_cache_admit", 0644, NULL,
+			   &io_dma_pfn_cache_admit);
+	debugfs_create_u32("io_uring_dma_pfn_cache_window_mb", 0644, NULL,
+			   &io_dma_pfn_cache_window_mb);
+	debugfs_create_file("io_uring_dma_pfn_cache_sketch_reset", 0200, NULL,
+			    NULL, &io_pfn_sketch_reset_fops);
+	/* Admission frequency sketch; on failure admission degrades to
+	 * admit-everything (legacy behavior). */
+	io_pfn_sketch = kvzalloc(1UL << IO_PFN_SKETCH_ORDER, GFP_KERNEL);
+	if (!io_pfn_sketch)
+		pr_warn("io_uring DMA: pfn admission sketch alloc failed; admitting all\n");
 	debugfs_create_file("io_uring_dma_pfn_cache_flush", 0200, NULL, NULL,
 			    &io_pfn_cache_flush_fops);
 }
