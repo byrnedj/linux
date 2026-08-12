@@ -375,6 +375,14 @@ struct io_dma_channel {
 	struct io_dma_task	*free_list;	/* chained via ->next */
 	unsigned int		free_count;	/* parked objects */
 	unsigned int		free_max;	/* pool cap == target size */
+
+	/* Blocking submitters over the outstanding-task cap sleep here
+	 * until the reaper drains below it. Bounded by a timeout on the
+	 * waiter side, so a lost wakeup costs at most the timeout. It is
+	 * touched only while the cap is set, so it sits after the freelist
+	 * and leaves ->lock, the two lists and the freelist on one line.
+	 */
+	wait_queue_head_t	inflight_wq;
 };
 
 struct io_dma_kiocb {
