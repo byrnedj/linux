@@ -974,9 +974,19 @@ static int __io_read(struct io_kiocb *req, struct io_br_sel *sel,
 			io_dma_fm_record(IO_DMA_FM_SHMEM);
 		} else {
 			io_uring_dma_prep(req);
-			req->dma.dst_user_addr = rw->addr;
+			/*
+			 * On a reissue after a short claim the iter and
+			 * ki_pos have advanced by io->bytes_done, but
+			 * rw->addr is the SQE's original address.  Address
+			 * the destination from where the iter stands, or
+			 * the retry lands the tail's data at the buffer
+			 * head (data corruption, found via fio
+			 * --verify=crc32c on cold reads).
+			 */
+			req->dma.dst_user_addr = rw->addr + io->bytes_done;
 
-			ret = io_dma_filemap_read(req, kiocb, rw->addr,
+			ret = io_dma_filemap_read(req, kiocb,
+						  rw->addr + io->bytes_done,
 						  iov_iter_count(&io->iter));
 
 			if (ret > 0)
@@ -1276,8 +1286,10 @@ int io_write(struct io_kiocb *req, unsigned int issue_flags)
 			/* iomap filesystems (XFS) take the normal path */
 			io_dma_fmw_record(IO_DMA_FMW_NO_AOPS);
 		} else {
+			/* Same reissue rule as the read path: the source
+			 * registered-buffer base must track the iter. */
 			ret2 = io_dma_filemap_write(req, kiocb, &io->iter,
-						    rw->addr);
+						    rw->addr + io->bytes_done);
 			if (ret2 > 0)
 				io_dma_fmw_record(IO_DMA_FMW_ENGAGED);
 			else if (ret2 == -EAGAIN)
