@@ -1114,6 +1114,16 @@ static u32 io_dma_budget_wr_pct = 75;
 static atomic64_t io_dma_fmw_short;
 static u32 io_dma_fmw_retry;
 
+/* Corruption bisect: 1 = submit every batch entry as its own plain
+ * MEMMOVE descriptor (no DSA batch descriptors). debugfs
+ * io_uring_dma_no_batch. */
+static u32 io_dma_no_batch;
+
+/* Corruption bisect: 1 = trace_printk every filemap-read entry at
+ * collect time (file pos, folio, src/dst dma). debugfs
+ * io_uring_dma_trace. */
+static u32 io_dma_trace;
+
 struct io_dma_devload {
 	void		*key;		/* dma_device*, identity only --
 					 * never dereferenced */
@@ -1673,6 +1683,10 @@ void io_dma_debugfs_init(void)
 			   &io_dma_budget_wr_pct);
 	debugfs_create_u32("io_uring_dma_fmw_retry", 0644, NULL,
 			   &io_dma_fmw_retry);
+	debugfs_create_u32("io_uring_dma_no_batch", 0644, NULL,
+			   &io_dma_no_batch);
+	debugfs_create_u32("io_uring_dma_trace", 0644, NULL,
+			   &io_dma_trace);
 	debugfs_create_file("io_uring_dma_latency", 0444, NULL, NULL,
 			    &io_dma_lat_fops);
 	debugfs_create_file("io_uring_dma_latency_reset", 0200, NULL, NULL,
@@ -3347,6 +3361,30 @@ static ssize_t io_dma_flush_batch(struct io_kiocb *req,
 	if (!nr_entries)
 		return 0;
 
+	if (unlikely(READ_ONCE(io_dma_no_batch))) {
+		/* Corruption bisect: one plain MEMMOVE descriptor per entry,
+		 * no DSA batch descriptors.  The caller's claim accounting
+		 * is all-or-nothing per flush, so a mid-loop submit failure
+		 * returns the ERROR: the already-submitted prefix completes
+		 * into space the caller never claims (harmless), the
+		 * unsubmitted tail is unmapped here. */
+		unsigned int i;
+		ssize_t total = 0;
+
+		for (i = 0; i < nr_entries; i++) {
+			ret = io_dma_submit_single_entry(req, chan,
+							 &entries[i]);
+			if (ret < 0) {
+				io_dma_unmap_batch(req->ctx, dev,
+						   entries + i,
+						   nr_entries - i, false);
+				return ret;
+			}
+			total += ret;
+		}
+		return total;
+	}
+
 	if (nr_entries == 1)
 		ret = io_dma_submit_single_entry(req, chan, &entries[0]);
 	else
@@ -3531,6 +3569,16 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 				entries[nr_entries].src_is_page = true;
 				nr_entries++;
 
+				if (unlikely(READ_ONCE(io_dma_trace)))
+					trace_printk("ent file=%llu udst=%llx len=%zu fpfn=%lx fsz=%zu src=%llx dst=%llx pm=%d\n",
+						(u64)(iocb->ki_pos + copied),
+						(u64)(dst_user_addr + dst_offset),
+						chunk,
+						folio_pfn(folio),
+						folio_size(folio),
+						(u64)src_dma, (u64)dst_dma,
+						!!pm);
+
 				copied += chunk;
 				dst_offset += chunk;
 				batch_bytes += chunk;
@@ -3596,6 +3644,10 @@ put_folios:
 	 * was actually submitted.  Claiming unsubmitted bytes returns
 	 * uninitialized destination memory to userspace.
 	 */
+	if (unlikely(READ_ONCE(io_dma_trace)))
+		trace_printk("ret start=%llu want=%zu udst=%llx submitted=%zd total=%zd err=%d\n",
+			     (u64)start_pos, want, (u64)dst_user_addr,
+			     submitted, total_read, error);
 	if (unlikely(submitted != total_read))
 		iocb->ki_pos = start_pos + submitted;
 	return submitted ? submitted : error;
