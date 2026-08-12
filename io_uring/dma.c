@@ -983,6 +983,150 @@ void io_dma_fmw_record(unsigned int reason)
 	atomic64_inc(&io_dma_fmw[reason]);
 }
 
+/*
+ * Per-channel queueing diagnostics for the channel-sharing design work:
+ * seen_kb = bytes already in flight on the channel at each submit (the
+ * queue the op joins, log2 KB buckets), lat_us = the submit->complete
+ * latency it then experienced (log2 us buckets; includes service time
+ * and detection), plus an in-flight high-water mark.  Bucket 0 is "<1",
+ * bucket k is [2^(k-1), 2^k), the last bucket is the catch-all.
+ * Lockless registry in submission order (like io_pfn_cache_devs).
+ * Dumped via io_uring_dma_chan_qstat; counters (not live in-flight)
+ * cleared by latency_reset.
+ */
+#define IO_DMA_QSTAT_CHANS	64
+#define IO_DMA_QSTAT_NBUCKETS	16
+
+struct io_dma_chan_qstat {
+	struct dma_chan	*chan;		/* identity ONLY -- may be stale after
+					 * a WQ reconfig; never dereference */
+	char		name[24];	/* captured at registration */
+	atomic64_t	inflight;	/* bytes submitted, not yet completed */
+	atomic64_t	hwm;		/* max in-flight bytes seen */
+	atomic64_t	submits;
+	atomic64_t	bytes;
+	atomic64_t	lat_us[IO_DMA_QSTAT_NBUCKETS];
+	atomic64_t	seen_kb[IO_DMA_QSTAT_NBUCKETS];
+};
+static struct io_dma_chan_qstat io_dma_qstats[IO_DMA_QSTAT_CHANS];
+
+static struct io_dma_chan_qstat *io_dma_qstat_get(struct dma_chan *chan)
+{
+	int i;
+
+	for (i = 0; i < IO_DMA_QSTAT_CHANS; i++) {
+		struct dma_chan *c = READ_ONCE(io_dma_qstats[i].chan);
+
+		if (c == chan)
+			return &io_dma_qstats[i];
+		if (!c) {
+			if (!cmpxchg(&io_dma_qstats[i].chan, NULL, chan)) {
+				/* claimed: chan is live here (we are on its
+				 * submit path); racing readers may see a
+				 * partial name, never a stale pointer */
+				strscpy(io_dma_qstats[i].name,
+					dma_chan_name(chan),
+					sizeof(io_dma_qstats[i].name));
+				return &io_dma_qstats[i];
+			}
+			if (READ_ONCE(io_dma_qstats[i].chan) == chan)
+				return &io_dma_qstats[i];
+		}
+	}
+	return NULL;	/* registry full: op uncounted */
+}
+
+static unsigned int io_dma_qstat_bucket(u64 v)
+{
+	return v ? min_t(unsigned int, ilog2(v) + 1,
+			 IO_DMA_QSTAT_NBUCKETS - 1) : 0;
+}
+
+static void io_dma_qstat_submit(struct dma_chan *chan, u32 len)
+{
+	struct io_dma_chan_qstat *q = io_dma_qstat_get(chan);
+	u64 now, hwm;
+
+	if (!q)
+		return;
+	atomic64_inc(&q->seen_kb[io_dma_qstat_bucket(
+					atomic64_read(&q->inflight) >> 10)]);
+	atomic64_inc(&q->submits);
+	atomic64_add(len, &q->bytes);
+	now = atomic64_add_return(len, &q->inflight);
+	hwm = atomic64_read(&q->hwm);
+	while (now > hwm) {
+		u64 old = atomic64_cmpxchg(&q->hwm, hwm, now);
+
+		if (old == hwm)
+			break;
+		hwm = old;
+	}
+}
+
+static void io_dma_qstat_complete(struct dma_chan *chan, u32 len, u64 submit_ns)
+{
+	struct io_dma_chan_qstat *q = io_dma_qstat_get(chan);
+
+	if (!q)
+		return;
+	atomic64_sub(len, &q->inflight);
+	if (!submit_ns)
+		return;
+	atomic64_inc(&q->lat_us[io_dma_qstat_bucket(
+			div_u64(ktime_get_ns() - submit_ns, NSEC_PER_USEC))]);
+}
+
+static int io_dma_chan_qstat_show(struct seq_file *m, void *v)
+{
+	int i, b;
+
+	for (i = 0; i < IO_DMA_QSTAT_CHANS; i++) {
+		struct io_dma_chan_qstat *q = &io_dma_qstats[i];
+		struct dma_chan *chan = READ_ONCE(q->chan);
+
+		if (!chan)
+			break;
+		if (!atomic64_read(&q->submits))
+			continue;	/* idle or pre-reconfig leftover */
+		seq_printf(m, "%s submits %llu bytes_mb %llu inflight_kb %llu hwm_kb %llu\n",
+			   q->name,
+			   (u64)atomic64_read(&q->submits),
+			   (u64)atomic64_read(&q->bytes) >> 20,
+			   (u64)atomic64_read(&q->inflight) >> 10,
+			   (u64)atomic64_read(&q->hwm) >> 10);
+		seq_puts(m, "  lat_us");
+		for (b = 0; b < IO_DMA_QSTAT_NBUCKETS; b++)
+			seq_printf(m, " %llu", (u64)atomic64_read(&q->lat_us[b]));
+		seq_puts(m, "\n  seen_kb");
+		for (b = 0; b < IO_DMA_QSTAT_NBUCKETS; b++)
+			seq_printf(m, " %llu", (u64)atomic64_read(&q->seen_kb[b]));
+		seq_puts(m, "\n");
+	}
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(io_dma_chan_qstat);
+
+static void io_dma_qstat_reset(void)
+{
+	int i, b;
+
+	for (i = 0; i < IO_DMA_QSTAT_CHANS; i++) {
+		struct io_dma_chan_qstat *q = &io_dma_qstats[i];
+
+		if (!READ_ONCE(q->chan))
+			break;
+		atomic64_set(&q->submits, 0);
+		atomic64_set(&q->bytes, 0);
+		/* keep live inflight; restart the high-water mark from it */
+		atomic64_set(&q->hwm, atomic64_read(&q->inflight));
+		for (b = 0; b < IO_DMA_QSTAT_NBUCKETS; b++) {
+			atomic64_set(&q->lat_us[b], 0);
+			atomic64_set(&q->seen_kb[b], 0);
+		}
+	}
+}
+
 static void io_dma_lat_show_one(struct seq_file *m, const char *name,
 				struct io_dma_lat_stats *s)
 {
@@ -1051,8 +1195,6 @@ static ssize_t io_dma_lat_reset_write(struct file *file,
 
 	io_dma_lat_reset(&io_dma_lat_dma);
 	io_dma_lat_reset(&io_dma_lat_cpu);
-	for (i = 0; i < IO_DMA_FMW_NR; i++)
-		atomic64_set(&io_dma_fmw[i], 0);
 	io_dma_lat_reset(&io_dma_lat_call);
 	for (i = 0; i < IO_DMA_CHUNKS_HIST; i++)
 		atomic64_set(&io_dma_chunks_hist[i], 0);
@@ -1061,6 +1203,9 @@ static ssize_t io_dma_lat_reset_write(struct file *file,
 	atomic64_set(&io_dma_drain_cycles, 0);
 	for (i = 0; i < IO_DMA_FM_NR; i++)
 		atomic64_set(&io_dma_fm[i], 0);
+	for (i = 0; i < IO_DMA_FMW_NR; i++)
+		atomic64_set(&io_dma_fmw[i], 0);
+	io_dma_qstat_reset();
 	return count;
 }
 
@@ -1336,6 +1481,8 @@ static const struct file_operations io_dma_poll_kick_fops = {
 
 void io_dma_debugfs_init(void)
 {
+	debugfs_create_file("io_uring_dma_chan_qstat", 0444, NULL, NULL,
+			    &io_dma_chan_qstat_fops);
 	debugfs_create_file("io_uring_dma_latency", 0444, NULL, NULL,
 			    &io_dma_lat_fops);
 	debugfs_create_file("io_uring_dma_latency_reset", 0200, NULL, NULL,
@@ -2095,6 +2242,7 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 		 */
 		return -EAGAIN;
 	}
+	io_dma_qstat_submit(req->ctx->dma.chan, dma->len);
 
 	/* Take folio refs for DMA duration (page-cache sources only; skb kvec
 	 * sources are kept alive by the deferred cb_fn at dma_refcnt == 0).
@@ -2599,6 +2747,7 @@ static ssize_t io_dma_submit_batch_sg(struct io_kiocb *req, struct device *dev,
 		io_dma_task_free(req->ctx, dma);
 		return -EAGAIN;	/* full shared WQ etc.: CPU-copy fallback */
 	}
+	io_dma_qstat_submit(req->ctx->dma.chan, dma->len);
 
 	io_dma_task_link(req, dma);
 
@@ -2823,6 +2972,7 @@ static ssize_t io_dma_submit_single_entry(struct io_kiocb *req,
 		io_dma_task_free(req->ctx, dma);
 		return -EAGAIN;	/* full shared WQ etc.: CPU-copy fallback */
 	}
+	io_dma_qstat_submit(req->ctx->dma.chan, dma->len);
 
 	io_dma_task_link(req, dma);
 
@@ -3183,6 +3333,13 @@ struct io_dma_fmw_folio {
 	unsigned int map_len;
 };
 
+/* One in-flight write descriptor, carrying what qstat accounting needs. */
+struct io_dma_fmw_ck {
+	dma_cookie_t ck;
+	unsigned int len;
+	u64 submit_ns;
+};
+
 /*
  * Poll every outstanding cookie to completion.  Sets *redo on any
  * DMA_ERROR.  Returns 0, or -ETIMEDOUT with cookies possibly still in
@@ -3195,21 +3352,27 @@ struct io_dma_fmw_folio {
  * application heartbeats at O(100) shared rings.  Back off to sleeping
  * once the fast path misses.
  */
-static int io_dma_fmw_wait(struct dma_chan *chan, dma_cookie_t *cookies,
+static int io_dma_fmw_wait(struct dma_chan *chan, struct io_dma_fmw_ck *cookies,
 			   unsigned int *nr, bool *redo)
 {
 	unsigned long deadline = jiffies + msecs_to_jiffies(IO_DMA_FMW_WAIT_MS);
 	u64 spin_end = ktime_get_ns() +
 		READ_ONCE(io_dma_fmw_spin_us) * NSEC_PER_USEC;
-	unsigned int i, spins;
+	unsigned int i, j, spins;
 
 	for (i = 0; i < *nr; i++) {
 		enum dma_status st;
 
 		spins = 0;
-		while ((st = dmaengine_async_is_tx_complete(chan, cookies[i]))
+		while ((st = dmaengine_async_is_tx_complete(chan, cookies[i].ck))
 		       == DMA_IN_PROGRESS) {
 			if (time_after(jiffies, deadline)) {
+				/* Wedged: retire the qstat in-flight bytes
+				 * (the descriptors are leaked/fenced by the
+				 * caller), no latency samples. */
+				for (j = i; j < *nr; j++)
+					io_dma_qstat_complete(chan,
+							cookies[j].len, 0);
 				*nr = 0;
 				return -ETIMEDOUT;
 			}
@@ -3223,6 +3386,12 @@ static int io_dma_fmw_wait(struct dma_chan *chan, dma_cookie_t *cookies,
 		}
 		if (st != DMA_COMPLETE)
 			*redo = true;
+		/* Latency is poll-observation time: cookies are polled in
+		 * order, so a later cookie's sample can be inflated by up
+		 * to the earlier polls -- fine at histogram resolution. */
+		io_dma_qstat_complete(chan, cookies[i].len,
+				      st == DMA_COMPLETE ?
+						cookies[i].submit_ns : 0);
 	}
 	*nr = 0;
 	return 0;
@@ -3244,7 +3413,7 @@ ssize_t io_dma_filemap_write(struct io_kiocb *req, struct kiocb *iocb,
 	size_t max_chunk = min_t(size_t, mapping_max_folio_size(mapping),
 				 io_dma_map_quantum(chan->device->dev));
 	struct io_dma_fmw_folio *fol = NULL;
-	dma_cookie_t *cookies = NULL;
+	struct io_dma_fmw_ck *cookies = NULL;
 	unsigned int nr_fol = 0, nr_cookies = 0, max_fol, max_cookies, i;
 	ssize_t want, written = 0, err = 0;
 	bool redo = false;
@@ -3378,10 +3547,16 @@ ssize_t io_dma_filemap_write(struct io_kiocb *req, struct kiocb *iocb,
 				}
 			} else {
 				ck = dmaengine_submit(tx);
-				if (dma_submit_error(ck))
+				if (dma_submit_error(ck)) {
 					redo = true;
-				else
-					cookies[nr_cookies++] = ck;
+				} else {
+					cookies[nr_cookies++] =
+						(struct io_dma_fmw_ck){
+							.ck = ck, .len = len,
+							.submit_ns = ktime_get_ns(),
+						};
+					io_dma_qstat_submit(chan, len);
+				}
 				if (nr_cookies == max_cookies) {
 					dma_async_issue_pending(chan);
 					wedged = io_dma_fmw_wait(chan, cookies,
@@ -3535,6 +3710,8 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
 			 task_len, ret, dma->is_batch);
 		req->dma.dma_result = -EFAULT;
 	}
+
+	io_dma_qstat_complete(req->ctx->dma.chan, task_len, dma->submit_ns);
 
 	/* Free the task before touching refcnt -- task_len saved above */
 	io_dma_task_free(req->ctx, dma);
