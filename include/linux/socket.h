@@ -89,6 +89,7 @@ struct msghdr {
 	bool		msg_get_inq : 1;/* return INQ after receive */
 	unsigned int	msg_flags;	/* flags on received message */
 	__kernel_size_t	msg_controllen;	/* ancillary data buffer length */
+	struct io_kiocb *msg_io_iocb;	/* io_uring request for DMA-offloaded recv */
 	struct ubuf_info *msg_ubuf;
 	int (*sg_from_iter)(struct sk_buff *skb,
 			    struct iov_iter *from, size_t length);

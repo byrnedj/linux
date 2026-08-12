@@ -651,8 +651,8 @@ static inline void io_rw_done(struct io_kiocb *req, ssize_t ret)
 		io_complete_rw(&rw->kiocb, ret);
 }
 
-static int kiocb_done(struct io_kiocb *req, ssize_t ret,
-		      struct io_br_sel *sel, unsigned int issue_flags)
+int kiocb_done(struct io_kiocb *req, ssize_t ret, struct io_br_sel *sel,
+		       unsigned int issue_flags)
 {
 	struct io_rw *rw = io_kiocb_to_cmd(req, struct io_rw);
 	unsigned final_ret = io_fixup_rw_res(req, ret);
@@ -922,6 +922,7 @@ static int __io_read(struct io_kiocb *req, struct io_br_sel *sel,
 	struct io_async_rw *io = req->async_data;
 	struct kiocb *kiocb = &rw->kiocb;
 	ssize_t ret;
+	int ret2;
 	loff_t *ppos;
 
 	if (req->flags & REQ_F_IMPORT_BUFFER) {
@@ -954,15 +955,71 @@ static int __io_read(struct io_kiocb *req, struct io_br_sel *sel,
 	if (unlikely(ret))
 		return ret;
 
-	ret = io_iter_do_read(rw, &io->iter);
+	/* DMA-offloaded page cache read for registered buffers.
+	 * Bypass generic_file_read_iter() and read directly from the
+	 * page cache, submitting DMA copies to the registered buffer.
+	 */
+	if (!IS_ERR_OR_NULL(req->ctx->dma.chan) &&
+	    (req->flags & REQ_F_ISREG) &&
+	    (req->flags & REQ_F_BUF_NODE) && req->buf_node &&
+	    req->buf_node->buf->dma_addrs &&
+	    iov_iter_is_bvec(&io->iter) &&
+	    !(kiocb->ki_flags & IOCB_DIRECT)) {
+		io_uring_dma_prep(req);
+		req->dma.dst_user_addr = rw->addr;
 
-	/*
+		ret = io_dma_filemap_read(req, kiocb, rw->addr);
+
+		if (ret > 0 && req->dma.dma_refcnt > 0) {
+			req->dma.saved_res = ret;
+			req->dma.saved_cflags = 0;
+			ret2 = io_dma_submit_queued_tasks(req);
+			if (ret2 == -EIOCBQUEUED)
+				return IOU_ISSUE_SKIP_COMPLETE;
+		}
+		if (ret > 0)
+			goto done;
+		/* On failure, fall through to normal read path */
+		req->dma.dma_active = false;
+	}
+
+	/* Set up DMA copy offload for socket reads.
+	 * Pass io_kiocb via kiocb->private so sock_read_iter()
+	 * can forward it to msg.msg_io_iocb for tcp_recvmsg().
+	 */
+	if (force_nonblock && !IS_ERR_OR_NULL(req->ctx->dma.chan)) {
+		io_uring_dma_prep(req);
+		req->dma.dst_user_addr = rw->addr;
+		kiocb->private = req;
+	} else {
+		kiocb->private = NULL;
+	}
+
+	ret = io_iter_do_read(rw, &io->iter);
+	
+        /*
 	 * Some file systems like to return -EOPNOTSUPP for an IOCB_NOWAIT
 	 * issue, even though they should be returning -EAGAIN. To be safe,
 	 * retry from blocking context for either.
 	 */
 	if (ret == -EOPNOTSUPP && force_nonblock)
 		ret = -EAGAIN;
+
+
+	if (ret >= 0) {
+		/* Pre-compute CQE result for DMA completion path.
+		 * Must happen BEFORE io_dma_submit_queued_tasks() because
+		 * DMA can complete synchronously during submit.
+		 */
+		if (!IS_ERR_OR_NULL(req->ctx->dma.chan) && req->dma.dma_active) {
+			req->dma.saved_res = ret;
+			req->dma.saved_cflags = 0;
+		}
+		ret2 = io_dma_submit_queued_tasks(req);
+		if (ret2 < 0) {
+			ret = ret2;
+		}
+	}
 
 	if (ret == -EAGAIN) {
 		/* If we can poll, just do that. */

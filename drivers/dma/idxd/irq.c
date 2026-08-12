@@ -334,12 +334,13 @@ static void process_evl_entry(struct idxd_device *idxd,
 			fault = kmem_cache_alloc(idxd->evl_cache, GFP_ATOMIC);
 			if (fault) {
 				struct idxd_wq *wq = idxd->wqs[entry_head->wq_idx];
+				struct workqueue_struct *work_q = wq->wq ? wq->wq : idxd->wq;
 
 				fault->wq = wq;
 				fault->status = status;
 				memcpy(&fault->entry, entry_head, ent_size);
 				INIT_WORK(&fault->work, idxd_evl_fault_work);
-				queue_work(wq->wq, &fault->work);
+				queue_work(work_q, &fault->work);
 			} else {
 				dev_warn(dev, "Failed to service fault work.\n");
 			}
@@ -648,7 +649,7 @@ static void irq_process_work_list(struct idxd_irq_entry *irq_entry)
 
 	spin_unlock(&irq_entry->list_lock);
 
-	list_for_each_entry_safe(desc, n, &flist, list) {
+	list_for_each_entry(desc, &flist, list) {
 		/*
 		 * Check against the original status as ABORT is software defined
 		 * and 0xff, which DSA_COMP_STATUS_MASK can mask out.

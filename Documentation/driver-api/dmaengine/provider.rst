@@ -162,6 +162,16 @@ Currently, the types available are:
 
   - The device is able to do memory to memory copies
 
+- - DMA_MEMCPY_SG
+
+  - The device supports memory to memory scatter-gather transfers.
+
+  - Even though a plain memcpy can look like a particular case of a
+    scatter-gather transfer, with a single chunk to copy, it's a distinct
+    transaction type in the mem2mem transfer case. This is because some very
+    simple devices might be able to do contiguous single-chunk memory copies,
+    but have no support for more complex SG transfers.
+
   - No matter what the overall size of the combined chunks for source and
     destination is, only as many bytes as the smallest of the two will be
     transmitted. That means the number and size of the scatter-gather buffers in
@@ -259,22 +269,6 @@ Currently, the types available are:
   - It's usually used for 2d content transfers, in which case you
     want to transfer a portion of uncompressed data directly to the
     display to print it
-
-- DMA_COMPLETION_NO_ORDER
-
-  - The device does not support in order completion.
-
-  - The driver should return DMA_OUT_OF_ORDER for device_tx_status if
-    the device is setting this capability.
-
-  - All cookie tracking and checking API should be treated as invalid if
-    the device exports this capability.
-
-  - At this point, this is incompatible with polling option for dmatest.
-
-  - If this cap is set, the user is recommended to provide an unique
-    identifier for each descriptor sent to the DMA device in order to
-    properly track the completion.
 
 - DMA_REPEAT
 
@@ -419,7 +413,9 @@ supported.
 
     - tx_submit: A pointer to a function you have to implement,
       that is supposed to push the current transaction descriptor to a
-      pending queue, waiting for issue_pending to be called.
+      pending queue, waiting for issue_pending to be called. Each
+      descriptor is given a cookie to identify it. See the section
+      "Cookie Management" below.
 
     - phys: Physical address of the descriptor which is used later by
       the dma engine to read the descriptor and initiate transfer.
@@ -465,9 +461,6 @@ supported.
 
   - In the case of a cyclic transfer, it should only take into
     account the total size of the cyclic buffer.
-
-  - Should return DMA_OUT_OF_ORDER if the device does not support in order
-    completion and is completing the operation out of order.
 
   - This function can be called in an interrupt context.
 
@@ -533,6 +526,40 @@ supported.
 
   - May sleep.
 
+Cookie Management
+------------------
+
+When a transaction is queued for submission via tx_submit(), the provider
+must assign that transaction a cookie (dma_cookie_t) to uniquely identify it.
+The provider is allowed to perform this assignment however it wants, but for
+convenience the following utility functions are available to create
+monotonically increasing cookies
+
+  .. code-block:: c
+
+    void dma_cookie_init(struct dma_chan *chan);
+
+  Called once at channel creation
+
+  .. code-block:: c
+
+    dma_cookie_t dma_cookie_assign(struct dma_async_tx_descriptor *tx);
+
+  Assign a cookie to the given descriptor
+
+  .. code-block:: c
+
+    void dma_cookie_complete(struct dma_async_tx_descriptor *tx);
+
+  Mark the descriptor as complete and invalidate the cookie
+
+  .. code-block:: c
+
+    enum dma_status dma_cookie_status(struct dma_chan *chan,
+      dma_cookie_t cookie, struct dma_tx_state *state);
+
+  Report the status of the cookie and filling in state, if not NULL.
+
 
 Misc notes
 ==========
@@ -550,10 +577,10 @@ where to put them)
 
 dma_cookie_t
 
-- it's a DMA transaction ID that will increment over time.
+- it's a DMA transaction ID.
 
-- Not really relevant any more since the introduction of ``virt-dma``
-  that abstracts it away.
+- The value can be chosen by the provider, or use the helper APIs
+  such as dma_cookie_assign() and dma_cookie_complete().
 
 dma_vec
 

@@ -287,6 +287,7 @@
 #include <net/hotdata.h>
 #include <trace/events/tcp.h>
 #include <net/rps.h>
+#include <linux/io_uring.h>
 
 #include "../core/devmem.h"
 
@@ -1611,13 +1612,15 @@ void tcp_cleanup_rbuf(struct sock *sk, int copied)
 	__tcp_cleanup_rbuf(sk, copied);
 }
 
-static void tcp_eat_recv_skb(struct sock *sk, struct sk_buff *skb)
+static void tcp_eat_recv_skb(struct sock *sk, struct sk_buff *skb, bool free)
 {
 	__skb_unlink(skb, &sk->sk_receive_queue);
 	if (likely(skb->destructor == sock_rfree)) {
 		sock_rfree(skb);
 		skb->destructor = NULL;
 		skb->sk = NULL;
+		if (!free)
+			return;
 		return skb_attempt_defer_free(skb);
 	}
 	__kfree_skb(skb);
@@ -1642,7 +1645,7 @@ struct sk_buff *tcp_recv_skb(struct sock *sk, u32 seq, u32 *off)
 		 * splitted a fat GRO packet, while we released socket lock
 		 * in skb_splice_bits()
 		 */
-		tcp_eat_recv_skb(sk, skb);
+		tcp_eat_recv_skb(sk, skb, true);
 	}
 	return NULL;
 }
@@ -1712,11 +1715,11 @@ static int __tcp_read_sock(struct sock *sk, read_descriptor_t *desc,
 				continue;
 		}
 		if (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN) {
-			tcp_eat_recv_skb(sk, skb);
+			tcp_eat_recv_skb(sk, skb, true);
 			++seq;
 			break;
 		}
-		tcp_eat_recv_skb(sk, skb);
+		tcp_eat_recv_skb(sk, skb, true);
 		if (!desc->count)
 			break;
 		WRITE_ONCE(*copied_seq, seq);
@@ -1804,11 +1807,11 @@ void tcp_read_done(struct sock *sk, size_t len)
 			break;
 
 		if (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN) {
-			tcp_eat_recv_skb(sk, skb);
+			tcp_eat_recv_skb(sk, skb, true);
 			++seq;
 			break;
 		}
-		tcp_eat_recv_skb(sk, skb);
+		tcp_eat_recv_skb(sk, skb, true);
 	}
 	WRITE_ONCE(tp->copied_seq, seq);
 
@@ -2644,6 +2647,98 @@ out:
 	return sent;
 }
 
+static int printkvec(struct sk_buff *skb, int off, int len, struct kvec *kvec)
+{
+	int start = skb_headlen(skb);
+	int copy = start - off;
+	int i;
+	int n = 0;
+	struct sk_buff *frag_iter;
+	struct kvec *saved_kvec = kvec;
+
+	/*
+	 * Advance kvec only when we actually write a slot. Previous version
+	 * indexed frags as kvec[i] and did "kvec += i" after the loop, which
+	 * left uninitialized slots whenever the linear region was bypassed
+	 * (off >= headlen) or leading frags were skipped (end <= off). The
+	 * per-CPU backing kvec then delivered stale iov_base pointers that
+	 * could land inside a recycled slab object (e.g., task_struct),
+	 * tripping usercopy hardening during copy_to_iter.
+	 */
+	if (copy > 0) {
+		if (copy > len)
+			copy = len;
+
+		kvec->iov_base = skb->data + off;
+		kvec->iov_len = copy;
+
+		if ((len -= copy) == 0)
+			return 1;
+		off += copy;
+		kvec++;
+	}
+
+
+	for (i = 0; len && i < skb_shinfo(skb)->nr_frags; i++) {
+		int end;
+		const skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
+
+		end = start + skb_frag_size(frag);
+
+
+		if ((copy = end - off) > 0) {
+			struct page *page = skb_frag_page(frag);
+			u8 *vaddr = kmap_local_page(page);
+
+			if (copy > len)
+				copy = len;
+
+			kvec->iov_base = vaddr + skb_frag_off(frag) + off - start;
+			kvec->iov_len = copy;
+			kvec++;
+			off += copy;
+			kunmap_local(vaddr);
+			len -= copy;
+		}
+		start = end;
+	}
+
+	skb_walk_frags(skb, frag_iter) {
+		int end;
+
+		WARN_ON(start > off + len);
+
+
+		end = start + frag_iter->len;
+		if ((copy = end - off) > 0) {
+			if (copy > len)
+				copy = len;
+
+			n = printkvec(frag_iter, off - start, copy, kvec);
+
+			off += copy;
+			kvec += n;
+			if ((len -= copy) == 0)
+				break;
+
+		}
+		start = end;
+
+	}
+
+	return kvec - saved_kvec;
+}
+
+static void cb_fn(struct kiocb *kiocb, void *arg, int err)
+{
+	struct sk_buff *skb = arg;
+
+	skb_attempt_defer_free(skb);
+}
+
+#define KVEC_MAX 256
+static DEFINE_PER_CPU(struct kvec[KVEC_MAX], tcp_recv_kvec);
+
 /*
  *	This routine copies from a sock struct into the user buffer.
  *
@@ -2726,11 +2821,22 @@ static int tcp_recvmsg_locked(struct sock *sk, struct msghdr *msg, size_t len,
 			/* Now that we have two receive queues this
 			 * shouldn't happen.
 			 */
+			if (0) {
 			if (WARN(before(*seq, TCP_SKB_CB(skb)->seq),
 				 "TCP recvmsg seq # bug: copied %X, seq %X, rcvnxt %X, fl %X\n",
 				 *seq, TCP_SKB_CB(skb)->seq, tp->rcv_nxt,
 				 flags))
 				break;
+			}
+
+			/* Convert to printk to avoid backtrace() */
+			if (before(*seq, TCP_SKB_CB(skb)->seq)) {
+
+				 printk(KERN_ERR "TCP recvmsg seq # bug: copied %X, seq %X, rcvnxt %X, fl %X\n",
+				 *seq, TCP_SKB_CB(skb)->seq, tp->rcv_nxt,
+				 flags);
+				break;
+			}
 
 			offset = *seq - TCP_SKB_CB(skb)->seq;
 			if (unlikely(TCP_SKB_CB(skb)->tcp_flags & TCPHDR_SYN)) {
@@ -2837,8 +2943,51 @@ found_ok_skb:
 				break;
 
 			if (skb_frags_readable(skb)) {
-				err = skb_copy_datagram_msg(skb, offset, msg,
-							    used);
+				/*
+				 * Only take the DMA-iocb path when we will fully
+				 * consume this skb (used + offset == skb->len).
+				 * The DMA path transfers skb ownership from TCP
+				 * to the DMA engine via tcp_eat_recv_skb(free=false)
+				 * — that assumes the remaining skb data won't be
+				 * needed later. For a partial read (user iov
+				 * smaller than remaining skb bytes), fall back to
+				 * a plain CPU copy so the skb stays on the receive
+				 * queue for the next recvmsg to continue from.
+				 */
+				if (msg->msg_io_iocb && used + offset == skb->len) {
+					struct iov_iter src;
+					struct kvec *kv;
+					int kvec_len;
+					size_t avail = iov_iter_count(&msg->msg_iter);
+
+					pr_debug("tcp_recvmsg: used=%zu avail=%zu flags=0x%x\n",
+						 (size_t)used, avail, flags);
+
+					get_cpu();
+					kv = this_cpu_ptr(tcp_recv_kvec);
+					kvec_len = printkvec(skb, offset, used, kv);
+					iov_iter_kvec(&src, READ, kv, kvec_len, used);
+					put_cpu();
+
+					pr_debug("tcp_recvmsg: kvec_len=%d\n", kvec_len);
+
+					err = io_uring_copy_to_iter((struct kiocb *)msg->msg_io_iocb, &msg->msg_iter,
+							&src, cb_fn, skb, 0);
+					/* io_uring_copy_to_iter returns positive byte count
+					 * on success, but the error check below expects 0.
+					 */
+					if (err > 0)
+						err = 0;
+
+					pr_debug("tcp_recvmsg: io_uring_copy ret=%d avail_after=%zu\n",
+						 err, iov_iter_count(&msg->msg_iter));
+
+				} else {
+					/* Pure CPU copy: either no iocb, or a partial
+					 * skb read that must keep the skb on the queue.
+					 */
+					err = skb_copy_datagram_msg(skb, offset, msg, used);
+				}
 				if (err) {
 					/* Exception. Bailout! */
 					if (!copied)
@@ -2890,20 +3039,31 @@ skip_copy:
 			*cmsg_flags |= TCP_CMSG_TS;
 		}
 
+		/*
+		 * If we only consumed part of the skb, leave it on the queue
+		 * so the next loop iteration (or the next recvmsg call) can
+		 * pick up where we left off. The DMA-iocb branch is only
+		 * entered when used + offset == skb->len (see above), so we
+		 * never transfer a partially-read skb to the DMA engine.
+		 */
 		if (used + offset < skb->len)
 			continue;
 
 		if (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN)
 			goto found_fin_ok;
 		if (!(flags & MSG_PEEK))
-			tcp_eat_recv_skb(sk, skb);
-		continue;
+			tcp_eat_recv_skb(sk, skb, !msg->msg_io_iocb);
+
+		if (!msg->msg_io_iocb)
+			continue;
+		else
+			break;
 
 found_fin_ok:
 		/* Process the FIN. */
 		WRITE_ONCE(*seq, *seq + 1);
 		if (!(flags & MSG_PEEK))
-			tcp_eat_recv_skb(sk, skb);
+			tcp_eat_recv_skb(sk, skb, !msg->msg_io_iocb);
 		break;
 	} while (len > 0);
 
@@ -3161,7 +3321,7 @@ void __tcp_close(struct sock *sk, long timeout)
 			end_seq--;
 		if (after(end_seq, tcp_sk(sk)->copied_seq))
 			data_was_unread = true;
-		tcp_eat_recv_skb(sk, skb);
+		tcp_eat_recv_skb(sk, skb, true);
 	}
 
 	/* If socket has been already reset (e.g. in tcp_reset()) - kill it. */
