@@ -656,6 +656,8 @@ enum {
 	IO_DMA_FM_NR,
 };
 void io_dma_fm_record(unsigned int reason);
+void io_dma_qstat_forget(struct dma_chan *chan);
+void io_dma_dev_stat_release(struct device *dev);
 extern unsigned int io_dma_stripe_chans;
 void io_pfn_cache_prepare(struct dma_chan *chan);
 int kiocb_done(struct io_kiocb *req, ssize_t ret, struct io_br_sel *sel, unsigned int issue_flags);
