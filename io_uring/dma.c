@@ -626,6 +626,315 @@ static void io_dma_lat_record(struct io_dma_lat_stats *s, size_t len, u64 ns)
 	atomic64_add(ns, &s->sum_ns[b]);
 }
 
+/*
+ * Per-channel queueing diagnostics for the channel-sharing design
+ * work.  seen_kb is the number of bytes already in flight on the
+ * channel at each submit, meaning the queue the op joins, in log2 KB
+ * buckets.  lat_us is the submit-to-complete latency the op then
+ * experienced, in log2 us buckets, and it includes service time and
+ * detection.  There is also an in-flight high-water mark.  Bucket 0 is
+ * "<1", bucket k is [2^(k-1), 2^k), and the last bucket is the
+ * catch-all.  The registry is lockless and in submission order, like
+ * io_pfn_cache_devs.  The stats are dumped via io_uring_dma_chan_qstat
+ * and the counters, but not the live in-flight bytes, are cleared by
+ * latency_reset.
+ */
+#define IO_DMA_STAT_DEVS	16
+#define IO_DMA_STAT_CHANS	8
+#define IO_DMA_QSTAT_NBUCKETS	16
+
+struct io_dma_chan_qstat {
+	struct dma_chan	*chan;		/* identity only, may be stale after
+					 * a WQ reconfig, never dereference
+					 */
+	bool		released;	/* ghost: keeps its counters readable
+					 * until the slot is reused or reset
+					 */
+	char		name[24];	/* captured at registration */
+	atomic64_t	inflight;	/* bytes submitted, not yet completed */
+	atomic64_t	hwm;		/* max in-flight bytes seen */
+	atomic64_t	submits;
+	atomic64_t	bytes;
+	atomic64_t	lat_us[IO_DMA_QSTAT_NBUCKETS];
+	atomic64_t	seen_kb[IO_DMA_QSTAT_NBUCKETS];
+};
+/*
+ * One registry, keyed by device, holding that device's channels. A
+ * channel knows its device, so the submit and complete hooks resolve
+ * the device slot once and then index the channel within it, instead
+ * of scanning two independent tables. Both keys are stored for
+ * identity only and are never dereferenced after registration.
+ */
+struct io_dma_dev_stat {
+	void		*key;		/* dma_device, identity only */
+	char		name[24];	/* captured at registration */
+	struct io_dma_chan_qstat chans[IO_DMA_STAT_CHANS];
+};
+static struct io_dma_dev_stat io_dma_dev_stats[IO_DMA_STAT_DEVS];
+
+static struct io_dma_dev_stat *io_dma_dev_stat_get(struct dma_chan *chan)
+{
+	void *key = chan->device;
+	int i;
+
+	for (i = 0; i < IO_DMA_STAT_DEVS; i++) {
+		void *k = READ_ONCE(io_dma_dev_stats[i].key);
+
+		if (k == key)
+			return &io_dma_dev_stats[i];
+		if (!k) {
+			if (!cmpxchg(&io_dma_dev_stats[i].key, NULL, key)) {
+				/* We claimed the slot and the device is live
+				 * here since we are on its submit path.
+				 * Racing readers may see a partial name but
+				 * never a stale pointer.
+				 */
+				strscpy(io_dma_dev_stats[i].name,
+					dev_name(chan->device->dev),
+					sizeof(io_dma_dev_stats[i].name));
+				return &io_dma_dev_stats[i];
+			}
+			if (READ_ONCE(io_dma_dev_stats[i].key) == key)
+				return &io_dma_dev_stats[i];
+		}
+	}
+	return NULL;	/* The registry is full, so the op is uncounted. */
+}
+
+static DEFINE_SPINLOCK(io_dma_stat_slot_lock);
+
+static void io_dma_qstat_zero(struct io_dma_chan_qstat *q)
+{
+	int b;
+
+	atomic64_set(&q->submits, 0);
+	atomic64_set(&q->bytes, 0);
+	atomic64_set(&q->inflight, 0);
+	atomic64_set(&q->hwm, 0);
+	for (b = 0; b < IO_DMA_QSTAT_NBUCKETS; b++) {
+		atomic64_set(&q->lat_us[b], 0);
+		atomic64_set(&q->seen_kb[b], 0);
+	}
+}
+
+/*
+ * A released channel's slot stays behind as a ghost so its counters
+ * remain readable after the last ring exits, which is when they are
+ * usually read. The slot is reclaimed when a new channel needs one and
+ * no empty slot remains, and freed by latency_reset. A recycled
+ * dma_chan allocation that lands on its old ghost is a new channel, so
+ * the ghost's counters are cleared rather than inherited. Slot state
+ * transitions are rare and take a lock; the fast path is the lock-free
+ * pointer match on a live slot.
+ */
+static struct io_dma_chan_qstat *io_dma_qstat_get(struct io_dma_dev_stat *d,
+						  struct dma_chan *chan)
+{
+	struct io_dma_chan_qstat *hole, *ghost, *q;
+	int i;
+
+	for (i = 0; i < IO_DMA_STAT_CHANS; i++) {
+		struct io_dma_chan_qstat *c = &d->chans[i];
+
+		if (READ_ONCE(c->chan) == chan && !READ_ONCE(c->released))
+			return c;
+	}
+
+	spin_lock(&io_dma_stat_slot_lock);
+	hole = ghost = NULL;
+	q = NULL;
+	for (i = 0; i < IO_DMA_STAT_CHANS; i++) {
+		struct io_dma_chan_qstat *c = &d->chans[i];
+		struct dma_chan *cc = READ_ONCE(c->chan);
+
+		if (cc == chan) {
+			q = c;
+			break;
+		}
+		if (!cc && !hole)
+			hole = c;
+		if (cc && READ_ONCE(c->released) && !ghost)
+			ghost = c;
+	}
+	if (q) {
+		/* A recycled allocation reusing its old address. */
+		if (READ_ONCE(q->released)) {
+			io_dma_qstat_zero(q);
+			WRITE_ONCE(q->released, false);
+		}
+	} else if (hole || ghost) {
+		q = hole ? hole : ghost;
+		io_dma_qstat_zero(q);
+		WRITE_ONCE(q->released, false);
+		strscpy(q->name, dma_chan_name(chan), sizeof(q->name));
+		WRITE_ONCE(q->chan, chan);
+	}
+	spin_unlock(&io_dma_stat_slot_lock);
+	return q;
+}
+
+/*
+ * Called when the last ring sharing a channel releases it, with the
+ * channel drained and still valid. The slot becomes a ghost rather
+ * than being cleared, so a run's counters survive the run's rings.
+ */
+void io_dma_qstat_forget(struct dma_chan *chan)
+{
+	int i, j;
+
+	for (i = 0; i < IO_DMA_STAT_DEVS; i++) {
+		struct io_dma_dev_stat *d = &io_dma_dev_stats[i];
+
+		if (READ_ONCE(d->key) != chan->device)
+			continue;
+		for (j = 0; j < IO_DMA_STAT_CHANS; j++) {
+			struct io_dma_chan_qstat *q = &d->chans[j];
+
+			if (READ_ONCE(q->chan) == chan)
+				WRITE_ONCE(q->released, true);
+		}
+		return;
+	}
+}
+
+static unsigned int io_dma_qstat_bucket(u64 v)
+{
+	return v ? min_t(unsigned int, ilog2(v) + 1,
+			 IO_DMA_QSTAT_NBUCKETS - 1) : 0;
+}
+
+static void io_dma_qstat_submit(struct dma_chan *chan, u32 len)
+{
+	struct io_dma_dev_stat *d = io_dma_dev_stat_get(chan);
+	struct io_dma_chan_qstat *q;
+	u64 now, hwm;
+
+	if (!d)
+		return;
+	q = io_dma_qstat_get(d, chan);
+	if (!q)
+		return;
+	atomic64_inc(&q->seen_kb[io_dma_qstat_bucket(
+					atomic64_read(&q->inflight) >> 10)]);
+	atomic64_inc(&q->submits);
+	atomic64_add(len, &q->bytes);
+	now = atomic64_add_return(len, &q->inflight);
+	hwm = atomic64_read(&q->hwm);
+	while (now > hwm) {
+		u64 old = atomic64_cmpxchg(&q->hwm, hwm, now);
+
+		if (old == hwm)
+			break;
+		hwm = old;
+	}
+}
+
+static void io_dma_qstat_complete(struct dma_chan *chan, u32 len, u64 submit_ns)
+{
+	struct io_dma_dev_stat *d = io_dma_dev_stat_get(chan);
+	struct io_dma_chan_qstat *q;
+
+	if (!d)
+		return;
+	q = io_dma_qstat_get(d, chan);
+	if (!q)
+		return;
+	atomic64_sub(len, &q->inflight);
+	if (!submit_ns)
+		return;
+	atomic64_inc(&q->lat_us[io_dma_qstat_bucket(
+			div_u64(ktime_get_ns() - submit_ns, NSEC_PER_USEC))]);
+}
+
+/*
+ * Retire the qstat and devload accounting for a task that ring teardown
+ * abandons without a hardware completion. Without this, the machine
+ * global in-flight counters drift upward on every hung-hardware drain
+ * and the per-device budget eventually refuses all DMA.
+ */
+void io_dma_qstat_task_abandon(struct io_ring_ctx *ctx, struct io_dma_task *dma)
+{
+	if (!IS_ERR_OR_NULL(ctx->dma.chan))
+		io_dma_qstat_complete(ctx->dma.chan, dma->len, 0);
+}
+
+static int io_dma_chan_qstat_show(struct seq_file *m, void *v)
+{
+	int i, j, b;
+
+	for (i = 0; i < IO_DMA_STAT_DEVS; i++) {
+		struct io_dma_dev_stat *d = &io_dma_dev_stats[i];
+
+		if (!READ_ONCE(d->key))
+			break;
+		for (j = 0; j < IO_DMA_STAT_CHANS; j++) {
+			struct io_dma_chan_qstat *q = &d->chans[j];
+			struct dma_chan *chan = READ_ONCE(q->chan);
+
+			/* Released channels leave holes. */
+			if (!chan)
+				continue;
+			if (!atomic64_read(&q->submits))
+				continue;	/* idle or a pre-reconfig leftover */
+			seq_printf(m, "%s submits %llu bytes_mb %llu inflight_kb %llu hwm_kb %llu\n",
+				   q->name,
+				   (u64)atomic64_read(&q->submits),
+				   (u64)atomic64_read(&q->bytes) >> 20,
+				   (u64)atomic64_read(&q->inflight) >> 10,
+				   (u64)atomic64_read(&q->hwm) >> 10);
+			seq_puts(m, "  lat_us");
+			for (b = 0; b < IO_DMA_QSTAT_NBUCKETS; b++)
+				seq_printf(m, " %llu", (u64)atomic64_read(&q->lat_us[b]));
+			seq_puts(m, "\n  seen_kb");
+			for (b = 0; b < IO_DMA_QSTAT_NBUCKETS; b++)
+				seq_printf(m, " %llu", (u64)atomic64_read(&q->seen_kb[b]));
+			seq_puts(m, "\n");
+		}
+	}
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(io_dma_chan_qstat);
+
+static void io_dma_qstat_reset(void)
+{
+	int i, j, b;
+
+	for (i = 0; i < IO_DMA_STAT_DEVS; i++) {
+		struct io_dma_dev_stat *d = &io_dma_dev_stats[i];
+
+		if (!READ_ONCE(d->key))
+			break;
+		for (j = 0; j < IO_DMA_STAT_CHANS; j++) {
+			struct io_dma_chan_qstat *q = &d->chans[j];
+
+			if (!READ_ONCE(q->chan))
+				continue;
+			/* Reset frees the ghosts of released channels. */
+			if (READ_ONCE(q->released)) {
+				spin_lock(&io_dma_stat_slot_lock);
+				if (READ_ONCE(q->released)) {
+					io_dma_qstat_zero(q);
+					q->name[0] = '\0';
+					WRITE_ONCE(q->released, false);
+					WRITE_ONCE(q->chan, NULL);
+				}
+				spin_unlock(&io_dma_stat_slot_lock);
+				continue;
+			}
+			atomic64_set(&q->submits, 0);
+			atomic64_set(&q->bytes, 0);
+			/* Keep the live in-flight bytes and restart the high-water
+			 * mark from them.
+			 */
+			atomic64_set(&q->hwm, atomic64_read(&q->inflight));
+			for (b = 0; b < IO_DMA_QSTAT_NBUCKETS; b++) {
+				atomic64_set(&q->lat_us[b], 0);
+				atomic64_set(&q->seen_kb[b], 0);
+			}
+		}
+	}
+}
+
 static void io_dma_lat_show_one(struct seq_file *m, const char *name,
 				struct io_dma_lat_stats *s)
 {
@@ -697,6 +1006,9 @@ static ssize_t io_dma_lat_reset_write(struct file *file,
 		atomic64_set(&io_dma_fmw[i], 0);
 	for (i = 0; i < IO_DMA_FM_NR; i++)
 		atomic64_set(&io_dma_fm[i], 0);
+	for (i = 0; i < IO_DMA_FMW_NR; i++)
+		atomic64_set(&io_dma_fmw[i], 0);
+	io_dma_qstat_reset();
 	return count;
 }
 
@@ -713,6 +1025,8 @@ void io_dma_debugfs_init(void)
 
 	dir = debugfs_create_dir("io_uring_dma", NULL);
 
+	debugfs_create_file("chan_qstat", 0444, dir, NULL,
+			    &io_dma_chan_qstat_fops);
 	debugfs_create_u32("cq_poll_us", 0644, dir, &io_dma_cq_poll_us);
 	debugfs_create_u32("fmw_spin_us", 0644, dir, &io_dma_fmw_spin_us);
 	debugfs_create_u32("fmw_wait_ms", 0644, dir, &io_dma_fmw_wait_ms);
@@ -957,6 +1271,7 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 		io_dma_task_free(req->ctx, dma);
 		return -EAGAIN;	/* The WQ may be full. Fall back to CPU copy. */
 	}
+	io_dma_qstat_submit(req->ctx->dma.chan, dma->len);
 
 	/* Take folio references for the duration of the DMA. */
 	for (i = 0; i < nr_entries; i++)
@@ -1030,6 +1345,7 @@ static ssize_t io_dma_submit_single_entry(struct io_kiocb *req,
 		io_dma_task_free(req->ctx, dma);
 		return -EAGAIN;	/* The WQ may be full. Fall back to CPU copy. */
 	}
+	io_dma_qstat_submit(req->ctx->dma.chan, dma->len);
 
 	req->dma.dma_refcnt++;
 
@@ -1401,6 +1717,13 @@ struct io_dma_fmw_folio {
 	unsigned int map_len;
 };
 
+/* One in-flight write descriptor, carrying what qstat accounting needs. */
+struct io_dma_fmw_ck {
+	dma_cookie_t ck;
+	unsigned int len;
+	u64 submit_ns;
+};
+
 /*
  * Poll every outstanding cookie to completion.  Sets *redo on any
  * DMA_ERROR.  Returns 0, or -ETIMEDOUT with cookies possibly still in
@@ -1413,22 +1736,30 @@ struct io_dma_fmw_folio {
  * and starved application heartbeats at O(100) shared rings.
  * Therefore we back off to sleeping once the fast path misses.
  */
-static int io_dma_fmw_wait(struct dma_chan *chan, dma_cookie_t *cookies,
+static int io_dma_fmw_wait(struct dma_chan *chan, struct io_dma_fmw_ck *cookies,
 			   unsigned int *nr, bool *redo)
 {
 	unsigned int wait_ms = READ_ONCE(io_dma_fmw_wait_ms);
 	unsigned long deadline = jiffies + msecs_to_jiffies(wait_ms);
 	u64 spin_end = ktime_get_ns() +
 		READ_ONCE(io_dma_fmw_spin_us) * NSEC_PER_USEC;
-	unsigned int i, spins;
+	unsigned int i, j, spins;
 
 	for (i = 0; i < *nr; i++) {
 		enum dma_status st;
 
 		spins = 0;
-		while ((st = dmaengine_async_is_tx_complete(chan, cookies[i]))
+		while ((st = dmaengine_async_is_tx_complete(chan, cookies[i].ck))
 		       == DMA_IN_PROGRESS) {
 			if (time_after(jiffies, deadline)) {
+				/* We are wedged, so we retire the qstat
+				 * in-flight bytes with no latency samples.
+				 * The descriptors are leaked and fenced by
+				 * the caller.
+				 */
+				for (j = i; j < *nr; j++)
+					io_dma_qstat_complete(chan,
+							cookies[j].len, 0);
 				*nr = 0;
 				return -ETIMEDOUT;
 			}
@@ -1442,6 +1773,14 @@ static int io_dma_fmw_wait(struct dma_chan *chan, dma_cookie_t *cookies,
 		}
 		if (st != DMA_COMPLETE)
 			*redo = true;
+		/* Latency is poll-observation time. Cookies are polled in
+		 * order, so a later cookie's sample can be inflated by up
+		 * to the earlier polls. This is fine at histogram
+		 * resolution.
+		 */
+		io_dma_qstat_complete(chan, cookies[i].len,
+				      st == DMA_COMPLETE ?
+						cookies[i].submit_ns : 0);
 	}
 	*nr = 0;
 	return 0;
@@ -1471,7 +1810,7 @@ static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
 				size_t base, size_t room,
 				struct io_dma_fmw_folio *fol,
 				unsigned int max_fol,
-				dma_cookie_t *cookies,
+				struct io_dma_fmw_ck *cookies,
 				unsigned int max_cookies)
 {
 	struct io_ring_ctx *ctx = req->ctx;
@@ -1616,10 +1955,16 @@ static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
 				}
 			} else {
 				ck = dmaengine_submit(tx);
-				if (dma_submit_error(ck))
+				if (dma_submit_error(ck)) {
 					redo = true;
-				else
-					cookies[nr_cookies++] = ck;
+				} else {
+					cookies[nr_cookies++] =
+						(struct io_dma_fmw_ck){
+							.ck = ck, .len = len,
+							.submit_ns = ktime_get_ns(),
+						};
+					io_dma_qstat_submit(chan, len);
+				}
 				if (nr_cookies == max_cookies) {
 					dma_async_issue_pending(chan);
 					wedged = io_dma_fmw_wait(chan, cookies,
@@ -1738,7 +2083,7 @@ ssize_t io_dma_filemap_write(struct io_kiocb *req, struct kiocb *iocb,
 	struct file *file = iocb->ki_filp;
 	struct inode *inode = file->f_mapping->host;
 	struct io_dma_fmw_folio *fol = NULL;
-	dma_cookie_t *cookies = NULL;
+	struct io_dma_fmw_ck *cookies = NULL;
 	unsigned int max_fol, max_cookies;
 	ssize_t want, written = 0, err = 0;
 
@@ -1888,6 +2233,8 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
 		 */
 		req->dma.min_fail_off = min(req->dma.min_fail_off, dma->off);
 	}
+
+	io_dma_qstat_complete(req->ctx->dma.chan, task_len, dma->submit_ns);
 
 	/* Free the task before touching the refcnt. task_len was saved above. */
 	io_dma_task_free(req->ctx, dma);
@@ -2202,14 +2549,12 @@ out_disarm:
  */
 /*
  * Teardown diagnostic, called from io_ring_exit_work() when the ring's
- * references fail to drop within the timeout. The dump distinguishes the
- * wedge classes before teardown proceeds anyway:
- *
- *  - task(s) on the pending lists: a descriptor stuck DMA_IN_PROGRESS;
- *    every listed task is polled each pass, so any entry may be the
- *    wedged one.
- *  - empty list but nr_req_allocated > 0: a ctx reference held by
- *    something other than DMA.
+ * references fail to drop within the timeout. The dump distinguishes
+ * the wedge classes before teardown proceeds anyway. Tasks on the
+ * pending lists mean a descriptor is stuck DMA_IN_PROGRESS. Every
+ * listed task is polled each pass, so any entry may be the wedged one.
+ * An empty list with nr_req_allocated > 0 means a ctx reference is
+ * held by something other than DMA.
  */
 void io_dma_dump_stuck(struct io_ring_ctx *ctx)
 {
@@ -2223,9 +2568,9 @@ void io_dma_dump_stuck(struct io_ring_ctx *ctx)
 	       atomic_read(&ctx->dma.poll_armed));
 
 	/*
-	 * refs_taken vs refs_dropped says whether every in-flight DMA req
-	 * ref was released; an imbalance locates the wedge in the ref-drop
-	 * path of __io_dma_task_complete().
+	 * Comparing refs_taken with refs_dropped says whether every
+	 * in-flight DMA req ref was released. An imbalance locates the
+	 * wedge in the ref-drop path of __io_dma_task_complete().
 	 */
 	pr_err("io_uring DMA teardown stuck: refs_taken=%d refs_dropped=%d\n",
 	       atomic_read(&ctx->dma.diag_refs_taken),
@@ -2235,9 +2580,9 @@ void io_dma_dump_stuck(struct io_ring_ctx *ctx)
 		return;
 
 	/*
-	 * poll_list belongs to the (quiesced-by-now) poller and submit_list
-	 * is lock-free; this walk is racy by design, feeding only a
-	 * diagnostic dump on an already-wedged teardown.
+	 * poll_list belongs to the poller, which is quiesced by now, and
+	 * submit_list is lock-free. This walk is racy by design since it
+	 * feeds only a diagnostic dump on an already-wedged teardown.
 	 */
 	for (dma = READ_ONCE(ctx->dma.poll_list); dma; dma = dma->next) {
 		count++;

@@ -595,6 +595,7 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 			    u64 dst_user_addr, size_t want);
 extern struct kmem_cache *dma_cachep;
 int __io_dma_poll(struct io_ring_ctx *ctx);
+void io_dma_qstat_task_abandon(struct io_ring_ctx *ctx, struct io_dma_task *dma);
 void io_dma_task_release_res(struct io_ring_ctx *ctx, struct device *dev,
 			     struct io_dma_task *dma);
 
@@ -640,6 +641,7 @@ enum {
 	IO_DMA_FM_NR,
 };
 void io_dma_fm_record(unsigned int reason);
+void io_dma_qstat_forget(struct dma_chan *chan);
 int kiocb_done(struct io_kiocb *req, ssize_t ret, struct io_br_sel *sel, unsigned int issue_flags);
 void io_submit_flush_completions(struct io_ring_ctx *ctx);
 
