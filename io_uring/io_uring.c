@@ -2252,6 +2252,7 @@ static void io_release_dma_chan(struct io_ring_ctx *ctx)
 			 * leak confined to the already-degraded
 			 * hung-hardware path, which is preferable.
 			 */
+			io_dma_qstat_task_abandon(ctx, dma);
 			io_dma_task_release_res(ctx,
 					dma->chan->device->dev, dma);
 			kmem_cache_free(dma_cachep, dma);
@@ -2424,6 +2425,10 @@ static void io_dma_pool_put(struct dma_chan *chan)
 			if (pd->chans[i].chan != chan)
 				continue;
 			if (--pd->chans[i].refcnt == 0) {
+				/* Drained by teardown; free its stats slot
+				 * before the channel can be recycled.
+				 */
+				io_dma_qstat_forget(chan);
 				dma_release_channel(chan);
 				pd->chans[i] = pd->chans[--pd->nr];
 			}
