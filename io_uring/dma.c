@@ -856,7 +856,7 @@ static void io_dma_lat_reset(struct io_dma_lat_stats *s)
  */
 static const char * const io_dma_fmw_names[IO_DMA_FMW_NR] = {
 	"engaged", "no_aops", "not_bvec", "direct", "no_dma_addrs",
-	"eagain", "cpu_redo", "error",
+	"eagain", "cpu_redo", "error", "short_write",
 };
 static atomic64_t io_dma_fmw[IO_DMA_FMW_NR];
 
@@ -893,8 +893,6 @@ static ssize_t io_dma_lat_reset_write(struct file *file,
 		atomic64_set(&io_dma_fmw[i], 0);
 	for (i = 0; i < IO_DMA_FM_NR; i++)
 		atomic64_set(&io_dma_fm[i], 0);
-	for (i = 0; i < IO_DMA_FMW_NR; i++)
-		atomic64_set(&io_dma_fmw[i], 0);
 	io_dma_qstat_reset();
 	return count;
 }
@@ -1743,6 +1741,10 @@ ssize_t io_dma_filemap_write(struct io_kiocb *req, struct kiocb *iocb,
 		status = aops->write_begin(iocb, mapping, pos, bytes,
 					   &folio, &fsdata);
 		if (unlikely(status < 0)) {
+			/* Unlike generic_perform_write(), which blocks in
+			 * reclaim and retries, we fail into a short write.
+			 * fmw_short counts these.
+			 */
 			if (!written)
 				err = status;
 			break;
@@ -1973,8 +1975,11 @@ out_unlock:
 	inode_unlock(inode);
 	kvfree(fol);
 	kvfree(cookies);
-	if (written > 0)
+	if (written > 0) {
+		if (written < want)
+			io_dma_fmw_record(IO_DMA_FMW_SHORT);
 		return generic_write_sync(iocb, written) ?: written;
+	}
 	return err;
 }
 
