@@ -8,7 +8,7 @@
 #include <linux/spinlock.h>
 #include <linux/xarray.h>
 #include <linux/pagemap.h>
-#include <linux/pagevec.h>
+#include <linux/folio_batch.h>
 #include <linux/swap.h>
 #include <linux/fs.h>
 #include <linux/scatterlist.h>
@@ -1924,6 +1924,7 @@ void io_dma_poll_workfn(struct work_struct *w)
  */
 #ifdef CONFIG_X86
 #include <asm/cpufeature.h>
+#include <asm/cpuid/api.h>
 #include <asm/mwait.h>
 #include <asm/tsc.h>
 

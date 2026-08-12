@@ -1015,7 +1015,7 @@ static int __io_read(struct io_kiocb *req, struct io_br_sel *sel,
 					return IOU_ISSUE_SKIP_COMPLETE;
 			}
 			if (ret > 0)
-				goto done;
+				return ret;
 			/* On failure, fall through to normal read path */
 			req->dma.dma_active = false;
 		}
