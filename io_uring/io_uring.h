@@ -637,6 +637,7 @@ enum {
 				 */
 	IO_DMA_FMW_ERROR,
 	IO_DMA_FMW_FS_DECLINE,	/* ->dma_copy_checks declined, also eagain */
+	IO_DMA_FMW_SHORT,	/* returned short, for any cause */
 	IO_DMA_FMW_NR,
 };
 void io_dma_fmw_record(unsigned int reason);
