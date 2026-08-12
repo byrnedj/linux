@@ -47,42 +47,36 @@ static inline unsigned long io_dma_prep_flags(void)
 /*
  * PFN-keyed persistent source-mapping cache.
  *
- * Under translated IOMMU domains the dominant recoverable submit cost on
- * the DMA source paths is per-chunk dma_map/dma_unmap (measured via the
- * temporary iommu=pt experiment: buffered reads 10.7 -> 53.7 GB/s, recv
- * ~1 core at 20GB/s).  Destinations are already persistent -- registered
- * buffers and IOU_PBUF_RING_DMA regions map once at registration; this
- * gives sources the same discipline, lazily: the first chunk that touches
- * a folio maps the whole folio DMA_TO_DEVICE and caches {folio-head PFN
- * -> dma_addr} in a per-DSA-device xarray; every later chunk on that
- * folio is pure arithmetic.  dma_unmap leaves the per-I/O path entirely,
- * running only on CLOCK eviction (bytes-capped) and explicit flush.
+ * Under translated IOMMU domains the dominant recoverable submit cost
+ * on the DMA source paths is per-chunk dma_map/dma_unmap.  Destinations
+ * are already persistent (registered buffers and IOU_PBUF_RING_DMA
+ * regions map once at registration); this gives sources the same
+ * discipline, lazily: the first chunk touching a folio maps its
+ * io_dma_map_quantum()-sized segment DMA_TO_DEVICE and caches
+ * {segment-head PFN -> dma_addr} in a per-device xarray; later chunks
+ * on that segment are pure arithmetic.  dma_unmap runs only on CLOCK
+ * eviction (bytes-capped) and explicit flush.
  *
- * Correctness keystone: struct page <-> physical address is immutable,
- * and descriptors are only issued against pages held live by the I/O
- * being processed (skb reference on the recv path, folio reference on
- * the filemap path).  A stale cached translation therefore can never
- * misdirect DMA -- if the page was freed and recycled since insertion it
- * is by definition the same physical page legitimately holding the new
- * data.  Staleness costs IOVA space and a lingering device *read*
- * permission window, bounded by the cap (the same class of trade
- * page_pool's persistent NIC mappings make).
+ * Correctness: struct page <-> physical address is immutable, and
+ * descriptors are only issued against pages held live by the I/O being
+ * processed (skb ref on recv, folio ref on filemap), so a stale cached
+ * translation can never misdirect DMA.  Staleness costs IOVA space and
+ * a lingering device *read* window, bounded by the cap -- the trade
+ * page_pool's persistent NIC mappings also make.
  *
  * Entry lifetime: refs = 1 cache bias + one per in-flight batch entry.
- * Lookup takes a reference with atomic_inc_not_zero() under RCU;
- * eviction erases the entry from the tree and drops the bias, so the
- * mapping survives until its last in-flight user completes.  The
- * refs>1 test in the CLOCK sweep is only a preference for idle entries;
- * correctness comes from the bias protocol.
+ * Lookup takes a ref with atomic_inc_not_zero() under RCU; eviction
+ * erases the entry and drops the bias, so a mapping survives until its
+ * last in-flight user completes.
  *
- * Limitation: mappings are keyed to the DSA struct device and are not
- * torn down on driver unbind -- flush via debugfs before unbinding idxd.
+ * Mappings are keyed to the DSA struct device and are not torn down on
+ * driver unbind -- flush via debugfs before unbinding idxd.
  */
 
 struct io_pfn_map {
-	unsigned long		pfn;		/* folio-head PFN: cache key */
-	dma_addr_t		dma_base;	/* whole-folio DMA_TO_DEVICE mapping */
-	unsigned int		size;		/* mapped bytes (folio_size at insert) */
+	unsigned long		pfn;		/* segment-head PFN: cache key */
+	dma_addr_t		dma_base;	/* segment DMA_TO_DEVICE mapping */
+	unsigned int		size;		/* mapped bytes (<= cache quantum) */
 	atomic_t		refs;		/* cache bias + in-flight users */
 	bool			referenced;	/* CLOCK second-chance bit */
 	atomic_t		probation;	/* 1 = window resident awaiting reuse
@@ -99,6 +93,8 @@ struct io_pfn_cache {
 	spinlock_t		lock;		/* serializes the CLOCK sweep */
 	unsigned long		hand;		/* next PFN the sweep visits */
 	struct device		*dev;
+	size_t			quantum;	/* pow2 segment size entries are
+						 * carved into (io_dma_map_quantum) */
 	atomic64_t		covered;	/* bytes mapped through the tree */
 	atomic64_t		hits;
 	atomic64_t		misses;
@@ -228,6 +224,24 @@ static unsigned int io_pfn_sketch_touch(unsigned long pfn)
  * table is large and mostly referenced/in-flight (soft cap). */
 #define IO_PFN_EVICT_BUDGET	1024
 
+/*
+ * Standing mappings are carved into power-of-two segments no larger than
+ * dma_opt_mapping_size(): IOVA allocations above that limit bypass the
+ * IOMMU's per-CPU rcaches and fall to the domain rbtree under its lock
+ * (measured at 12-48% of node cycles under shuffle load when whole 2MB
+ * folios were mapped as single entries).  With the stock rcache ceiling
+ * this yields 128KB segments; capped at 2MB so a no-IOMMU SIZE_MAX
+ * answer degenerates to whole-folio behaviour.
+ */
+static size_t io_dma_map_quantum(struct device *dev)
+{
+	size_t q = dma_opt_mapping_size(dev);
+
+	if (!q || q > SZ_2M)
+		q = SZ_2M;
+	return rounddown_pow_of_two(q);
+}
+
 static struct io_pfn_cache *io_pfn_cache_get(struct device *dev)
 {
 	struct io_pfn_cache *c;
@@ -246,6 +260,7 @@ static struct io_pfn_cache *io_pfn_cache_get(struct device *dev)
 	xa_init(&c->xa);
 	spin_lock_init(&c->lock);
 	c->dev = dev;
+	c->quantum = io_dma_map_quantum(dev);
 
 	spin_lock(&io_pfn_cache_reg_lock);
 	for (i = 0; i < IO_PFN_CACHE_DEVS; i++) {
@@ -349,12 +364,19 @@ out:
  * *dma is set to the chunk's device address.  NULL means the caller should
  * fall back to a plain per-chunk map (never an error).
  *
- * @map_len is how much to map from the folio head on a miss: folio_size()
- * for page-cache folios, but a kvec run may extend past a 4KB folio across
- * physically-contiguous neighbours (mlx5 striding-RQ buffers), and mapping
- * the whole run as one entry is what keeps its IOVA contiguous -- the
- * property descriptor coalescing needs.  Overlapping entries from runs
- * that start mid-region are allowed (correct, just IOVA-wasteful).
+ * Entries are quantized: the folio (or run) is carved into c->quantum
+ * segments from its head, each cached and mapped independently, so every
+ * IOVA allocation stays inside the IOMMU's per-CPU rcache size classes.
+ * The chunk must lie within one segment -- the filemap-read path splits
+ * chunks at segment boundaries to guarantee it; a recv run that crosses
+ * one falls back to a plain map.
+ *
+ * @map_len is the known-physically-contiguous extent from the folio head:
+ * folio_size() for page-cache folios, but a kvec run may extend past a
+ * 4KB folio across physically-contiguous neighbours (mlx5 striding-RQ
+ * buffers; direct-map virtual contiguity implies physical contiguity).
+ * Overlapping entries from runs that start mid-region are allowed
+ * (correct, just IOVA-wasteful).
  */
 static struct io_pfn_map *io_pfn_map_lookup(struct io_pfn_cache *c,
 					    struct folio *folio,
@@ -362,19 +384,29 @@ static struct io_pfn_map *io_pfn_map_lookup(struct io_pfn_cache *c,
 					    size_t map_len,
 					    dma_addr_t *dma)
 {
-	unsigned long pfn = folio_pfn(folio);
 	u64 cap = (u64)READ_ONCE(io_dma_pfn_cache_cap_mb) << 20;
+	size_t seg_base, seg_len, rel;
 	struct io_pfn_map *pm, *old;
+	unsigned long pfn;
 	dma_addr_t base;
 
 	if (!c || !cap)
 		return NULL;
 
+	seg_base = offset & ~(c->quantum - 1);
+	seg_len = min_t(size_t, c->quantum, map_len - seg_base);
+	rel = offset - seg_base;
+	if (unlikely(rel + len > seg_len)) {
+		atomic64_inc(&c->range_fallbacks);
+		return NULL;
+	}
+	pfn = folio_pfn(folio) + (seg_base >> PAGE_SHIFT);
+
 	rcu_read_lock();
 	pm = xa_load(&c->xa, pfn);
 	if (pm && atomic_inc_not_zero(&pm->refs)) {
 		rcu_read_unlock();
-		if (unlikely(offset + len > pm->size)) {
+		if (unlikely(rel + len > pm->size)) {
 			/*
 			 * The run outgrew the cached region (fused striding
 			 * runs vary in length, and a recycled PFN may carry a
@@ -408,7 +440,7 @@ static struct io_pfn_map *io_pfn_map_lookup(struct io_pfn_cache *c,
 			atomic64_inc(&c->promotions);
 			io_pfn_sketch_touch(pfn);
 		}
-		*dma = pm->dma_base + offset;
+		*dma = pm->dma_base + rel;
 		return pm;
 	}
 	rcu_read_unlock();
@@ -418,15 +450,15 @@ miss:
 	pm = kmalloc(sizeof(*pm), GFP_NOWAIT | __GFP_NOWARN);
 	if (!pm)
 		goto fail;
-	base = dma_map_page(c->dev, folio_page(folio, 0), 0,
-			    map_len, DMA_TO_DEVICE);
+	base = dma_map_page(c->dev, folio_page(folio, 0), seg_base,
+			    seg_len, DMA_TO_DEVICE);
 	if (dma_mapping_error(c->dev, base)) {
 		kfree(pm);
 		goto fail;
 	}
 	pm->pfn = pfn;
 	pm->dma_base = base;
-	pm->size = map_len;
+	pm->size = seg_len;
 	pm->dev = c->dev;
 	pm->referenced = true;
 	pm->inserted_j = jiffies;
@@ -450,14 +482,14 @@ miss:
 		kfree(pm);
 		if (!xa_is_err(old) && atomic_inc_not_zero(&old->refs)) {
 			rcu_read_unlock();
-			if (unlikely(offset + len > old->size)) {
+			if (unlikely(rel + len > old->size)) {
 				atomic64_inc(&c->range_fallbacks);
 				io_pfn_map_put(old);
 				return NULL;
 			}
 			WRITE_ONCE(old->referenced, true);
 			atomic64_inc(&c->hits);
-			*dma = old->dma_base + offset;
+			*dma = old->dma_base + rel;
 			return old;
 		}
 		rcu_read_unlock();
@@ -471,7 +503,7 @@ miss:
 	    atomic64_read(&c->probation_bytes) >
 			((u64)READ_ONCE(io_dma_pfn_cache_window_mb) << 20))
 		io_pfn_cache_evict(c, cap);
-	*dma = pm->dma_base + offset;
+	*dma = pm->dma_base + rel;
 	return pm;
 fail:
 	atomic64_inc(&c->insert_fails);
@@ -543,8 +575,9 @@ static int io_pfn_cache_stats_show(struct seq_file *m, void *p)
 			break;
 		c = io_pfn_caches[i];
 		seq_printf(m,
-			   "dev %s covered_kb %lld hits %lld misses %lld inserts %lld insert_fails %lld range_fallbacks %lld evictions %lld ref_skips %lld probation_kb %lld admits %lld promotions %lld prob_evictions %lld\n",
+			   "dev %s quantum_kb %zu covered_kb %lld hits %lld misses %lld inserts %lld insert_fails %lld range_fallbacks %lld evictions %lld ref_skips %lld probation_kb %lld admits %lld promotions %lld prob_evictions %lld\n",
 			   dev_name(c->dev),
+			   c->quantum >> 10,
 			   atomic64_read(&c->covered) >> 10,
 			   atomic64_read(&c->hits),
 			   atomic64_read(&c->misses),
@@ -2566,6 +2599,7 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 	struct dma_chan *chan = ctx->dma.chan;
 	struct io_pfn_cache *pfn_cache =
 		io_pfn_cache_usable(ctx) ? io_pfn_cache_get(dev) : NULL;
+	size_t map_quantum = io_dma_map_quantum(dev);
 	struct folio_batch fbatch;
 	struct io_dma_batch_entry *entries;
 	unsigned int nr_entries = 0;
@@ -2676,6 +2710,11 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 
 				chunk = min_t(size_t, bytes - copied,
 					      dst_folio_remain);
+				/* Split at source map-quantum boundaries so
+				 * one cache segment covers each entry and no
+				 * transient map exceeds the rcache classes. */
+				chunk = min_t(size_t, chunk, map_quantum -
+					((offset + copied) & (map_quantum - 1)));
 
 				if (ctx->dma.use_phys_addrs) {
 					src_dma = page_to_phys(folio_page(folio, 0)) +
@@ -2865,7 +2904,10 @@ ssize_t io_dma_filemap_write(struct io_kiocb *req, struct kiocb *iocb,
 	struct io_mapped_ubuf *imu = req->buf_node->buf;
 	struct dma_chan *chan = ctx->dma.chan;
 	struct device *dev = chan->device->dev;
-	size_t max_chunk = mapping_max_folio_size(mapping);
+	/* Clamp write chunks (and so the transient dst-folio maps) to the
+	 * IOVA-rcache-served quantum. */
+	size_t max_chunk = min_t(size_t, mapping_max_folio_size(mapping),
+				 io_dma_map_quantum(chan->device->dev));
 	struct io_dma_fmw_folio *fol = NULL;
 	dma_cookie_t *cookies = NULL;
 	unsigned int nr_fol = 0, nr_cookies = 0, max_fol, max_cookies, i;
