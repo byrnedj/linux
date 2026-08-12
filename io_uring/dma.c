@@ -123,7 +123,7 @@ static DEFINE_SPINLOCK(io_pfn_cache_reg_lock);
  * a cycling working set makes the sweep thrash (evict+remap per I/O,
  * worse than no cache).  Size it above the source working set -- the hot
  * file set for reads.  (Recv sources bypass the cache entirely by
- * default; see io_dma_pfn_cache_pp_bypass.)
+ * default; see io_dma_pfn_cache_recv.)
  */
 static u32 io_dma_pfn_cache_cap_mb __read_mostly = 4096;
 
@@ -132,9 +132,26 @@ static u32 io_dma_pfn_cache_cap_mb __read_mostly = 4096;
  * are filled once and recycled, so a cached mapping never gets a second
  * use while its reference blocks the recycler.  1 = bypass (default),
  * 0 = cache them like any other source (pre-bypass behavior, for A/B).
- * debugfs io_uring_dma_pfn_cache_pp_bypass.
+ * debugfs io_uring_dma_pfn_cache_pp_bypass.  Only consulted when
+ * io_dma_pfn_cache_recv has re-enabled recv caching at all.
  */
 static u32 io_dma_pfn_cache_pp_bypass __read_mostly = 1;
+
+/*
+ * Whether recv sources may use the PFN cache at all.  0 (default) =
+ * every recv batch takes the plain dma_map_sg path: socket payloads are
+ * consumed once, so standing source mappings never earn their keep, and
+ * on both measured transports they were a net loss -- NIC recv pays
+ * bookkeeping > mapping saved (see pp_bypass above), and non-page-pool
+ * loopback runs bloated the IOVA tree into a 5-23x shuffle regression.
+ * 1 = recv sources may cache (pp_bypass still gates page-pool pages),
+ * for A/B against a workload with genuine recv-side PFN reuse.
+ * debugfs io_uring_dma_pfn_cache_recv.
+ */
+static u32 io_dma_pfn_cache_recv __read_mostly;
+
+/* Batches the recv-wide default routed down the plain sg path. */
+static atomic64_t io_pfn_recv_bypass_batches;
 
 /*
  * TinyLFU-style admission (default on; 0 = legacy admit-everything).
@@ -562,8 +579,10 @@ static int io_pfn_cache_stats_show(struct seq_file *m, void *p)
 {
 	int i;
 
-	seq_printf(m, "cap_mb %u pp_bypass %u pp_bypass_batches %lld admit %u window_mb %u\n",
+	seq_printf(m, "cap_mb %u recv %u recv_bypass_batches %lld pp_bypass %u pp_bypass_batches %lld admit %u window_mb %u\n",
 		   READ_ONCE(io_dma_pfn_cache_cap_mb),
+		   READ_ONCE(io_dma_pfn_cache_recv),
+		   (long long)atomic64_read(&io_pfn_recv_bypass_batches),
 		   READ_ONCE(io_dma_pfn_cache_pp_bypass),
 		   (long long)atomic64_read(&io_pfn_pp_bypass_batches),
 		   READ_ONCE(io_dma_pfn_cache_admit),
@@ -1093,6 +1112,8 @@ void io_dma_debugfs_init(void)
 			   &io_dma_pfn_cache_cap_mb);
 	debugfs_create_u32("io_uring_dma_pfn_cache_pp_bypass", 0644, NULL,
 			   &io_dma_pfn_cache_pp_bypass);
+	debugfs_create_u32("io_uring_dma_pfn_cache_recv", 0644, NULL,
+			   &io_dma_pfn_cache_recv);
 	debugfs_create_u32("io_uring_dma_pfn_cache_admit", 0644, NULL,
 			   &io_dma_pfn_cache_admit);
 	debugfs_create_u32("io_uring_dma_pfn_cache_window_mb", 0644, NULL,
@@ -2325,31 +2346,34 @@ static unsigned int io_dma_merge_entries(struct io_dma_batch_entry *entries,
 /*
  * Should this batch skip the PFN cache and take the plain sg path?
  *
- * NIC receive buffers are strictly streaming: the driver fills a page
- * once, the stack consumes it, and the page pool recycles it.  A cached
- * source mapping is therefore never reused, while the cache reference it
- * holds is one the recycler has to wait on.  Measured on 64KB memcached
- * recv, caching page-pool sources spent ~5.4% of node cycles (lookup,
- * xarray walk, page-pool ref release, flush) to avoid ~2.3% of mapping
- * work.
+ * Receive buffers are streaming: a cached source mapping is never
+ * reused, while the standing entries bloat the IOVA tree and (for
+ * page-pool pages) hold a reference the recycler must wait on.  Recv
+ * therefore bypasses the cache for every source by default;
+ * io_uring_dma_pfn_cache_recv=1 restores caching for non-page-pool
+ * sources (page-pool pages then still bypass unless pp_bypass is also
+ * cleared).
  *
- * The decision has to be made per batch, not per chunk: declining an
- * individual lookup only drops that chunk to its own dma_map_single,
- * whereas skipping the cache entirely routes the batch through
- * dma_map_sg(), which coalesces physically contiguous frags into one
- * IOVA segment (a 64KB GRO skb becomes ~1 descriptor instead of 16).
- * Per-chunk bypass measured 14% SLOWER than the sg path for exactly
- * that reason.
- *
- * Recv batches are homogeneous -- every chunk is an skb frag from the
- * same NIC page pool -- so sampling the first chunk decides the batch.
+ * The decision is per batch, not per chunk: skipping the cache routes
+ * the whole batch through dma_map_sg(), which coalesces physically
+ * contiguous frags into one IOVA segment (a 64KB GRO skb becomes ~1
+ * descriptor instead of 16); declining individual lookups would drop
+ * each chunk to its own dma_map_single and lose that.  Recv batches
+ * are homogeneous -- every chunk is an skb frag from the same source
+ * -- so sampling the first chunk decides the batch.
  */
 static bool io_dma_batch_bypasses_cache(struct io_dma_batch_entry *entries,
 					unsigned int nr_entries)
 {
 	const void *kaddr;
 
-	if (!READ_ONCE(io_dma_pfn_cache_pp_bypass) || !nr_entries)
+	if (!nr_entries)
+		return false;
+	if (!READ_ONCE(io_dma_pfn_cache_recv)) {
+		atomic64_inc(&io_pfn_recv_bypass_batches);
+		return true;
+	}
+	if (!READ_ONCE(io_dma_pfn_cache_pp_bypass))
 		return false;
 	kaddr = entries[0].src_kaddr;
 	if (!virt_addr_valid(kaddr) ||
