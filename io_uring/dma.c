@@ -7,6 +7,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/spinlock.h>
 #include <linux/xarray.h>
+#include <linux/hash.h>
 #include <linux/pagemap.h>
 #include <linux/folio_batch.h>
 #include <linux/swap.h>
@@ -127,6 +128,7 @@ struct io_pfn_cache {
 	atomic64_t		evictions;
 	atomic64_t		age_evictions;	/* retired for idleness */
 	atomic64_t		ref_skips;	/* sweep passed an in-flight entry */
+
 	/*
 	 * Ghost list: the keys, and only the keys, of segments the cap
 	 * recently forced out, each stored as an xarray value holding
@@ -1813,6 +1815,54 @@ static unsigned int io_dma_fmw_spin_us __read_mostly = 60;
 static unsigned int io_dma_fmw_wait_ms __read_mostly = 5000;
 /* DEBUG experiment: force singles to test batch-serialization theory */
 static unsigned int io_dma_batch_min __read_mostly = 8;
+/*
+ * Bounded wait for a descriptor slot on a failed read prep, in
+ * microseconds; 0 restores the old shatter-into-CPU-tails behavior.
+ * The budget should cover one descriptor service time under load.
+ * Default off: measured on saturated 16-job reads, waiting for slots
+ * more than halved throughput, because the CPU tails it eliminates
+ * are a hybrid copy mode that adds CPU bandwidth on top of the
+ * slot-limited device. The knob remains for latency-sensitive or
+ * CPU-scarce experiments.
+ */
+static unsigned int io_dma_slot_wait_us __read_mostly;
+/*
+ * Bounded outstanding: past this many unreaped descriptors on one ring,
+ * a nowait-pass read defers to io-wq instead of engaging, so excess
+ * submissions wait rather than deepening the poll list and the
+ * detection latency with it. Throughput against queue depth is not
+ * monotonic; the peak sits near two thousand descriptors machine-wide,
+ * and an application driving past it loses close to a third. 0 is off.
+ */
+unsigned int io_dma_ring_max_descs __read_mostly;
+
+/*
+ * The outstanding-task cap. A nowait-pass submission over the cap
+ * defers to io-wq. The io-wq pass may sleep, so instead of engaging
+ * over the cap it waits for the reaper to drain below it; the wait is
+ * time-bounded so a missed wakeup degrades to a timed engage, never a
+ * wedge. Returns true when the caller should defer with -EAGAIN.
+ */
+bool io_dma_cap_over(struct io_ring_ctx *ctx)
+{
+	unsigned int cap = READ_ONCE(io_dma_ring_max_descs);
+
+	return cap && atomic_read(&ctx->dma.tasks_pending) >= cap;
+}
+
+bool io_dma_cap_defer(struct io_ring_ctx *ctx, bool nonblock)
+{
+	unsigned int cap = READ_ONCE(io_dma_ring_max_descs);
+
+	if (!io_dma_cap_over(ctx))
+		return false;
+	if (nonblock)
+		return true;
+	wait_event_timeout(ctx->dma.inflight_wq,
+			   atomic_read(&ctx->dma.tasks_pending) < cap,
+			   msecs_to_jiffies(20));
+	return false;
+}
 
 /* DEBUG experiment: flush threshold, caps entries per batch descriptor */
 static unsigned int io_dma_batch_max __read_mostly = IO_DMA_BATCH_MAX;
@@ -1862,7 +1912,8 @@ static struct io_dma_lat_stats io_dma_lat_dma;	/* DSA transactions (per task) */
  */
 static const char * const io_dma_fm_names[IO_DMA_FM_NR] = {
 	"engaged", "shmem", "not_bvec", "direct", "no_dma_addrs",
-	"eagain", "enomem", "efault", "other", "cpu_tail", "fs_check", "cpu_redo",
+	"eagain", "enomem", "efault", "other", "cpu_tail", "slot_wait",
+	"deferred", "cap_bypass", "fs_check", "cpu_redo",
 };
 static atomic64_t io_dma_fm[IO_DMA_FM_NR];
 
@@ -1931,6 +1982,10 @@ struct io_dma_chan_qstat {
 struct io_dma_dev_stat {
 	void		*key;		/* dma_device, identity only */
 	char		name[24];	/* captured at registration */
+	atomic64_t	inflight;	/* all classes, descriptors */
+	atomic64_t	inflight_wr;	/* write-sink descriptors */
+	atomic64_t	rej_rd;
+	atomic64_t	rej_wr;
 	struct io_dma_chan_qstat chans[IO_DMA_STAT_CHANS];
 };
 static struct io_dma_dev_stat io_dma_dev_stats[IO_DMA_STAT_DEVS];
@@ -2101,15 +2156,143 @@ static unsigned int io_dma_qstat_bucket(u64 v)
 			 IO_DMA_QSTAT_NBUCKETS - 1) : 0;
 }
 
-static void io_dma_qstat_submit(struct dma_chan *chan, u32 len)
+/*
+ * Per-device in-flight descriptor budget, the queueing bound for the
+ * channel-sharing design.  A device's work queues hold a fixed number
+ * of descriptor slots and the queueing delay for a new descriptor
+ * grows with the descriptors ahead of it.  Therefore bounding admitted
+ * descriptors bounds both by construction.  A budget at or below the
+ * configured WQ size means submissions never find the queue full.
+ *
+ * There are two classes.  The write sink is bulk and waits inline on
+ * its cookies, so it may hold at most budget*wr_pct/100 descriptors
+ * and refused chunks fall to the CPU-redo pass.  File reads are
+ * admitted while the total in flight is within the budget, so the
+ * remaining share is their guaranteed headroom.
+ *
+ * budget_descs 0, the default, disables all checks.  The counters live
+ * in the same per-device slot the queueing histograms use, so the
+ * submit and complete hooks resolve one registry entry and serve both,
+ * and per-device lines appear in chan_qstat.
+ */
+static u32 io_dma_budget_descs;			/* 0 = off */
+static u32 io_dma_budget_wr_pct = 75;
+
+
+/*
+ * Write-sink chunk admission.  A refusal sends the chunk to the
+ * CPU-redo pass.  This is checked per chunk so that a draining queue
+ * readmits mid-write.
+ */
+/*
+ * Memo for the registry lookups. The submit and complete hooks run per
+ * descriptor and the two linear scans behind them showed up as several
+ * percent of submit-path CPU. The memo is validated against the
+ * authoritative fields, so a torn or stale entry can never return the
+ * wrong slot, only fall back to the scans.
+ */
+struct io_dma_stat_memo {
+	struct dma_chan		*chan;
+	struct io_dma_dev_stat	*d;
+	struct io_dma_chan_qstat *q;
+};
+/*
+ * Per CPU, not hashed and shared: a global memo array written on every
+ * miss by every submitting CPU was a cacheline storm that cost more
+ * than the scans it saved. Each CPU tends to feed one ring and so one
+ * channel, so a single private entry hits almost always and a miss
+ * only rewrites a line this CPU owns.
+ */
+static DEFINE_PER_CPU(struct io_dma_stat_memo, io_dma_stat_memo_pcpu);
+
+static void io_dma_stat_lookup(struct dma_chan *chan,
+			       struct io_dma_dev_stat **dp,
+			       struct io_dma_chan_qstat **qp)
 {
-	struct io_dma_dev_stat *d = io_dma_dev_stat_get(chan);
+	struct io_dma_stat_memo *m = get_cpu_ptr(&io_dma_stat_memo_pcpu);
+	struct io_dma_dev_stat *d = m->d;
+	struct io_dma_chan_qstat *q = m->q;
+
+	if (m->chan == chan && d && q &&
+	    READ_ONCE(d->key) == chan->device && io_dma_qstat_live(q, chan)) {
+		put_cpu_ptr(&io_dma_stat_memo_pcpu);
+		*dp = d;
+		*qp = q;
+		return;
+	}
+	d = io_dma_dev_stat_get(chan);
+	q = d ? io_dma_qstat_get(d, chan) : NULL;
+	if (d && q) {
+		m->d = d;
+		m->q = q;
+		m->chan = chan;
+	}
+	put_cpu_ptr(&io_dma_stat_memo_pcpu);
+	*dp = d;
+	*qp = q;
+}
+
+static bool io_dma_budget_refuse_wr(struct dma_chan *chan)
+{
+	u64 budget = READ_ONCE(io_dma_budget_descs);
+	struct io_dma_dev_stat *d;
+
+	if (!budget)
+		return false;
+	{
+		struct io_dma_chan_qstat *q;
+
+		io_dma_stat_lookup(chan, &d, &q);
+	}
+	if (!d)
+		return false;
+	if (atomic64_read(&d->inflight) >= budget ||
+	    atomic64_read(&d->inflight_wr) >=
+			div_u64(budget * min(READ_ONCE(io_dma_budget_wr_pct), 100U), 100)) {
+		atomic64_inc(&d->rej_wr);
+		return true;
+	}
+	return false;
+}
+
+/*
+ * Whole-read admission at io_dma_filemap_read() entry.  A refusal
+ * falls back to the buffered read and is counted under the eagain
+ * reason.
+ */
+static bool io_dma_budget_refuse_rd(struct dma_chan *chan)
+{
+	u64 budget = READ_ONCE(io_dma_budget_descs);
+	struct io_dma_dev_stat *d;
+
+	if (!budget)
+		return false;
+	{
+		struct io_dma_chan_qstat *q;
+
+		io_dma_stat_lookup(chan, &d, &q);
+	}
+	if (!d)
+		return false;
+	if (atomic64_read(&d->inflight) > budget) {
+		atomic64_inc(&d->rej_rd);
+		return true;
+	}
+	return false;
+}
+
+static void io_dma_qstat_submit(struct dma_chan *chan, u32 len, bool wr)
+{
+	struct io_dma_dev_stat *d;
 	struct io_dma_chan_qstat *q;
 	u64 now, hwm;
 
+	io_dma_stat_lookup(chan, &d, &q);
 	if (!d)
 		return;
-	q = io_dma_qstat_get(d, chan);
+	atomic64_inc(&d->inflight);
+	if (wr)
+		atomic64_inc(&d->inflight_wr);
 	if (!q)
 		return;
 	atomic64_inc(&q->seen_kb[io_dma_qstat_bucket(
@@ -2133,14 +2316,17 @@ static void io_dma_qstat_submit(struct dma_chan *chan, u32 len)
  * the task, so those costs do not inflate the latency.
  */
 static void io_dma_qstat_complete(struct dma_chan *chan, u32 len, u64 submit_ns,
-				  u64 done_ns)
+				  u64 done_ns, bool wr)
 {
-	struct io_dma_dev_stat *d = io_dma_dev_stat_get(chan);
+	struct io_dma_dev_stat *d;
 	struct io_dma_chan_qstat *q;
 
+	io_dma_stat_lookup(chan, &d, &q);
 	if (!d)
 		return;
-	q = io_dma_qstat_get(d, chan);
+	atomic64_dec(&d->inflight);
+	if (wr)
+		atomic64_dec(&d->inflight_wr);
 	if (!q)
 		return;
 	atomic64_sub(len, &q->inflight);
@@ -2161,7 +2347,7 @@ static void io_dma_qstat_complete(struct dma_chan *chan, u32 len, u64 submit_ns,
 void io_dma_qstat_task_abandon(struct io_ring_ctx *ctx, struct io_dma_task *dma)
 {
 	if (dma->chan)
-		io_dma_qstat_complete(dma->chan, dma->len, 0, 0);
+		io_dma_qstat_complete(dma->chan, dma->len, 0, 0, false);
 }
 
 static int io_dma_chan_qstat_show(struct seq_file *m, void *v)
@@ -2196,6 +2382,20 @@ static int io_dma_chan_qstat_show(struct seq_file *m, void *v)
 				seq_printf(m, " %llu", (u64)atomic64_read(&q->seen_kb[b]));
 			seq_puts(m, "\n");
 		}
+	}
+	for (i = 0; i < IO_DMA_STAT_DEVS; i++) {
+		struct io_dma_dev_stat *d = &io_dma_dev_stats[i];
+
+		if (!READ_ONCE(d->key))
+			break;
+		seq_printf(m, "device %s inflight_descs %llu wr_descs %llu rej_rd %llu rej_wr %llu budget_descs %u wr_pct %u\n",
+			   d->name,
+			   (u64)atomic64_read(&d->inflight),
+			   (u64)atomic64_read(&d->inflight_wr),
+			   (u64)atomic64_read(&d->rej_rd),
+			   (u64)atomic64_read(&d->rej_wr),
+			   READ_ONCE(io_dma_budget_descs),
+			   READ_ONCE(io_dma_budget_wr_pct));
 	}
 	return 0;
 }
@@ -2238,6 +2438,13 @@ static void io_dma_qstat_reset(void)
 				atomic64_set(&q->seen_kb[b], 0);
 			}
 		}
+	}
+	for (i = 0; i < IO_DMA_STAT_DEVS; i++) {
+		if (!READ_ONCE(io_dma_dev_stats[i].key))
+			break;
+		/* The live inflight and inflight_wr counts stay. */
+		atomic64_set(&io_dma_dev_stats[i].rej_rd, 0);
+		atomic64_set(&io_dma_dev_stats[i].rej_wr, 0);
 	}
 }
 
@@ -2342,12 +2549,16 @@ void io_dma_debugfs_init(void)
 
 	debugfs_create_file("chan_qstat", 0444, dir, NULL,
 			    &io_dma_chan_qstat_fops);
+	debugfs_create_u32("budget_descs", 0644, dir, &io_dma_budget_descs);
+	debugfs_create_u32("budget_wr_pct", 0644, dir, &io_dma_budget_wr_pct);
 	debugfs_create_u32("cq_poll_us", 0644, dir, &io_dma_cq_poll_us);
 	debugfs_create_u32("fmw_spin_us", 0644, dir, &io_dma_fmw_spin_us);
 	debugfs_create_u32("fmw_wait_ms", 0644, dir, &io_dma_fmw_wait_ms);
 	debugfs_create_u32("batch_min", 0644, dir, &io_dma_batch_min);
 	debugfs_create_u32("batch_max", 0644, dir, &io_dma_batch_max);
+	debugfs_create_u32("slot_wait_us", 0644, dir, &io_dma_slot_wait_us);
 	debugfs_create_u32("stripe_chans", 0644, dir, &io_dma_stripe_chans);
+	debugfs_create_u32("ring_max_descs", 0644, dir, &io_dma_ring_max_descs);
 	debugfs_create_u32("stats", 0644, dir, &io_dma_stats_enabled);
 	debugfs_create_file("latency", 0444, dir, NULL, &io_dma_lat_fops);
 	debugfs_create_file("latency_reset", 0200, dir, NULL,
@@ -2517,7 +2728,8 @@ void io_uring_dma_prep(struct io_kiocb *req)
 static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 				   struct device *dev, struct dma_chan *chan,
 				   struct io_dma_batch_entry *entries,
-				   unsigned int nr_entries, u32 off)
+				   unsigned int nr_entries, u32 off,
+				   bool can_wait)
 {
 	struct dma_async_tx_descriptor *tx;
 	struct io_dma_batch_entry *heap_entries;
@@ -2570,6 +2782,26 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 					   src_sgl, nr_entries,
 					   io_dma_prep_flags());
 	if (!tx) {
+		/* Same bounded wait-for-slot as the single path. */
+		u64 us = READ_ONCE(io_dma_slot_wait_us);
+		u64 end;
+
+		if (!can_wait)
+			us /= 8;
+		end = ktime_get_ns() + us * NSEC_PER_USEC;
+		while (!tx && us && ktime_get_ns() < end) {
+			__io_dma_poll(req->ctx);
+			if (can_wait)
+				cond_resched();
+			tx = dmaengine_prep_dma_memcpy_sg(chan, dst_sgl,
+							  nr_entries, src_sgl,
+							  nr_entries,
+							  io_dma_prep_flags());
+		}
+		if (tx)
+			io_dma_fm_record(IO_DMA_FM_SLOT_WAIT);
+	}
+	if (!tx) {
 		kfree(sgls);
 		io_dma_task_free(req->ctx, dma);
 		kfree(heap_entries);
@@ -2600,7 +2832,7 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 		io_dma_task_free(req->ctx, dma);
 		return -EAGAIN;	/* The WQ may be full. Fall back to CPU copy. */
 	}
-	io_dma_qstat_submit(chan, dma->len);
+	io_dma_qstat_submit(chan, dma->len, false);
 
 	/* Take folio references for the duration of the DMA. */
 	for (i = 0; i < nr_entries; i++)
@@ -2629,7 +2861,7 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 static ssize_t io_dma_submit_single_entry(struct io_kiocb *req,
 					  struct dma_chan *chan,
 					  struct io_dma_batch_entry *entry,
-					  u32 off)
+					  u32 off, bool can_wait)
 {
 	struct dma_async_tx_descriptor *tx;
 	struct io_dma_task *dma;
@@ -2644,6 +2876,36 @@ static ssize_t io_dma_submit_single_entry(struct io_kiocb *req,
 	 */
 	tx = dmaengine_prep_dma_memcpy(chan, entry->dst_dma, entry->src_dma,
 				       entry->src_len, io_dma_prep_flags());
+	if (!tx) {
+		/*
+		 * The channel pool is exhausted. The old behavior took a
+		 * short claim and the CPU copied the tail, which at
+		 * saturation turned a quarter to half of all large reads
+		 * partly back into memcpy. Polling completions retires
+		 * finished descriptors and frees their slots, so a
+		 * bounded wait converts those CPU tails into a little
+		 * submission latency. The nowait pass, where most warm
+		 * reads complete, gets an eighth of the budget; the
+		 * poll loop never sleeps, so spinning there is legal.
+		 */
+		u64 us = READ_ONCE(io_dma_slot_wait_us);
+		u64 end;
+
+		if (!can_wait)
+			us /= 8;
+		end = ktime_get_ns() + us * NSEC_PER_USEC;
+		while (!tx && us && ktime_get_ns() < end) {
+			__io_dma_poll(req->ctx);
+			if (can_wait)
+				cond_resched();
+			tx = dmaengine_prep_dma_memcpy(chan, entry->dst_dma,
+						       entry->src_dma,
+						       entry->src_len,
+						       io_dma_prep_flags());
+		}
+		if (tx)
+			io_dma_fm_record(IO_DMA_FM_SLOT_WAIT);
+	}
 	if (!tx) {
 		io_dma_task_free(req->ctx, dma);
 		return -EAGAIN;
@@ -2675,7 +2937,7 @@ static ssize_t io_dma_submit_single_entry(struct io_kiocb *req,
 		io_dma_task_free(req->ctx, dma);
 		return -EAGAIN;	/* The WQ may be full. Fall back to CPU copy. */
 	}
-	io_dma_qstat_submit(chan, dma->len);
+	io_dma_qstat_submit(chan, dma->len, false);
 
 	req->dma.dma_refcnt++;
 
@@ -2725,7 +2987,8 @@ static void io_dma_unmap_batch_entries(struct io_kiocb *req,
 static ssize_t io_dma_flush_batch(struct io_kiocb *req,
 				  struct device *dev, struct dma_chan *chan,
 				  struct io_dma_batch_entry *entries,
-				  unsigned int nr_entries, u32 off)
+				  unsigned int nr_entries, u32 off,
+				  bool can_wait)
 {
 	ssize_t total = 0;
 	unsigned int i;
@@ -2737,7 +3000,7 @@ static ssize_t io_dma_flush_batch(struct io_kiocb *req,
 	if (nr_entries < IO_DMA_BATCH_MIN) {
 		for (i = 0; i < nr_entries; i++) {
 			ret = io_dma_submit_single_entry(req, chan, &entries[i],
-							 off + total);
+							 off + total, can_wait);
 			if (ret < 0) {
 				/* A failed submit never consumes the entry's
 				 * source mapping, so release this entry and
@@ -2753,7 +3016,8 @@ static ssize_t io_dma_flush_batch(struct io_kiocb *req,
 		return total;
 	}
 
-	ret = io_dma_submit_batch(req, dev, chan, entries, nr_entries, off);
+	ret = io_dma_submit_batch(req, dev, chan, entries, nr_entries, off,
+				  can_wait);
 	if (ret < 0)
 		io_dma_unmap_batch_entries(req, dev, entries, nr_entries);
 	return ret;
@@ -2871,6 +3135,7 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 	struct dma_chan *chan;
 	struct device *dev;
 	struct io_pfn_cache *pfn_cache;
+	bool can_wait = !(iocb->ki_flags & IOCB_NOWAIT);
 	size_t map_quantum;
 	struct folio_batch fbatch;
 	struct io_dma_batch_entry *entries;
@@ -2923,6 +3188,12 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 		return -EINVAL;
 	if (unlikely(iocb->ki_pos >= inode->i_sb->s_maxbytes))
 		return 0;
+	/* Device budget admission. Reads are refused only when even their
+	 * full-budget headroom is gone, since writers are capped at
+	 * wr_pct below it. A refusal falls back to the buffered read.
+	 */
+	if (io_dma_budget_refuse_rd(chan))
+		return -EAGAIN;
 
 	/*
 	 * We never block on the read datapath. On failure the caller
@@ -3082,7 +3353,8 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 
 					ret = io_dma_flush_batch(req, dev, chan,
 						entries, nr_entries,
-						dst_offset - batch_bytes);
+						dst_offset - batch_bytes,
+						can_wait);
 					nr_entries = 0;
 					if (ret < 0) {
 						error = ret;
@@ -3157,7 +3429,7 @@ flush_and_put:
 
 			ret = io_dma_flush_batch(req, dev, chan,
 				entries, nr_entries,
-				dst_offset - batch_bytes);
+				dst_offset - batch_bytes, can_wait);
 			nr_entries = 0;
 			if (ret < 0) {
 				if (!error)
@@ -3309,7 +3581,8 @@ static int io_dma_fmw_wait(struct io_dma_fmw_ck *cookies, unsigned int *nr,
 				 */
 				for (j = i; j < *nr; j++)
 					io_dma_qstat_complete(cookies[j].chan,
-							cookies[j].len, 0, 0);
+							cookies[j].len, 0, 0,
+							true);
 				*nr = 0;
 				return -ETIMEDOUT;
 			}
@@ -3330,7 +3603,7 @@ static int io_dma_fmw_wait(struct io_dma_fmw_ck *cookies, unsigned int *nr,
 		 */
 		io_dma_qstat_complete(chan, cookies[i].len,
 				      st == DMA_COMPLETE ?
-						cookies[i].submit_ns : 0, 0);
+						cookies[i].submit_ns : 0, 0, true);
 	}
 	*nr = 0;
 	return 0;
@@ -3363,6 +3636,28 @@ static void io_dma_fmw_issue(struct io_ring_ctx *ctx, unsigned long *issued)
 	for_each_set_bit(i, issued, IO_DMA_RING_CHANS)
 		dma_async_issue_pending(io_dma_stripe_chan(ctx, i));
 	*issued = 0;
+}
+
+/*
+ * A destination piece's device is over its write budget. This group's own
+ * unreaped descriptors count against that budget, so reap them and ask
+ * once more before refusing. Returns true when the piece is refused, or
+ * when the reap wedged, which *wedged then says.
+ */
+static bool io_dma_fmw_refused(struct io_ring_ctx *ctx, struct dma_chan *pchan,
+			       struct io_dma_fmw_ck *cookies,
+			       unsigned int *nr_cookies, unsigned long *issued,
+			       bool *redo, int *wedged)
+{
+	if (!io_dma_budget_refuse_wr(pchan))
+		return false;
+	if (!*nr_cookies)
+		return true;
+	io_dma_fmw_issue(ctx, issued);
+	*wedged = io_dma_fmw_wait(cookies, nr_cookies, redo);
+	if (*wedged)
+		return true;
+	return io_dma_budget_refuse_wr(pchan);
 }
 
 static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
@@ -3527,7 +3822,7 @@ static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
 				dma_addr_t d;
 
 				if (nr_dst == max_dst) {
-					redo = true;
+					chunk_redo = true;
 					break;
 				}
 				/* An orphaned channel completes nothing: leave
@@ -3535,7 +3830,23 @@ static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
 				 * nothing.
 				 */
 				if (dma_chan_orphaned(pchan)) {
-					redo = true;
+					chunk_redo = true;
+					break;
+				}
+				if (io_dma_fmw_refused(ctx, pchan, cookies,
+						       &nr_cookies, &issued,
+						       &redo, &wedged)) {
+					if (wedged)
+						goto collect_done;
+					/*
+					 * Over that device's in-flight
+					 * budget: this folio goes to the
+					 * CPU-redo pass. The budget is
+					 * re-checked per piece, so a
+					 * draining queue readmits the next
+					 * folio mid-write.
+					 */
+					chunk_redo = true;
 					break;
 				}
 				pm = pc ?
@@ -3624,7 +3935,7 @@ static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
 							.chan = chan,
 						};
 					issued |= BIT(cur_dst->stripe);
-					io_dma_qstat_submit(chan, len);
+					io_dma_qstat_submit(chan, len, true);
 				}
 				if (nr_cookies == max_cookies) {
 					io_dma_fmw_issue(ctx, &issued);
@@ -3962,10 +4273,22 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
 		req->dma.min_fail_off = min(req->dma.min_fail_off, dma->off);
 	}
 
-	io_dma_qstat_complete(dma->chan, task_len, dma->submit_ns, done_ns);
+	io_dma_qstat_complete(dma->chan, task_len,
+			      dma->submit_ns, done_ns, false);
 
 	/* Free the task before touching the refcnt. task_len was saved above. */
 	atomic_dec(&req->ctx->dma.tasks_pending);
+	if (READ_ONCE(io_dma_ring_max_descs)) {
+		/*
+		 * Order the dec against the waitqueue_active() read; the
+		 * waiter's prepare_to_wait() barrier pairs with it. Plain
+		 * atomic_dec() has no return and so no implicit ordering.
+		 */
+		smp_mb__after_atomic();
+		/* The waiter checks the count after prepare_to_wait(). */
+		if (waitqueue_active(&req->ctx->dma.inflight_wq))
+			wake_up(&req->ctx->dma.inflight_wq);
+	}
 	io_dma_task_free(req->ctx, dma);
 	req->dma.dma_refcnt--;
 

@@ -1006,6 +1006,29 @@ static int __io_read(struct io_kiocb *req, struct io_br_sel *sel,
 			 * the reason.
 			 */
 			io_dma_fm_record(IO_DMA_FM_FS_CHECK);
+		} else if ((req->flags & REQ_F_NOWAIT) && io_dma_cap_over(req->ctx)) {
+			/*
+			 * RWF_NOWAIT cannot be deferred to io-wq: -EAGAIN
+			 * would reach the application, for data the
+			 * buffered read can serve from the page cache
+			 * without blocking. Over the cap it takes that path.
+			 */
+			io_dma_fm_record(IO_DMA_FM_CAP_BYPASS);
+		} else if (io_dma_cap_defer(req->ctx, force_nonblock)) {
+			/*
+			 * Bounded outstanding. Excess submissions deepen
+			 * the poll list and the completion-detection
+			 * latency with it, and throughput over queue
+			 * depth peaks well below what applications
+			 * commonly drive. Past the cap a nowait pass
+			 * defers to io-wq; the io-wq pass slept in the
+			 * helper until the ring drained below the cap,
+			 * so the excess waits instead of either
+			 * shattering into CPU tails or burning the CPU
+			 * on an immediate fallback copy.
+			 */
+			io_dma_fm_record(IO_DMA_FM_DEFERRED);
+			return -EAGAIN;
 		} else {
 			io_uring_dma_prep(req);
 			/*

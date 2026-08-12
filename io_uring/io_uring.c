@@ -2470,6 +2470,7 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 	atomic_set(&ctx->dma.poll_armed, 0);
 	atomic_set(&ctx->dma.diag_refs_taken, 0);
 	atomic_set(&ctx->dma.diag_refs_dropped, 0);
+	init_waitqueue_head(&ctx->dma.inflight_wq);
 
 	/*
 	 * One channel per device, in the pool's canonical order, so this
