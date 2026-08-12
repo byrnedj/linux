@@ -1104,6 +1104,16 @@ static unsigned int io_dma_qstat_bucket(u64 v)
 static u32 io_dma_budget_kb;			/* 0 = off */
 static u32 io_dma_budget_wr_pct = 75;
 
+/*
+ * Corruption investigation (mergedma + memory-capped cgroup): the DMA
+ * write path returns SHORT writes when write_begin() fails under
+ * reclaim, where generic_perform_write() would block and retry.
+ * fmw_short counts them; io_uring_dma_fmw_retry=1 retries ENOMEM with
+ * reclaim like the stock path (default 0 = historical behaviour).
+ */
+static atomic64_t io_dma_fmw_short;
+static u32 io_dma_fmw_retry;
+
 struct io_dma_devload {
 	void		*key;		/* dma_device*, identity only --
 					 * never dereferenced */
@@ -1344,6 +1354,8 @@ static int io_dma_lat_show(struct seq_file *m, void *v)
 	for (i = 0; i < IO_DMA_FMW_NR; i++)
 		seq_printf(m, "  %-12s %12llu\n", io_dma_fmw_names[i],
 			   atomic64_read(&io_dma_fmw[i]));
+	seq_printf(m, "  %-12s %12llu\n", "short_write",
+		   (u64)atomic64_read(&io_dma_fmw_short));
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(io_dma_lat);
@@ -1376,6 +1388,7 @@ static ssize_t io_dma_lat_reset_write(struct file *file,
 		atomic64_set(&io_dma_fm[i], 0);
 	for (i = 0; i < IO_DMA_FMW_NR; i++)
 		atomic64_set(&io_dma_fmw[i], 0);
+	atomic64_set(&io_dma_fmw_short, 0);
 	io_dma_qstat_reset();
 	return count;
 }
@@ -1658,6 +1671,8 @@ void io_dma_debugfs_init(void)
 			   &io_dma_budget_kb);
 	debugfs_create_u32("io_uring_dma_budget_wr_pct", 0644, NULL,
 			   &io_dma_budget_wr_pct);
+	debugfs_create_u32("io_uring_dma_fmw_retry", 0644, NULL,
+			   &io_dma_fmw_retry);
 	debugfs_create_file("io_uring_dma_latency", 0444, NULL, NULL,
 			    &io_dma_lat_fops);
 	debugfs_create_file("io_uring_dma_latency_reset", 0200, NULL, NULL,
@@ -3704,6 +3719,7 @@ ssize_t io_dma_filemap_write(struct io_kiocb *req, struct kiocb *iocb,
 	bool redo = false;
 	bool surrendered = false;
 	unsigned int prep_fails = 0;
+	unsigned int retries = 0;
 	int wedged = 0;
 
 	inode_lock(inode);
@@ -3743,10 +3759,26 @@ ssize_t io_dma_filemap_write(struct io_kiocb *req, struct kiocb *iocb,
 		status = aops->write_begin(iocb, mapping, pos, bytes,
 					   &folio, &fsdata);
 		if (unlikely(status < 0)) {
+			/*
+			 * The stock buffered path never surfaces this:
+			 * generic_perform_write() blocks in reclaim and
+			 * retries.  Bailing here instead returns a SHORT
+			 * write -- rare unloaded, common under cgroup
+			 * memory pressure.  fmw_retry mimics the stock
+			 * behaviour; fmw_short counts every short return
+			 * for the corruption investigation.
+			 */
+			if (READ_ONCE(io_dma_fmw_retry) &&
+			    status == -ENOMEM && retries++ < 64) {
+				balance_dirty_pages_ratelimited(mapping);
+				cond_resched();
+				continue;
+			}
 			if (!written)
 				err = status;
 			break;
 		}
+		retries = 0;
 		offset = offset_in_folio(folio, pos);
 		bytes = min_t(size_t, bytes, folio_size(folio) - offset);
 
@@ -3931,8 +3963,11 @@ out_unlock:
 	inode_unlock(inode);
 	kvfree(fol);
 	kvfree(cookies);
-	if (written > 0)
+	if (written > 0) {
+		if (written < want)
+			atomic64_inc(&io_dma_fmw_short);
 		return generic_write_sync(iocb, written) ?: written;
+	}
 	return err;
 }
 
