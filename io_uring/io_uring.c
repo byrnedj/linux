@@ -2316,6 +2316,29 @@ static bool io_dma_pool_filter_dev(struct dma_chan *chan, void *param)
 }
 
 /*
+ * Whether the table no longer lists @dev and no ring holds a channel of
+ * it, so that nothing accounts to its stat slot any more. A held
+ * channel keeps its device readable, an orphaned one included.
+ */
+static bool io_dma_pool_dev_unused(struct device *dev)
+{
+	int d, i;
+
+	lockdep_assert_held(&io_dma_pool_mutex);
+
+	for (d = 0; d < io_dma_pool_ndevs; d++) {
+		struct io_dma_pool_dev *pd = &io_dma_pool[d];
+
+		if (pd->dev == dev)
+			return false;
+		for (i = 0; i < pd->nr; i++)
+			if (pd->chans[i].chan->device->dev == dev)
+				return false;
+	}
+	return true;
+}
+
+/*
  * Retire the entries of removed devices and unpin them. Channels that
  * rings still hold on a removed device stay in its slot, where
  * io_dma_pool_put() finds them by channel. The pin keeps the device
@@ -2339,10 +2362,14 @@ static void io_dma_pool_retire(void)
 		 * creation.
 		 */
 		if (pd->dev && !data_race(device_is_registered(pd->dev))) {
-			put_device(pd->dev);
+			struct device *dev = pd->dev;
+
 			pd->dev = NULL;
 			pd->retired = pass;
 			io_dma_pool_retired = pass;
+			if (io_dma_pool_dev_unused(dev))
+				io_dma_dev_stat_release(dev);
+			put_device(dev);
 		}
 	}
 }
@@ -2510,8 +2537,22 @@ static void io_dma_pool_put(struct dma_chan *chan)
 			if (pd->chans[i].chan != chan)
 				continue;
 			if (--pd->chans[i].refcnt == 0) {
+				struct device *dev = chan->device->dev;
+
+				/* Drained by teardown; free its stats slot
+				 * before the channel can be recycled.
+				 */
+				io_dma_qstat_forget(chan);
 				dma_release_channel(chan);
 				pd->chans[i] = pd->chans[--pd->nr];
+				/*
+				 * The last channel of a retired device frees
+				 * its device stat slot. The device is compared
+				 * and not dereferenced, since the release may
+				 * have dropped its last reference.
+				 */
+				if (io_dma_pool_dev_unused(dev))
+					io_dma_dev_stat_release(dev);
 			}
 			goto out;
 		}
