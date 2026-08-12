@@ -3446,6 +3446,7 @@ static const char * const io_dma_fmw_names[IO_DMA_FMW_NR] = {
 	[IO_DMA_FMW_CPU_REDO] = "cpu_redo",
 	[IO_DMA_FMW_ERROR] = "error",
 	[IO_DMA_FMW_FS_DECLINE] = "fs_decline",
+	[IO_DMA_FMW_SHORT] = "short_write",
 };
 static atomic64_t io_dma_fmw[IO_DMA_FMW_NR];
 
@@ -3482,8 +3483,6 @@ static ssize_t io_dma_lat_reset_write(struct file *file,
 		atomic64_set(&io_dma_fmw[i], 0);
 	for (i = 0; i < IO_DMA_FM_NR; i++)
 		atomic64_set(&io_dma_fm[i], 0);
-	for (i = 0; i < IO_DMA_FMW_NR; i++)
-		atomic64_set(&io_dma_fmw[i], 0);
 	io_dma_qstat_reset();
 	return count;
 }
@@ -5115,13 +5114,14 @@ static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
 			 * next group retries the chunk with nothing held,
 			 * where ext4 falls back or retries the allocation.
 			 * A failure there ends the write short, as on the
-			 * stock path. Until then the group's earlier folios
-			 * stay locked, so reclaim has less to work with. On
-			 * a filesystem that truncates failed writes those
-			 * folios all lie inside EOF, so the truncation from
-			 * EOF never waits on one. ext4 returns -EAGAIN under
-			 * the flag only where it would have opened a handle,
-			 * so that lowers the cap as a handle does below.
+			 * stock path, and short_write counts it. Until then
+			 * the group's earlier folios stay locked, so reclaim
+			 * has less to work with. On a filesystem that
+			 * truncates failed writes those folios all lie
+			 * inside EOF, so the truncation from EOF never waits
+			 * on one. ext4 returns -EAGAIN under the flag only
+			 * where it would have opened a handle, so that
+			 * lowers the cap as a handle does below.
 			 */
 			if (status == -EAGAIN && nr_fol)
 				*fol_cap = 1;
@@ -5733,8 +5733,19 @@ out_unlock:
 	kvfree(fol);
 	kvfree(cookies);
 	kvfree(dsts);
-	if (written > 0)
+	if (written > 0) {
+		/*
+		 * A write ends short where the stock path also would: a
+		 * write_begin() failure on the first chunk of a group, a
+		 * group whose first folio commits nothing, or a fatal
+		 * signal before the next group. A device wedge after an
+		 * earlier group committed ends it short too, and counts as
+		 * error as well. short_write counts them all.
+		 */
+		if (written < want)
+			io_dma_fmw_record(IO_DMA_FMW_SHORT);
 		return generic_write_sync(iocb, written) ?: written;
+	}
 	return err;
 }
 
