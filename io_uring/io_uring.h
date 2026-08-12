@@ -620,6 +620,7 @@ enum {
 	IO_DMA_FMW_EAGAIN,
 	IO_DMA_FMW_CPU_REDO,	/* DMA timeout or error, idempotent CPU re-copy */
 	IO_DMA_FMW_ERROR,
+	IO_DMA_FMW_SHORT,	/* write_begin failure yielded a short write */
 	IO_DMA_FMW_NR,
 };
 void io_dma_fmw_record(unsigned int reason);
