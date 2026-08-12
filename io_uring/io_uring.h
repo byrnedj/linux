@@ -593,6 +593,13 @@ void io_dma_init_freelist(struct io_ring_ctx *ctx, struct io_uring_params *p);
 int io_dma_submit_queued_tasks(struct io_kiocb *req);
 ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 			    u64 dst_user_addr, size_t want);
+/*
+ * io_dma_filemap_read() result for a read the outstanding-task cap holds
+ * back before it maps anything, when the read must not sleep. Like
+ * IOU_REQUEUE it is not a valid error code, so no failure of the read can
+ * alias it.
+ */
+#define IO_DMA_READ_CAPPED	(-3073)
 extern struct kmem_cache *dma_cachep;
 int __io_dma_poll(struct io_ring_ctx *ctx);
 
@@ -648,6 +655,8 @@ enum {
 	IO_DMA_FM_EFAULT,
 	IO_DMA_FM_OTHER,
 	IO_DMA_FM_CPU_TAIL,
+	IO_DMA_FM_DEFERRED,
+	IO_DMA_FM_CAP_BYPASS,	/* a read over the cap took the CPU path */
 	IO_DMA_FM_FS_CHECK,	/* the filesystem's own checks refused the read */
 	IO_DMA_FM_CPU_REDO,	/* a DMA failure or a short claim left the rest
 				 * to a reissue
@@ -660,6 +669,7 @@ void io_dma_qstat_forget(struct dma_chan *chan);
 void io_dma_dev_stat_release(struct device *dev);
 extern unsigned int io_dma_stripe_chans;
 void io_pfn_cache_prepare(struct dma_chan *chan);
+extern unsigned int io_dma_ring_max_descs;
 int kiocb_done(struct io_kiocb *req, ssize_t ret, struct io_br_sel *sel, unsigned int issue_flags);
 void io_submit_flush_completions(struct io_ring_ctx *ctx);
 

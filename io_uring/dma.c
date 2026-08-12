@@ -8,6 +8,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/spinlock.h>
 #include <linux/xarray.h>
+#include <linux/hash.h>
 #include <linux/pagemap.h>
 #include <linux/folio_batch.h>
 #include <linux/swap.h>
@@ -137,6 +138,7 @@ struct io_pfn_cache {
 	atomic64_t		evictions;
 	atomic64_t		age_evictions;	/* retired for idleness */
 	atomic64_t		ref_skips;	/* sweep passed an in-flight entry */
+
 	/*
 	 * Ghost list: the keys, and only the keys, of segments the cap
 	 * recently forced out, each stored as an xarray value holding
@@ -2699,6 +2701,16 @@ DEFINE_DEBUGFS_ATTRIBUTE(io_dma_fmw_wait_ms_fops, io_dma_fmw_wait_ms_get,
 			 io_dma_fmw_wait_ms_set, "%llu\n");
 
 /*
+ * Bounded outstanding: past this many unreaped descriptors on one ring,
+ * a nowait-pass read defers to io-wq instead of engaging, so excess
+ * submissions wait rather than deepening the poll list and the
+ * detection latency with it. Throughput against queue depth is not
+ * monotonic; the peak sits near two thousand descriptors machine-wide,
+ * and an application driving past it loses close to a third. 0 is off.
+ */
+unsigned int io_dma_ring_max_descs __read_mostly;
+
+/*
  * Per-transaction DMA latency tracking, binned by transfer size. A
  * transaction is one io_dma_task, either a descriptor or a batch. It
  * is stamped at hardware submit and sampled when the poller observes
@@ -2752,6 +2764,8 @@ static const char * const io_dma_fm_names[IO_DMA_FM_NR] = {
 	[IO_DMA_FM_EFAULT] = "efault",
 	[IO_DMA_FM_OTHER] = "other",
 	[IO_DMA_FM_CPU_TAIL] = "cpu_tail",
+	[IO_DMA_FM_DEFERRED] = "deferred",
+	[IO_DMA_FM_CAP_BYPASS] = "cap_bypass",
 	[IO_DMA_FM_FS_CHECK] = "fs_check",
 	[IO_DMA_FM_CPU_REDO] = "cpu_redo",
 	[IO_DMA_FM_DONTCACHE] = "dontcache",
@@ -2832,9 +2846,15 @@ struct io_dma_chan_qstat {
 struct io_dma_dev_stat {
 	void		*key;		/* provider's device, identity only */
 	char		name[24];	/* captured at registration */
+	atomic64_t	inflight;	/* all classes, descriptors */
+	atomic64_t	inflight_wr;	/* write-sink descriptors */
+	atomic64_t	rej_rd;
+	atomic64_t	rej_wr;
 	struct io_dma_chan_qstat chans[IO_DMA_STAT_CHANS];
 };
 static struct io_dma_dev_stat io_dma_dev_stats[IO_DMA_STAT_DEVS];
+/* Advanced each time a device slot is freed. */
+static unsigned long io_dma_dev_stat_gen;
 
 static DEFINE_SPINLOCK(io_dma_stat_slot_lock);
 
@@ -3025,6 +3045,7 @@ void io_dma_qstat_forget(struct dma_chan *chan)
  * Called under io_dma_pool_mutex once the pool no longer lists @dev and
  * no ring holds a channel of it. The slot is cleared and freed, so a
  * new device that gets the address starts from zero under its own name.
+ * The generation tells memoized misses that a slot has room again.
  */
 void io_dma_dev_stat_release(struct device *dev)
 {
@@ -3044,7 +3065,14 @@ void io_dma_dev_stat_release(struct device *dev)
 			q->name[0] = '\0';
 			WRITE_ONCE(q->released, false);
 		}
+		atomic64_set(&d->inflight, 0);
+		atomic64_set(&d->inflight_wr, 0);
+		atomic64_set(&d->rej_rd, 0);
+		atomic64_set(&d->rej_wr, 0);
 		WRITE_ONCE(d->key, NULL);
+		/* A scan that sees the new generation sees the free slot. */
+		smp_store_release(&io_dma_dev_stat_gen,
+				  io_dma_dev_stat_gen + 1);
 		break;
 	}
 	spin_unlock(&io_dma_stat_slot_lock);
@@ -3056,15 +3084,170 @@ static unsigned int io_dma_qstat_bucket(u64 v)
 			 IO_DMA_QSTAT_NBUCKETS - 1) : 0;
 }
 
-static void io_dma_qstat_submit(struct dma_chan *chan, u32 len)
+/*
+ * Per-device in-flight descriptor budget, the queueing bound for the
+ * channel-sharing design.  A device's work queues hold a fixed number
+ * of descriptor slots and the queueing delay for a new descriptor
+ * grows with the descriptors ahead of it.  Therefore bounding admitted
+ * descriptors bounds both by construction.  A budget at or below the
+ * configured WQ size means submissions never find the queue full.
+ *
+ * There are two classes.  The write sink is bulk and waits inline on
+ * its cookies, so it may hold at most budget*wr_pct/100 descriptors
+ * and refused chunks fall to the CPU-redo pass.  File reads are
+ * admitted while the total in flight is within the budget, so the
+ * remaining share is their guaranteed headroom.
+ *
+ * budget_descs 0, the default, disables all checks.  The counters live
+ * in the same per-device slot the queueing histograms use, so the
+ * submit and complete hooks resolve one registry entry and serve both,
+ * and per-device lines appear in chan_qstat.
+ */
+static u32 io_dma_budget_descs;			/* 0 = off */
+static u32 io_dma_budget_wr_pct = 75;
+
+/*
+ * Memo for the registry lookups. The submit and complete hooks run per
+ * descriptor and the two linear scans behind them showed up as several
+ * percent of submit-path CPU. The memo is validated against the
+ * authoritative fields, so a torn or stale entry can never return the
+ * wrong slot, only fall back to the scans.
+ */
+struct io_dma_stat_memo {
+	struct dma_chan		*chan;
+	struct io_dma_dev_stat	*d;
+	struct io_dma_chan_qstat *q;
+	struct device		*miss;	/* found no device slot */
+	unsigned long		gen;	/* io_dma_dev_stat_gen at the miss */
+};
+/*
+ * Per CPU, not hashed and shared: a global memo array written on every
+ * miss by every submitting CPU was a cacheline storm that cost more
+ * than the scans it saved. Each CPU tends to feed one ring and so one
+ * channel, so a single private entry hits almost always and a miss
+ * only rewrites a line this CPU owns.
+ */
+static DEFINE_PER_CPU(struct io_dma_stat_memo, io_dma_stat_memo_pcpu);
+
+static void io_dma_stat_lookup(struct dma_chan *chan,
+			       struct io_dma_dev_stat **dp,
+			       struct io_dma_chan_qstat **qp)
 {
-	struct io_dma_dev_stat *d = io_dma_dev_stat_get(chan);
+	struct io_dma_stat_memo *m = get_cpu_ptr(&io_dma_stat_memo_pcpu);
+	struct io_dma_dev_stat *d = m->d;
+	struct io_dma_chan_qstat *q = m->q;
+	unsigned long gen;
+
+	if (m->chan == chan && d && q &&
+	    READ_ONCE(d->key) == chan->device->dev &&
+	    io_dma_qstat_live(q, chan)) {
+		put_cpu_ptr(&io_dma_stat_memo_pcpu);
+		*dp = d;
+		*qp = q;
+		return;
+	}
+	/*
+	 * A full registry gains room only when a slot is freed, so a miss
+	 * holds until the generation moves, and a device without a slot does
+	 * not rescan the registry on every op.
+	 */
+	if (m->chan == chan && !d && m->miss == chan->device->dev &&
+	    m->gen == READ_ONCE(io_dma_dev_stat_gen)) {
+		put_cpu_ptr(&io_dma_stat_memo_pcpu);
+		*dp = NULL;
+		*qp = NULL;
+		return;
+	}
+	/*
+	 * The scans run outside the per-CPU section, because a slot
+	 * transition takes io_dma_stat_slot_lock and that lock sleeps on
+	 * PREEMPT_RT. The result is stored in a second short per-CPU
+	 * section, on whichever CPU the task runs by then, and the
+	 * validation above makes such an entry as safe as any other.
+	 */
+	put_cpu_ptr(&io_dma_stat_memo_pcpu);
+	/* Pairs with io_dma_dev_stat_release(). */
+	gen = smp_load_acquire(&io_dma_dev_stat_gen);
+	d = io_dma_dev_stat_get(chan);
+	q = d ? io_dma_qstat_get(d, chan) : NULL;
+	if (!d || q) {
+		m = get_cpu_ptr(&io_dma_stat_memo_pcpu);
+		m->d = d;
+		m->q = q;
+		m->chan = chan;
+		m->miss = d ? NULL : chan->device->dev;
+		m->gen = gen;
+		put_cpu_ptr(&io_dma_stat_memo_pcpu);
+	}
+	*dp = d;
+	*qp = q;
+}
+
+/*
+ * Per-piece write admission. Returns the device's slot when the device
+ * is at its budget or at its write share, or NULL to admit the piece.
+ * io_dma_fmw_refused() may ask twice for one piece, so it counts a
+ * refused piece in rej_wr itself.
+ */
+static struct io_dma_dev_stat *io_dma_budget_refuse_wr(struct dma_chan *chan)
+{
+	u64 budget = READ_ONCE(io_dma_budget_descs);
+	struct io_dma_dev_stat *d;
+
+	if (!budget)
+		return NULL;
+	{
+		struct io_dma_chan_qstat *q;
+
+		io_dma_stat_lookup(chan, &d, &q);
+	}
+	if (!d)
+		return NULL;
+	if (atomic64_read(&d->inflight) >= budget ||
+	    atomic64_read(&d->inflight_wr) >=
+			div_u64(budget * min(READ_ONCE(io_dma_budget_wr_pct), 100U), 100))
+		return d;
+	return NULL;
+}
+
+/*
+ * Whole-read admission at __io_dma_filemap_read() entry.  A refusal
+ * falls back to the buffered read and is counted under the eagain
+ * reason.
+ */
+static bool io_dma_budget_refuse_rd(struct dma_chan *chan)
+{
+	u64 budget = READ_ONCE(io_dma_budget_descs);
+	struct io_dma_dev_stat *d;
+
+	if (!budget)
+		return false;
+	{
+		struct io_dma_chan_qstat *q;
+
+		io_dma_stat_lookup(chan, &d, &q);
+	}
+	if (!d)
+		return false;
+	if (atomic64_read(&d->inflight) > budget) {
+		atomic64_inc(&d->rej_rd);
+		return true;
+	}
+	return false;
+}
+
+static void io_dma_qstat_submit(struct dma_chan *chan, u32 len, bool wr)
+{
+	struct io_dma_dev_stat *d;
 	struct io_dma_chan_qstat *q;
 	u64 now, hwm;
 
+	io_dma_stat_lookup(chan, &d, &q);
 	if (!d)
 		return;
-	q = io_dma_qstat_get(d, chan);
+	atomic64_inc(&d->inflight);
+	if (wr)
+		atomic64_inc(&d->inflight_wr);
 	if (!q)
 		return;
 	atomic64_inc(&q->seen_kb[io_dma_qstat_bucket(
@@ -3088,23 +3271,27 @@ static void io_dma_qstat_submit(struct dma_chan *chan, u32 len)
  * the task, so those costs do not inflate the latency.
  */
 static void io_dma_qstat_complete(struct dma_chan *chan, u32 len, u64 submit_ns,
-				  u64 done_ns)
+				  u64 done_ns, bool wr)
 {
-	struct io_dma_dev_stat *d = io_dma_dev_stat_get(chan);
+	struct io_dma_dev_stat *d;
 	struct io_dma_chan_qstat *q;
 	s64 old, new;
 
+	io_dma_stat_lookup(chan, &d, &q);
 	if (!d)
-		return;
-	q = io_dma_qstat_get(d, chan);
-	if (!q)
 		return;
 	/*
 	 * A device that missed a full registry can gain a freed slot while
 	 * ops it never counted are in flight, and their completions would
-	 * drive the count below zero. The count therefore stops at zero, so
-	 * such a slot undercounts until those ops drain.
+	 * drive the counts below zero, where the budget reads them as huge
+	 * and refuses every op. The counts therefore stop at zero, so such
+	 * a slot undercounts until those ops drain, which fails open.
 	 */
+	atomic64_dec_if_positive(&d->inflight);
+	if (wr)
+		atomic64_dec_if_positive(&d->inflight_wr);
+	if (!q)
+		return;
 	old = atomic64_read(&q->inflight);
 	do {
 		new = old > len ? old - len : 0;
@@ -3152,6 +3339,20 @@ static int io_dma_chan_qstat_show(struct seq_file *m, void *v)
 			seq_puts(m, "\n");
 		}
 	}
+	for (i = 0; i < IO_DMA_STAT_DEVS; i++) {
+		struct io_dma_dev_stat *d = &io_dma_dev_stats[i];
+
+		if (!READ_ONCE(d->key))
+			continue;	/* freed slots leave holes */
+		seq_printf(m, "device %s inflight_descs %llu wr_descs %llu rej_rd %llu rej_wr %llu budget_descs %u wr_pct %u\n",
+			   d->name,
+			   (u64)atomic64_read(&d->inflight),
+			   (u64)atomic64_read(&d->inflight_wr),
+			   (u64)atomic64_read(&d->rej_rd),
+			   (u64)atomic64_read(&d->rej_wr),
+			   READ_ONCE(io_dma_budget_descs),
+			   READ_ONCE(io_dma_budget_wr_pct));
+	}
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(io_dma_chan_qstat);
@@ -3193,6 +3394,13 @@ static void io_dma_qstat_reset(void)
 				atomic64_set(&q->seen_kb[b], 0);
 			}
 		}
+	}
+	for (i = 0; i < IO_DMA_STAT_DEVS; i++) {
+		if (!READ_ONCE(io_dma_dev_stats[i].key))
+			continue;
+		/* The live inflight and inflight_wr counts stay. */
+		atomic64_set(&io_dma_dev_stats[i].rej_rd, 0);
+		atomic64_set(&io_dma_dev_stats[i].rej_wr, 0);
 	}
 }
 
@@ -3309,11 +3517,14 @@ void io_dma_debugfs_init(void)
 
 	debugfs_create_file("chan_qstat", 0444, dir, NULL,
 			    &io_dma_chan_qstat_fops);
+	debugfs_create_u32("budget_descs", 0644, dir, &io_dma_budget_descs);
+	debugfs_create_u32("budget_wr_pct", 0644, dir, &io_dma_budget_wr_pct);
 	debugfs_create_u32("cq_poll_us", 0644, dir, &io_dma_cq_poll_us);
 	debugfs_create_u32("fmw_spin_us", 0644, dir, &io_dma_fmw_spin_us);
 	debugfs_create_file_unsafe("fmw_wait_ms", 0644, dir, NULL,
 				   &io_dma_fmw_wait_ms_fops);
 	debugfs_create_u32("stripe_chans", 0644, dir, &io_dma_stripe_chans);
+	debugfs_create_u32("ring_max_descs", 0644, dir, &io_dma_ring_max_descs);
 	debugfs_create_u32("stats", 0644, dir, &io_dma_stats_enabled);
 	debugfs_create_file("latency", 0444, dir, NULL, &io_dma_lat_fops);
 	debugfs_create_file("latency_reset", 0200, dir, NULL,
@@ -3566,7 +3777,7 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 		io_dma_task_free(req->ctx, dma);
 		return -EAGAIN;	/* The WQ may be full. Fall back to CPU copy. */
 	}
-	io_dma_qstat_submit(chan, dma->len);
+	io_dma_qstat_submit(chan, dma->len, false);
 
 	/* Take folio references for the duration of the DMA. */
 	for (i = 0; i < nr_entries; i++)
@@ -3641,7 +3852,7 @@ static ssize_t io_dma_submit_single_entry(struct io_kiocb *req,
 		io_dma_task_free(req->ctx, dma);
 		return -EAGAIN;	/* The WQ may be full. Fall back to CPU copy. */
 	}
-	io_dma_qstat_submit(chan, dma->len);
+	io_dma_qstat_submit(chan, dma->len, false);
 
 	req->dma.dma_refcnt++;
 
@@ -3895,6 +4106,82 @@ static struct dma_chan *io_dma_stripe_chan(struct io_ring_ctx *ctx,
 	return ctx->dma.nr_chans ? ctx->dma.chans[stripe] : ctx->dma.chan;
 }
 
+/*
+ * Wait for the reaper to drain the ring below the outstanding-task cap.
+ * The waits are exclusive, so a wakeup wakes one waiter instead of the
+ * whole queue. The waiter reads the cap again on every pass, so a cap
+ * changed meanwhile applies from its next wakeup. The wait is
+ * time-bounded, so a missed wakeup costs at most the bound and never
+ * wedges the read. Returns false when the bound ran out with the ring
+ * still at or over the cap. It stays out of line, so that its wait entry
+ * does not grow the frame of every read.
+ */
+static noinline bool io_dma_cap_wait(struct io_ring_ctx *ctx)
+{
+	long left = msecs_to_jiffies(20);
+	bool below = true;
+	DEFINE_WAIT(wait);
+
+	for (;;) {
+		unsigned int cap;
+
+		prepare_to_wait_exclusive(&ctx->dma.inflight_wq, &wait,
+					  TASK_UNINTERRUPTIBLE);
+		cap = READ_ONCE(io_dma_ring_max_descs);
+		if (!cap || atomic_read(&ctx->dma.tasks_pending) < cap)
+			break;
+		if (!left) {
+			below = false;
+			break;
+		}
+		left = schedule_timeout(left);
+	}
+	finish_wait(&ctx->dma.inflight_wq, &wait);
+	return below;
+}
+
+/*
+ * Wake one cap waiter if the ring is below the cap, and nobody at or over
+ * it. The reaper calls this after every retired task, once it has dropped
+ * ctx->dma.lock, so the wakeup stays out of the reaper's interrupts-off
+ * section. A read the wait let through that queued no descriptors calls
+ * it too, so that its turn passes to the next waiter.
+ */
+static void io_dma_cap_wake(struct io_ring_ctx *ctx)
+{
+	unsigned int cap = READ_ONCE(io_dma_ring_max_descs);
+
+	if (likely(!cap) || atomic_read(&ctx->dma.tasks_pending) >= cap)
+		return;
+	/*
+	 * The barrier in wq_has_sleeper() orders the retire's decrement
+	 * against the waitqueue_active() read, as the one in
+	 * prepare_to_wait_exclusive() orders the waiter's queueing against
+	 * its count check.
+	 */
+	if (wq_has_sleeper(&ctx->dma.inflight_wq))
+		wake_up(&ctx->dma.inflight_wq);
+}
+
+/*
+ * The outstanding-task cap, the last gate of a read. Every gate before it
+ * may refuse the read, and a refused read adds no descriptors to the poll
+ * list the cap bounds, so the cap never holds such a read back. Nor does
+ * it hold back a read whose registered buffer is not mapped on the device
+ * of its first stripe. That read fails at its first entry and takes the
+ * CPU copy, as it does under the cap, and still moves the rotation on.
+ */
+static bool io_dma_cap_holds(struct io_ring_ctx *ctx,
+			     struct io_mapped_ubuf *imu, struct device *dev,
+			     u64 dst_user_addr)
+{
+	unsigned int cap = READ_ONCE(io_dma_ring_max_descs);
+
+	if (likely(!cap) || atomic_read(&ctx->dma.tasks_pending) < cap)
+		return false;
+	return io_reg_buf_dma_addr(imu, dst_user_addr, NULL, dev) != 0;
+}
+
 /* Reads at or below this size fall back to the CPU copy path */
 #define IO_DMA_MIN_READ_BYTES	SZ_16K
 
@@ -3905,12 +4192,15 @@ static struct dma_chan *io_dma_stripe_chan(struct io_ring_ctx *ctx,
  * buffer pages.  Uses dmaengine_prep_dma_memcpy_sg() to submit all
  * chunks in a folio batch as a single DSA batch descriptor.
  *
- * Returns bytes read (>0), 0 at EOF, or negative error.
+ * Returns bytes read (>0), 0 at EOF, IO_DMA_READ_CAPPED for a read the
+ * outstanding-task cap holds back when @apply_cap is set, or negative
+ * error.
  * Caller must call io_dma_submit_queued_tasks() after this returns >0
  * with dma_refcnt > 0 to drain the queued DMA tasks.
  */
-ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
-			    u64 dst_user_addr, size_t want)
+static ssize_t __io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
+				     u64 dst_user_addr, size_t want,
+				     bool apply_cap)
 {
 	struct io_ring_ctx *ctx = req->ctx;
 	struct file *filp = iocb->ki_filp;
@@ -4002,6 +4292,17 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 		return -EINVAL;
 	if (unlikely(iocb->ki_pos >= inode->i_sb->s_maxbytes))
 		return 0;
+	/* Device budget admission. Reads are refused only when even their
+	 * full-budget headroom is gone, since writers are capped at
+	 * wr_pct below it. A refusal falls back to the buffered read. In
+	 * the rotation the next read moves on to the next device, since
+	 * the rotation is otherwise saved only past a read that ran.
+	 */
+	if (io_dma_budget_refuse_rd(chan)) {
+		if (!det_stripe)
+			WRITE_ONCE(ctx->dma.stripe_rr, stripe + 1);
+		return -EAGAIN;
+	}
 
 	/*
 	 * We never block on the read datapath. On failure the caller
@@ -4016,6 +4317,12 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 	if (unlikely(iocb->ki_pos >= isize)) {
 		kfree(entries);
 		return 0;
+	}
+
+	if (unlikely(apply_cap &&
+		     io_dma_cap_holds(ctx, imu, dev, dst_user_addr))) {
+		kfree(entries);
+		return IO_DMA_READ_CAPPED;
 	}
 
 	folio_batch_init(&fbatch);
@@ -4320,6 +4627,50 @@ put_folios:
 }
 
 /*
+ * The read behind the outstanding-task cap. Over the cap, a read that
+ * must not sleep, in the nowait pass or for RWF_NOWAIT, returns
+ * IO_DMA_READ_CAPPED, and the io-wq pass waits for the reaper to drain
+ * below the cap instead. A read whose wait runs out with the ring still
+ * at or over the cap returns IO_DMA_READ_CAPPED from the io-wq pass too,
+ * and takes the CPU copy, as an RWF_NOWAIT read over the cap does, so
+ * that the cap stays a bound on what one ring holds outstanding. The
+ * wait can last milliseconds, so a read it lets through starts over
+ * without the cap and takes its stripe and its size,
+ * end-of-file, channel and budget gates again. A channel orphaned
+ * meanwhile is then passed over, a budget used up meanwhile sends the
+ * read to the CPU, and rotating reads that waited together do not all
+ * start on the stripe that was current when they parked. The checks
+ * __io_read() makes before calling here run once, before the wait. Of
+ * those only the filesystem's can change meanwhile, and a shutdown during
+ * the wait goes unseen, as it does for a buffered read that blocks after
+ * ->read_iter has made the same check.
+ */
+ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
+			    u64 dst_user_addr, size_t want)
+{
+	ssize_t ret;
+
+	ret = __io_dma_filemap_read(req, iocb, dst_user_addr, want, true);
+	if (likely(ret != IO_DMA_READ_CAPPED) ||
+	    (iocb->ki_flags & IOCB_NOWAIT) || (req->flags & REQ_F_NOWAIT))
+		return ret;
+	if (!io_dma_cap_wait(req->ctx)) {
+		/* Its turn passes on, as for a read that queued nothing. */
+		io_dma_cap_wake(req->ctx);
+		return IO_DMA_READ_CAPPED;
+	}
+	ret = __io_dma_filemap_read(req, iocb, dst_user_addr, want, false);
+	/*
+	 * A read the wait let through that queued no descriptors passes its
+	 * turn on, since once the ring drains no retire is left to wake the
+	 * next waiter.
+	 */
+	if (!req->dma.dma_refcnt)
+		io_dma_cap_wake(req->ctx);
+	return ret;
+}
+
+/*
  * DMA-offloaded buffered write for registered buffers (WRITE_FIXED).
  * This replaces generic_perform_write()'s copy_folio_from_iter() with
  * DSA copies from the pre-mapped registered buffer into the page-cache
@@ -4440,7 +4791,8 @@ static int io_dma_fmw_wait(struct io_dma_fmw_ck *cookies, unsigned int *nr,
 			/* Latency is the time of the pass that saw it done. */
 			io_dma_qstat_complete(chan, cookies[i].len,
 					      st == DMA_COMPLETE ?
-						cookies[i].submit_ns : 0, 0);
+						cookies[i].submit_ns : 0, 0,
+					      true);
 		}
 		if (!left)
 			break;
@@ -4465,7 +4817,8 @@ static int io_dma_fmw_wait(struct io_dma_fmw_ck *cookies, unsigned int *nr,
 				dmaengine_async_is_tx_complete(cookies[i].chan,
 							       cookies[i].ck);
 				io_dma_qstat_complete(cookies[i].chan,
-						      cookies[i].len, 0, 0);
+						      cookies[i].len, 0, 0,
+						      true);
 			}
 			*stuck = busy;
 			*nr = 0;
@@ -4548,6 +4901,42 @@ static void io_dma_fmw_issue(struct io_ring_ctx *ctx, unsigned long *issued)
 	for_each_set_bit(i, issued, IO_DMA_RING_CHANS)
 		dma_async_issue_pending(io_dma_stripe_chan(ctx, i));
 	*issued = 0;
+}
+
+/*
+ * A destination piece's device is over its write budget. This group's own
+ * unreaped descriptors on that device count against that budget, so reap
+ * them and ask once more before refusing. The reap waits for the whole
+ * group. A group with nothing outstanding on that device refuses at once,
+ * since draining its other stripes could not change the answer. Returns
+ * true when the piece is refused, or when the reap wedged, which *wedged
+ * then says, with the wedged channel in *stuck.
+ */
+static bool io_dma_fmw_refused(struct io_ring_ctx *ctx, struct dma_chan *pchan,
+			       struct io_dma_fmw_ck *cookies,
+			       unsigned int *nr_cookies, unsigned long *issued,
+			       bool *redo, int *wedged, struct dma_chan **stuck)
+{
+	struct io_dma_dev_stat *d = io_dma_budget_refuse_wr(pchan);
+	unsigned int i;
+
+	if (!d)
+		return false;
+	for (i = 0; i < *nr_cookies; i++)
+		if (cookies[i].chan->device == pchan->device)
+			break;
+	if (i == *nr_cookies)
+		goto refuse;
+	io_dma_fmw_issue(ctx, issued);
+	*wedged = io_dma_fmw_wait(cookies, nr_cookies, redo, stuck);
+	if (*wedged)
+		return true;
+	d = io_dma_budget_refuse_wr(pchan);
+	if (!d)
+		return false;
+refuse:
+	atomic64_inc(&d->rej_wr);
+	return true;
 }
 
 /*
@@ -4903,6 +5292,23 @@ static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
 					chunk_redo = true;
 					break;
 				}
+				if (io_dma_fmw_refused(ctx, pchan, cookies,
+						       &nr_cookies, &issued,
+						       &redo, &wedged,
+						       &stuck)) {
+					if (wedged)
+						goto record;
+					/*
+					 * Over that device's in-flight
+					 * budget: this folio goes to the
+					 * CPU-redo pass. The budget is
+					 * re-checked per piece, so a
+					 * draining queue readmits the next
+					 * folio mid-write.
+					 */
+					chunk_redo = true;
+					break;
+				}
 				pm = pc ?
 					io_pfn_map_lookup(pc, folio,
 							  doff, plen,
@@ -4990,7 +5396,7 @@ static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
 							.chan = chan,
 						};
 					issued |= BIT(cur_dst->stripe);
-					io_dma_qstat_submit(chan, len);
+					io_dma_qstat_submit(chan, len, true);
 					targeted = true;
 				}
 				if (nr_cookies == max_cookies) {
@@ -5412,7 +5818,8 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
 		req->dma.min_fail_off = min(req->dma.min_fail_off, dma->off);
 	}
 
-	io_dma_qstat_complete(dma->chan, task_len, dma->submit_ns, done_ns);
+	io_dma_qstat_complete(dma->chan, task_len,
+			      dma->submit_ns, done_ns, false);
 
 	/* Free the task before touching the refcnt. task_len was saved above. */
 	atomic_dec(&req->ctx->dma.tasks_pending);
@@ -5709,6 +6116,7 @@ int __io_dma_poll(struct io_ring_ctx *ctx)
 			spin_lock_irqsave(&ctx->dma.lock, flags);
 			__io_dma_task_complete(dev, dma, ret, done_ns);
 			spin_unlock_irqrestore(&ctx->dma.lock, flags);
+			io_dma_cap_wake(ctx);
 
 			count++;
 			dma = next;

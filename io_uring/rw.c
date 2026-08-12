@@ -1032,7 +1032,38 @@ static int __io_read(struct io_kiocb *req, struct io_br_sel *sel,
 						  rw->addr + io->bytes_done,
 						  iov_iter_count(&io->iter));
 
-			if (ret > 0)
+			if (ret == IO_DMA_READ_CAPPED &&
+			    (kiocb->ki_flags & IOCB_NOWAIT) &&
+			    !(req->flags & REQ_F_NOWAIT)) {
+				/*
+				 * Bounded outstanding. Excess submissions
+				 * deepen the poll list and the
+				 * completion-detection latency with it, and
+				 * throughput over queue depth peaks well below
+				 * what applications commonly drive. Past the
+				 * cap the nowait pass defers to io-wq, where
+				 * the read waits for the ring to drain below
+				 * the cap, so the excess waits instead of
+				 * either shattering into CPU tails or burning
+				 * the CPU on an immediate fallback copy. Only
+				 * a read the cap alone held back gets here.
+				 */
+				req->dma.dma_active = false;
+				io_dma_fm_record(IO_DMA_FM_DEFERRED);
+				return -EAGAIN;
+			}
+
+			/*
+			 * RWF_NOWAIT cannot be deferred to io-wq: -EAGAIN
+			 * would reach the application, for data the
+			 * buffered read can serve from the page cache
+			 * without blocking. Over the cap it takes that path,
+			 * as does a read in io-wq whose wait for the ring to
+			 * drain below the cap ran out.
+			 */
+			if (ret == IO_DMA_READ_CAPPED)
+				io_dma_fm_record(IO_DMA_FM_CAP_BYPASS);
+			else if (ret > 0)
 				io_dma_fm_record(IO_DMA_FM_ENGAGED);
 			else if (ret == -EAGAIN)
 				io_dma_fm_record(IO_DMA_FM_EAGAIN);
