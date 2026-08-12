@@ -2254,6 +2254,7 @@ static void io_release_dma_chan(struct io_ring_ctx *ctx)
 			 * leak confined to the already-degraded
 			 * hung-hardware path, which is preferable.
 			 */
+			io_dma_qstat_task_abandon(ctx, dma);
 			io_dma_task_release_res(ctx, dev, dma);
 			kmem_cache_free(dma_cachep, dma);
 			dma = next;
