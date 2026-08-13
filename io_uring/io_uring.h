@@ -632,6 +632,24 @@ enum {
 void io_dma_fmw_record(unsigned int reason);
 ssize_t io_dma_filemap_write(struct io_kiocb *req, struct kiocb *iocb,
 			     struct iov_iter *from, u64 src_user_addr);
+
+/* Filemap DMA-read gate and result accounting. See io_uring/dma.c. */
+enum {
+	IO_DMA_FM_ENGAGED,
+	IO_DMA_FM_SHMEM,
+	IO_DMA_FM_NOT_BVEC,
+	IO_DMA_FM_DIRECT,
+	IO_DMA_FM_NO_DMA_ADDRS,
+	IO_DMA_FM_EAGAIN,
+	IO_DMA_FM_ENOMEM,
+	IO_DMA_FM_EFAULT,
+	IO_DMA_FM_OTHER,
+	IO_DMA_FM_CPU_TAIL,
+	IO_DMA_FM_FS_CHECK,	/* the filesystem's own checks refused the read */
+	IO_DMA_FM_CPU_REDO,	/* a DMA failure handed the rest to the CPU */
+	IO_DMA_FM_NR,
+};
+void io_dma_fm_record(unsigned int reason);
 extern unsigned int io_dma_stripe_chans;
 void io_pfn_cache_prepare(struct device *dev);
 int kiocb_done(struct io_kiocb *req, ssize_t ret, struct io_br_sel *sel, unsigned int issue_flags);
