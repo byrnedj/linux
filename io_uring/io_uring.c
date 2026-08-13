@@ -59,6 +59,7 @@
 #include <linux/audit.h>
 #include <linux/security.h>
 #include <linux/jump_label.h>
+#include <asm/shmparam.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/io_uring.h>
@@ -1450,7 +1451,6 @@ int io_poll_issue(struct io_kiocb *req, io_tw_token_t tw)
 
 	ret = __io_issue_sqe(req, issue_flags, &io_issue_defs[req->opcode]);
 
-	WARN_ON_ONCE(ret == IOU_ISSUE_SKIP_COMPLETE);
 	return ret;
 }
 
@@ -2160,6 +2160,285 @@ static __cold void io_req_caches_free(struct io_ring_ctx *ctx)
 	__io_req_caches_free(ctx);
 }
 
+static void io_dma_shared_put(struct dma_chan *chan);
+
+static void io_release_dma_chan(struct io_ring_ctx *ctx)
+{
+	unsigned long dma_sync_wait_timeout = jiffies + msecs_to_jiffies(5000);
+	struct io_dma_task *dma, *next;
+	struct device *dev;
+	int ret;
+
+	if (!IS_ERR_OR_NULL(ctx->dma.chan)) {
+		struct llist_node *node;
+
+		/* Quiesce the kworker poller before walking the lists
+		 * that it owns.
+		 */
+		cancel_work_sync(&ctx->dma.poll_work);
+
+		dev = ctx->dma.chan->device->dev;
+
+		/* Pull any tasks still parked on the lock-free submit list
+		 * onto the poll list so that one walk below drains
+		 * everything. The llist is newest-first. Order does not
+		 * matter here because this is the hung-hardware path and
+		 * every task gets the same treatment.
+		 */
+		node = llist_del_all(&ctx->dma.submit_list);
+		while (node) {
+			struct io_dma_task *t =
+				llist_entry(node, struct io_dma_task, llnode);
+
+			node = node->next;
+			t->next = ctx->dma.poll_list;
+			ctx->dma.poll_list = t;
+		}
+
+		dma = ctx->dma.poll_list;
+		while (dma) {
+			next = dma->next;
+
+			do {
+				ret = dmaengine_async_is_tx_complete(ctx->dma.chan, dma->cookie);
+
+				if (time_after_eq(jiffies, dma_sync_wait_timeout))
+					break;
+
+				cpu_relax();
+			} while (ret == DMA_IN_PROGRESS);
+
+			if (ret == DMA_IN_PROGRESS)
+				pr_warn("Hung DMA offload task %p\n", dma);
+
+			/*
+			 * Release only the per-task resources, meaning the
+			 * unmap and the folio references. Normal completion
+			 * drains the pending lists via __io_dma_poll() in
+			 * the exit loop, so a task reaching this drain is
+			 * one whose DMA never completed on hung hardware
+			 * (see the Hung DMA warning above). The in-flight
+			 * DMA reference from io_dma_submit_queued_tasks()
+			 * keeps dma->req alive here, but we intentionally
+			 * do not drop that ref or complete the req. Doing
+			 * so would need io_free_req(), whose task_work
+			 * falls back onto this ctx's fallback_work while
+			 * the ctx is being torn down, which is a teardown
+			 * use-after-free. The lingering req is a bounded
+			 * leak confined to the already-degraded
+			 * hung-hardware path, which is preferable.
+			 */
+			io_dma_task_release_res(ctx, dev, dma);
+			kmem_cache_free(dma_cachep, dma);
+			dma = next;
+			cond_resched();
+		}
+
+		ctx->dma.poll_list = NULL;
+		ctx->dma.poll_list_tail = NULL;
+
+		/* Free the parked io_dma_task pool back to slab. */
+		while (ctx->dma.free_list) {
+			struct io_dma_task *t = ctx->dma.free_list;
+
+			ctx->dma.free_list = t->next;
+			kmem_cache_free(dma_cachep, t);
+		}
+		ctx->dma.free_count = 0;
+	}
+
+	if (ctx->dma.chan && !IS_ERR(ctx->dma.chan)) {
+		pr_info("io_uring DMA: releasing channel %s requester=%s[%d] tgid=%d ctx=%p\n",
+			dma_chan_name(ctx->dma.chan), current->comm,
+			task_pid_nr(current), task_tgid_nr(current), ctx);
+		io_dma_shared_put(ctx->dma.chan);
+	}
+	ctx->dma.chan = NULL;
+}
+
+#define IO_DMA_MAX_DEVS	16
+
+struct io_dma_chan_filter {
+	int node;		/* required device node, or NUMA_NO_NODE */
+	int target_dev;		/* ordinal (among matches) of the device to accept */
+	int seen_devs;
+	struct dma_device *last_dev;
+};
+
+static bool io_dma_chan_filter_fn(struct dma_chan *chan, void *param)
+{
+	struct io_dma_chan_filter *f = param;
+
+	if (f->node != NUMA_NO_NODE &&
+	    dev_to_node(chan->device->dev) != f->node)
+		return false;
+	/* Candidates arrive grouped by device, so we count device transitions. */
+	if (chan->device != f->last_dev) {
+		f->last_dev = chan->device;
+		f->seen_devs++;
+	}
+	return f->seen_devs - 1 == f->target_dev;
+}
+
+static struct dma_chan *io_dma_request_spread(dma_cap_mask_t *mask, int node)
+{
+	static atomic_t io_dma_chan_rr;
+	unsigned int rr = atomic_inc_return(&io_dma_chan_rr);
+	struct dma_chan *chan;
+	int i;
+
+	/* Round-robin across DSA devices */
+	for (i = 0; i < IO_DMA_MAX_DEVS; i++) {
+		struct io_dma_chan_filter f = {
+			.node = node,
+			.target_dev = (rr + i) % IO_DMA_MAX_DEVS,
+		};
+
+		chan = dma_request_channel(*mask, io_dma_chan_filter_fn, &f);
+		if (chan)
+			return chan;
+	}
+	return NULL;
+}
+
+/*
+ * Shared-channel pool.  Rings no longer own a dmaengine channel
+ * exclusively.  One channel can carry descriptors from many rings and a
+ * full WQ surfaces as a failed descriptor allocation at prep time, which
+ * the submitter handles by falling back to the CPU copy.  Allocation is
+ * first-come first-served.  Each ring grabs a fresh channel while the
+ * engine still has one, with device-spread and node-local channels
+ * preferred.  Once the engine is exhausted, later rings share existing
+ * channels round-robin.  Entries are refcounted and the dmaengine
+ * channel is released when the last ring detaches.
+ */
+#define IO_DMA_SHARED_MAX	64
+struct io_dma_shared_chan {
+	struct dma_chan *chan;
+	int refcnt;
+};
+static struct io_dma_shared_chan io_dma_shared[IO_DMA_SHARED_MAX];
+static int io_dma_shared_cnt;
+static unsigned int io_dma_shared_rr;
+static DEFINE_MUTEX(io_dma_shared_mutex);
+
+static struct dma_chan *io_dma_shared_pick(int node)
+{
+	int i, idx;
+
+	for (i = 0; i < io_dma_shared_cnt; i++) {
+		idx = (io_dma_shared_rr + i) % io_dma_shared_cnt;
+		if (node == NUMA_NO_NODE ||
+		    dev_to_node(io_dma_shared[idx].chan->device->dev) == node) {
+			io_dma_shared_rr = idx + 1;
+			io_dma_shared[idx].refcnt++;
+			return io_dma_shared[idx].chan;
+		}
+	}
+	return NULL;
+}
+
+static struct dma_chan *io_dma_shared_get(dma_cap_mask_t *mask, int node)
+{
+	struct dma_chan *chan;
+
+	mutex_lock(&io_dma_shared_mutex);
+
+	/* 1) fresh node-local channel */
+	if (io_dma_shared_cnt < IO_DMA_SHARED_MAX) {
+		chan = io_dma_request_spread(mask, node);
+		if (chan)
+			goto register_fresh;
+	}
+	/* 2) share a node-local channel round-robin */
+	chan = io_dma_shared_pick(node);
+	if (chan)
+		goto out;
+	/* 3) fresh channel on any node */
+	if (io_dma_shared_cnt < IO_DMA_SHARED_MAX) {
+		chan = io_dma_request_spread(mask, NUMA_NO_NODE);
+		if (chan)
+			goto register_fresh;
+	}
+	/* 4) share any channel, any node */
+	chan = io_dma_shared_pick(NUMA_NO_NODE);
+	goto out;
+
+register_fresh:
+	io_dma_shared[io_dma_shared_cnt++] =
+		(struct io_dma_shared_chan){ .chan = chan, .refcnt = 1 };
+out:
+	mutex_unlock(&io_dma_shared_mutex);
+	return chan;
+}
+
+static void io_dma_shared_put(struct dma_chan *chan)
+{
+	int i;
+
+	mutex_lock(&io_dma_shared_mutex);
+	for (i = 0; i < io_dma_shared_cnt; i++) {
+		if (io_dma_shared[i].chan != chan)
+			continue;
+		if (--io_dma_shared[i].refcnt == 0) {
+			dma_release_channel(chan);
+			io_dma_shared[i] = io_dma_shared[--io_dma_shared_cnt];
+			if (io_dma_shared_rr > (unsigned int)io_dma_shared_cnt)
+				io_dma_shared_rr = 0;
+		}
+		break;
+	}
+	mutex_unlock(&io_dma_shared_mutex);
+}
+
+static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
+				struct io_uring_params *p)
+{
+	dma_cap_mask_t mask;
+	int node = numa_node_id();
+	int rc = 0;
+
+	dma_cap_zero(mask);
+	dma_cap_set(DMA_MEMCPY, mask);
+
+	/* Prefer a channel whose DSA device sits on the caller's NUMA
+	 * node.  A cross-socket engine pays UPI hops on every descriptor
+	 * fetch and data move, which shows up as bimodal throughput
+	 * depending on which channel the ring happened to win.  Fresh
+	 * channels are handed out first-come first-served.  Once the
+	 * engine is exhausted, rings share channels round-robin.
+	 */
+	ctx->dma.chan = io_dma_shared_get(&mask, node);
+	if (IS_ERR_OR_NULL(ctx->dma.chan)) {
+		rc = ctx->dma.chan ? PTR_ERR(ctx->dma.chan) : -ENODEV;
+		pr_err("io_uring DMA: no channel available: %d requester=%s[%d] tgid=%d\n",
+		       rc, current->comm,
+		       task_pid_nr(current), task_tgid_nr(current));
+		ctx->dma.chan = NULL;
+		goto failed;
+	}
+
+	dev_info(ctx->dma.chan->device->dev,
+		 "io_uring DMA: acquired channel %s (node %d, caller node %d, pool %d chans) requester=%s[%d] tgid=%d ctx=%p\n",
+		 dma_chan_name(ctx->dma.chan),
+		 dev_to_node(ctx->dma.chan->device->dev), node,
+		 io_dma_shared_cnt,
+		 current->comm, task_pid_nr(current), task_tgid_nr(current), ctx);
+
+	init_llist_head(&ctx->dma.submit_list);
+	ctx->dma.poll_list = NULL;
+	ctx->dma.poll_list_tail = NULL;
+	spin_lock_init(&ctx->dma.lock);
+	INIT_WORK(&ctx->dma.poll_work, io_dma_poll_workfn);
+	atomic_set(&ctx->dma.poll_armed, 0);
+	io_dma_init_freelist(ctx, p);
+
+	return 0;
+failed:
+	io_release_dma_chan(ctx);
+	return rc;
+}
+
 static __cold void io_ring_ctx_free(struct io_ring_ctx *ctx)
 {
 	io_unregister_bpf_ops(ctx);
@@ -2181,6 +2460,8 @@ static __cold void io_ring_ctx_free(struct io_ring_ctx *ctx)
 		put_task_struct(ctx->submitter_task);
 
 	WARN_ON_ONCE(!list_empty(&ctx->ltimeout_list));
+
+	io_release_dma_chan(ctx);
 
 	if (ctx->mm_account) {
 		mmdrop(ctx->mm_account);
@@ -2345,6 +2626,17 @@ static __cold void io_ring_exit_work(struct work_struct *work)
 		do {
 			if (ctx->flags & IORING_SETUP_DEFER_TASKRUN)
 				io_cancel_local_task_work(ctx);
+			/*
+			 * Drain any DMA tasks whose hardware has completed
+			 * so that their completion callbacks run and their
+			 * reqs queue completion task_work. The callbacks
+			 * unmap, put folios, and drop dma_refcnt. Without
+			 * this, DMA-offloaded reqs hold refs to ctx
+			 * indefinitely during teardown.
+			 */
+			if (!IS_ERR_OR_NULL(ctx->dma.chan) &&
+			    io_dma_pending(ctx))
+				__io_dma_poll(ctx);
 			cond_resched();
 		} while (io_uring_try_cancel_requests(ctx, NULL, true, false));
 
@@ -2365,6 +2657,7 @@ static __cold void io_ring_exit_work(struct work_struct *work)
 		if (WARN_ON_ONCE(time_after(jiffies, timeout))) {
 			/* there is little hope left, don't run it too often */
 			interval = HZ * 60;
+			break;
 		}
 		/*
 		 * This is really an uninterruptible wait, as it has to be
@@ -2684,6 +2977,7 @@ iopoll_locked:
 			if (likely(!ret2))
 				ret2 = io_cqring_wait(ctx, min_complete, flags,
 						      &ext_arg);
+
 		}
 
 		if (!ret) {
@@ -3056,6 +3350,21 @@ static __cold int io_uring_create(struct io_ctx_config *config)
 		goto err;
 
 	p->features = IORING_FEAT_FLAGS;
+	/*
+	 * DMA-engine channels are a finite hardware resource with one
+	 * dmaengine channel per DSA WQ, so they are strictly opt-in.
+	 * Only rings created with IORING_SETUP_DMA take one.
+	 * Unconditional acquisition would spend channels on rings that
+	 * never DMA and race the asynchronous channel release of any
+	 * ring being torn down, silently degrading the loser to CPU
+	 * copies. An application that asks and cannot be served fails
+	 * loudly here instead.
+	 */
+	if (p->flags & IORING_SETUP_DMA) {
+		ret = io_allocate_dma_chan(ctx, p);
+		if (ret)
+			goto err;
+	}
 
 	if (copy_to_user(config->uptr, p, sizeof(*p))) {
 		ret = -EFAULT;
@@ -3257,6 +3566,8 @@ static int __init io_uring_init(void)
 	req_cachep = kmem_cache_create("io_kiocb", sizeof(struct io_kiocb), &kmem_args,
 				SLAB_HWCACHE_ALIGN | SLAB_PANIC | SLAB_ACCOUNT |
 				SLAB_TYPESAFE_BY_RCU);
+
+	dma_cachep = KMEM_CACHE(io_dma_task, SLAB_HWCACHE_ALIGN | SLAB_ACCOUNT);
 
 	iou_wq = alloc_workqueue("iou_exit", WQ_UNBOUND, 64);
 	BUG_ON(!iou_wq);
