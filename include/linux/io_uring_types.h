@@ -6,10 +6,15 @@
 #include <linux/task_work.h>
 #include <linux/bitmap.h>
 #include <linux/llist.h>
+#include <linux/dmaengine.h>
+#include <linux/iommu.h>
+#include <linux/workqueue.h>
+#include <linux/atomic.h>
 #include <uapi/linux/io_uring.h>
 
 struct iou_loop_params;
 struct io_uring_bpf_ops;
+struct folio;
 
 enum {
 	/*
@@ -312,6 +317,55 @@ enum {
 
 struct iou_ctx {};
 
+struct io_dma_channel {
+	struct dma_chan		*chan;
+	bool			use_phys_addrs;
+
+	struct work_struct	poll_work;
+	atomic_t		poll_armed;
+
+	spinlock_t		lock;
+	struct io_dma_task	*head;
+	struct io_dma_task	*tail;
+};
+
+struct io_dma_kiocb {
+	unsigned int		dma_refcnt;
+	int			dma_result;
+	int			saved_res;	/* result for the deferred CQE */
+	unsigned int		saved_cflags;	/* buffer flags for CQE */
+	size_t			remaining;
+	struct io_dma_task	*dma_tasks;
+	struct io_dma_task	*dma_tasks_tail;
+	bool			dma_active;	/* DMA copy armed for this req */
+	u64			dst_user_addr;	/* user VA for reg buf DMA lookup */
+};
+
+struct io_dma_batch_entry {
+	dma_addr_t		src_dma;	/* DMA-mapped source address */
+	dma_addr_t		dst_dma;	/* pre-mapped dest DMA address */
+	u32			src_len;	/* source mapping length */
+	struct folio		*folio;		/* page cache folio ref */
+};
+
+#define IO_DMA_BATCH_MAX	32
+
+struct io_dma_task {
+	struct io_kiocb		*req;
+	dma_cookie_t		cookie;
+	dma_addr_t		src_dma;	/* DMA-mapped source address */
+	dma_addr_t		dst_dma;	/* pre-mapped dest DMA address */
+	u32			len;
+	dma_addr_t		src_map_addr;	/* for dma_unmap at completion */
+	u32			src_map_len;
+	struct folio		*src_folio;	/* page cache folio ref to put on completion */
+	bool			src_is_page;	/* true → dma_unmap_page, false → dma_unmap_single */
+	bool			is_batch;	/* true → batch task with batch_entries */
+	u8			batch_nr;	/* number of batch entries */
+	struct io_dma_batch_entry *batch_entries; /* heap-allocated cleanup array */
+	struct io_dma_task	*next;
+};
+
 struct io_ring_ctx {
 	/* const or read-mostly hot data */
 	struct {
@@ -410,6 +464,8 @@ struct io_ring_ctx {
 		 */
 		u64					hybrid_poll_time;
 	} ____cacheline_aligned_in_smp;
+
+	struct io_dma_channel		dma;
 
 	struct {
 		/*
@@ -769,6 +825,8 @@ struct io_kiocb {
 
 		struct io_rsrc_node	*buf_node;
 	};
+
+	struct io_dma_kiocb		dma;
 
 	union {
 		/* used by request caches, completion batching and iopoll */

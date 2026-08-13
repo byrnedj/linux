@@ -59,6 +59,8 @@
 #include <linux/audit.h>
 #include <linux/security.h>
 #include <linux/jump_label.h>
+#include <linux/iommu.h>
+#include <asm/shmparam.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/io_uring.h>
@@ -1450,7 +1452,6 @@ int io_poll_issue(struct io_kiocb *req, io_tw_token_t tw)
 
 	ret = __io_issue_sqe(req, issue_flags, &io_issue_defs[req->opcode]);
 
-	WARN_ON_ONCE(ret == IOU_ISSUE_SKIP_COMPLETE);
 	return ret;
 }
 
@@ -2160,6 +2161,132 @@ static __cold void io_req_caches_free(struct io_ring_ctx *ctx)
 	__io_req_caches_free(ctx);
 }
 
+static void io_release_dma_chan(struct io_ring_ctx *ctx)
+{
+	unsigned long dma_sync_wait_timeout = jiffies + msecs_to_jiffies(5000);
+	struct io_dma_task *dma, *next;
+	struct device *dev;
+	int ret;
+
+	if (!IS_ERR_OR_NULL(ctx->dma.chan)) {
+		dev = ctx->dma.chan->device->dev;
+		dma = ctx->dma.head;
+		while (dma) {
+			next = dma->next;
+
+			do {
+				ret = dmaengine_async_is_tx_complete(ctx->dma.chan, dma->cookie);
+
+				if (time_after_eq(jiffies, dma_sync_wait_timeout))
+					break;
+
+				cpu_relax();
+			} while (ret == DMA_IN_PROGRESS);
+
+			if (ret == DMA_IN_PROGRESS)
+				pr_warn("Hung DMA offload task %p\n", dma);
+
+			/*
+			 * Release per-task resources (unmap, folio refs)
+			 * without dereferencing dma->req: the req may already
+			 * have been freed by cancel since ctx teardown runs
+			 * after refs drop. Mirrors __io_dma_task_complete's
+			 * cleanup minus the req-scope work.
+			 */
+			if (dma->is_batch) {
+				u8 i;
+
+				for (i = 0; i < dma->batch_nr; i++) {
+					if (!ctx->dma.use_phys_addrs)
+						dma_unmap_page(dev,
+							dma->batch_entries[i].src_dma,
+							dma->batch_entries[i].src_len,
+							DMA_TO_DEVICE);
+					folio_put(dma->batch_entries[i].folio);
+				}
+				kfree(dma->batch_entries);
+			} else {
+				if (dma->src_map_len && !ctx->dma.use_phys_addrs) {
+					if (dma->src_is_page)
+						dma_unmap_page(dev,
+							dma->src_map_addr,
+							dma->src_map_len,
+							DMA_TO_DEVICE);
+					else
+						dma_unmap_single(dev,
+							dma->src_map_addr,
+							dma->src_map_len,
+							DMA_TO_DEVICE);
+				}
+				if (dma->src_folio)
+					folio_put(dma->src_folio);
+			}
+
+			kmem_cache_free(dma_cachep, dma);
+			dma = next;
+			cond_resched();
+		}
+
+		ctx->dma.head = NULL;
+		ctx->dma.tail = NULL;
+		cancel_work_sync(&ctx->dma.poll_work);
+	}
+
+	if (ctx->dma.chan && !IS_ERR(ctx->dma.chan)) {
+		pr_info("io_uring DMA: releasing channel %s requester=%s[%d] tgid=%d ctx=%p\n",
+			dma_chan_name(ctx->dma.chan), current->comm,
+			task_pid_nr(current), task_tgid_nr(current), ctx);
+		dma_release_channel(ctx->dma.chan);
+	}
+	ctx->dma.chan = NULL;
+}
+
+static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
+				struct io_uring_params *p)
+{
+	dma_cap_mask_t mask;
+	int rc = 0;
+
+	dma_cap_zero(mask);
+	dma_cap_set(DMA_MEMCPY, mask);
+
+	ctx->dma.chan = dma_request_chan_by_mask(&mask);
+	if (IS_ERR(ctx->dma.chan)) {
+		rc = PTR_ERR(ctx->dma.chan);
+		pr_err("dma_request_chan_by_mask() failed: %d (%pe) requester=%s[%d] tgid=%d\n",
+		       rc, ctx->dma.chan, current->comm,
+		       task_pid_nr(current), task_tgid_nr(current));
+		ctx->dma.chan = NULL;
+		goto failed;
+	}
+
+	{
+		struct device *dma_dev = ctx->dma.chan->device->dev;
+		struct iommu_domain *domain = iommu_get_domain_for_dev(dma_dev);
+
+		/* Physical addresses only work in IOMMU passthrough mode */
+		ctx->dma.use_phys_addrs = !domain ||
+					  (domain->type == IOMMU_DOMAIN_IDENTITY);
+	}
+
+	dev_info(ctx->dma.chan->device->dev,
+		 "io_uring DMA: acquired channel %s (%s addressing) requester=%s[%d] tgid=%d ctx=%p\n",
+		 dma_chan_name(ctx->dma.chan),
+		 ctx->dma.use_phys_addrs ? "physical" : "IOMMU-mapped",
+		 current->comm, task_pid_nr(current), task_tgid_nr(current), ctx);
+
+	ctx->dma.head = NULL;
+	ctx->dma.tail = NULL;
+	spin_lock_init(&ctx->dma.lock);
+	INIT_WORK(&ctx->dma.poll_work, io_dma_poll_workfn);
+	atomic_set(&ctx->dma.poll_armed, 0);
+
+	return 0;
+failed:
+	io_release_dma_chan(ctx);
+	return rc;
+}
+
 static __cold void io_ring_ctx_free(struct io_ring_ctx *ctx)
 {
 	io_unregister_bpf_ops(ctx);
@@ -2181,6 +2308,8 @@ static __cold void io_ring_ctx_free(struct io_ring_ctx *ctx)
 		put_task_struct(ctx->submitter_task);
 
 	WARN_ON_ONCE(!list_empty(&ctx->ltimeout_list));
+
+	io_release_dma_chan(ctx);
 
 	if (ctx->mm_account) {
 		mmdrop(ctx->mm_account);
@@ -2345,6 +2474,16 @@ static __cold void io_ring_exit_work(struct work_struct *work)
 		do {
 			if (ctx->flags & IORING_SETUP_DEFER_TASKRUN)
 				io_cancel_local_task_work(ctx);
+			/*
+			 * Drain any DMA tasks whose hardware has completed so
+			 * their completion callbacks run (unmap, folio_put,
+			 * dma_refcnt--) and their reqs queue completion
+			 * task_work. Without this, DMA-offloaded reqs hold
+			 * refs to ctx indefinitely during teardown.
+			 */
+			if (!IS_ERR_OR_NULL(ctx->dma.chan) &&
+			    READ_ONCE(ctx->dma.head))
+				__io_dma_poll(ctx);
 			cond_resched();
 		} while (io_uring_try_cancel_requests(ctx, NULL, true, false));
 
@@ -2365,6 +2504,7 @@ static __cold void io_ring_exit_work(struct work_struct *work)
 		if (WARN_ON_ONCE(time_after(jiffies, timeout))) {
 			/* there is little hope left, don't run it too often */
 			interval = HZ * 60;
+			break;
 		}
 		/*
 		 * This is really an uninterruptible wait, as it has to be
@@ -2684,6 +2824,7 @@ iopoll_locked:
 			if (likely(!ret2))
 				ret2 = io_cqring_wait(ctx, min_complete, flags,
 						      &ext_arg);
+
 		}
 
 		if (!ret) {
@@ -3056,6 +3197,11 @@ static __cold int io_uring_create(struct io_ctx_config *config)
 		goto err;
 
 	p->features = IORING_FEAT_FLAGS;
+	ret = io_allocate_dma_chan(ctx, p);
+	if (ret) {
+		pr_info("io_uring was unable to allocate a DMA channel. Offloads unavailable.\n");
+		ret = 0;
+	}
 
 	if (copy_to_user(config->uptr, p, sizeof(*p))) {
 		ret = -EFAULT;
@@ -3257,6 +3403,8 @@ static int __init io_uring_init(void)
 	req_cachep = kmem_cache_create("io_kiocb", sizeof(struct io_kiocb), &kmem_args,
 				SLAB_HWCACHE_ALIGN | SLAB_PANIC | SLAB_ACCOUNT |
 				SLAB_TYPESAFE_BY_RCU);
+
+	dma_cachep = KMEM_CACHE(io_dma_task, SLAB_HWCACHE_ALIGN | SLAB_ACCOUNT);
 
 	iou_wq = alloc_workqueue("iou_exit", WQ_UNBOUND, 64);
 	BUG_ON(!iou_wq);

@@ -7,6 +7,7 @@
 #include <linux/resume_user_mode.h>
 #include <linux/poll.h>
 #include <linux/io_uring_types.h>
+#include <linux/workqueue.h>
 #include <uapi/linux/eventpoll.h>
 #include "alloc_cache.h"
 #include "io-wq.h"
@@ -173,6 +174,7 @@ static inline bool io_should_wake(struct io_wait_queue *iowq)
 int io_prepare_config(struct io_ctx_config *config);
 
 bool io_cqe_cache_refill(struct io_ring_ctx *ctx, bool overflow, bool cqe32);
+void io_dma_poll_workfn(struct work_struct *w);
 void io_req_defer_failed(struct io_kiocb *req, s32 res);
 bool io_post_aux_cqe(struct io_ring_ctx *ctx, u64 user_data, s32 res, u32 cflags);
 void io_add_aux_cqe(struct io_ring_ctx *ctx, u64 user_data, s32 res, u32 cflags);
@@ -582,4 +584,14 @@ static inline bool io_has_work(struct io_ring_ctx *ctx)
 	return test_bit(IO_CHECK_CQ_OVERFLOW_BIT, &ctx->check_cq) ||
 	       io_local_work_pending(ctx);
 }
+
+void io_uring_dma_prep(struct io_kiocb *req);
+int io_dma_submit_queued_tasks(struct io_kiocb *req);
+ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
+			    u64 dst_user_addr, size_t want);
+extern struct kmem_cache *dma_cachep;
+int __io_dma_poll(struct io_ring_ctx *ctx);
+int kiocb_done(struct io_kiocb *req, ssize_t ret, struct io_br_sel *sel, unsigned int issue_flags);
+void io_submit_flush_completions(struct io_ring_ctx *ctx);
+
 #endif
