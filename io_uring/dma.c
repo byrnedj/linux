@@ -2734,6 +2734,34 @@ struct io_dma_lat_stats {
 };
 
 static struct io_dma_lat_stats io_dma_lat_dma;	/* DSA transactions (per task) */
+/*
+ * Filemap DMA-read gate and result counters. The read path falls back
+ * to the normal buffered read silently on any failure, so a per-reason
+ * count is the only way to see whether it engages at all. These are
+ * recorded from the io_read gate in io_uring/rw.c, and cpu_redo from
+ * io_rw_dma_redo().
+ */
+static const char * const io_dma_fm_names[IO_DMA_FM_NR] = {
+	[IO_DMA_FM_ENGAGED] = "engaged",
+	[IO_DMA_FM_UNSUPPORTED] = "unsupported",
+	[IO_DMA_FM_NOT_BVEC] = "not_bvec",
+	[IO_DMA_FM_DIRECT] = "direct",
+	[IO_DMA_FM_NO_DMA_ADDRS] = "no_dma_addrs",
+	[IO_DMA_FM_EAGAIN] = "eagain",
+	[IO_DMA_FM_ENOMEM] = "enomem",
+	[IO_DMA_FM_EFAULT] = "efault",
+	[IO_DMA_FM_OTHER] = "other",
+	[IO_DMA_FM_CPU_TAIL] = "cpu_tail",
+	[IO_DMA_FM_FS_CHECK] = "fs_check",
+	[IO_DMA_FM_CPU_REDO] = "cpu_redo",
+	[IO_DMA_FM_DONTCACHE] = "dontcache",
+};
+static atomic64_t io_dma_fm[IO_DMA_FM_NR];
+
+void io_dma_fm_record(unsigned int reason)
+{
+	atomic64_inc(&io_dma_fm[reason]);
+}
 
 static unsigned int io_dma_lat_bin(size_t len)
 {
@@ -2812,6 +2840,10 @@ static int io_dma_lat_show(struct seq_file *m, void *v)
 	for (i = 0; i < IO_DMA_FMW_NR; i++)
 		seq_printf(m, "  %-12s %12llu\n", io_dma_fmw_names[i],
 			   atomic64_read(&io_dma_fmw[i]));
+	seq_puts(m, "filemap:\n");
+	for (i = 0; i < IO_DMA_FM_NR; i++)
+		seq_printf(m, "  %-12s %12llu\n", io_dma_fm_names[i],
+			   atomic64_read(&io_dma_fm[i]));
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(io_dma_lat);
@@ -2825,6 +2857,8 @@ static ssize_t io_dma_lat_reset_write(struct file *file,
 	io_dma_lat_reset(&io_dma_lat_dma);
 	for (i = 0; i < IO_DMA_FMW_NR; i++)
 		atomic64_set(&io_dma_fmw[i], 0);
+	for (i = 0; i < IO_DMA_FM_NR; i++)
+		atomic64_set(&io_dma_fm[i], 0);
 	return count;
 }
 
