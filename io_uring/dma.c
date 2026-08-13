@@ -438,6 +438,20 @@ static const char * const io_dma_comp_mode_names[IO_DMA_COMP_NR] = {
 /* Default to the original kworker path so behaviour is unchanged until set. */
 static unsigned int io_dma_completion_mode __read_mostly = IO_DMA_COMP_KWORKER;
 
+/* Modes whose detection context is the per-ctx compl thread. */
+static inline bool io_dma_mode_wakes_thread(unsigned int mode)
+{
+	return mode == IO_DMA_COMP_MWAIT;
+}
+
+static inline const u8 *io_dma_tx_compl_status(struct dma_chan *chan,
+					       struct dma_async_tx_descriptor *tx)
+{
+	if (!chan->device->device_completion_status_addr)
+		return NULL;
+	return chan->device->device_completion_status_addr(tx);
+}
+
 /*
  * Busy-poll budget (in microseconds) for draining in-flight DMA completions
  * from the CQ-wait path (io_dma_cq_wait_poll()) before the waiting task
@@ -460,6 +474,42 @@ static unsigned int io_dma_cq_poll_us __read_mostly = 20;
  * debugfs io_uring_dma_fmw_spin_us.
  */
 static unsigned int io_dma_fmw_spin_us __read_mostly = 60;
+
+/*
+ * Per-doze deadline (microseconds) for the mwait completion mode's
+ * UMWAIT on the head task's completion record. The wait normally ends
+ * sub-microsecond after the device writes the record; the deadline only
+ * bounds staleness when the monitored record was recycled under us or a
+ * later-cookie completion is what's actually pending. IA32_UMWAIT_CONTROL
+ * additionally caps each doze globally (typically ~100k TSC cycles).
+ * Tunable via debugfs io_uring_dma_mwait_us.
+ */
+static unsigned int io_dma_mwait_us __read_mostly = 50;
+
+
+/*
+ * TPAUSE slice (nanoseconds) used when UMONITOR is not effective (see
+ * io_uring_dma_umonitor_effective below). TPAUSE C0.2 needs no address
+ * monitor -- Intel's MONITOR/UMONITOR performance guidance (doc 826393)
+ * lists it as unaffected -- so waits become slice-bounded polls: doze one
+ * slice, re-check, repeat. Detection staleness is at most one slice.
+ * debugfs io_uring_dma_tpause_ns.
+ */
+static unsigned int io_dma_tpause_ns __read_mostly = 1000;
+
+/*
+ * Whether UMONITOR actually arms an address monitor on this machine.
+ * Per Intel doc 826393 (MONITOR/UMONITOR performance guidance): on
+ * affected parts (SPR/EMR/SRF/GNR) the microcode mitigation sets
+ * IA32_MCU_OPT_CTRL[6] IGN_UMONITOR, making UMONITOR a silent no-op --
+ * a subsequent UMWAIT retires immediately -- while CPUID still
+ * advertises WAITPKG. Detected once at init: effective iff
+ * CPUID.7.2.EDX[7] MONITOR_MITG_NO, or the mitigation MSR bit is
+ * absent/clear. Read-only debugfs io_uring_dma_umonitor_effective; the
+ * mwait mode falls back to TPAUSE slices when 0.
+ */
+static unsigned int io_dma_umonitor_eff;
+static void io_dma_umonitor_detect(void);
 
 /*
  * Keep DMA completion detection on the ring task where possible, instead of
@@ -693,8 +743,9 @@ static ssize_t io_dma_comp_mode_write(struct file *file, const char __user *ubuf
 	for (i = 0; i < IO_DMA_COMP_NR; i++) {
 		if (strcmp(mode, io_dma_comp_mode_names[i]))
 			continue;
-		/* mwait is not wired up yet. */
-		if (i == IO_DMA_COMP_MWAIT)
+		/* mwait needs WAITPKG (UMONITOR/UMWAIT). */
+		if (i == IO_DMA_COMP_MWAIT &&
+		    !(IS_ENABLED(CONFIG_X86) && boot_cpu_has(X86_FEATURE_WAITPKG)))
 			return -EOPNOTSUPP;
 		WRITE_ONCE(io_dma_completion_mode, i);
 		return len;
@@ -787,6 +838,15 @@ void io_dma_debugfs_init(void)
 			   &io_dma_cq_poll_us);
 	debugfs_create_u32("io_uring_dma_fmw_spin_us", 0644, NULL,
 			   &io_dma_fmw_spin_us);
+	debugfs_create_u32("io_uring_dma_mwait_us", 0644, NULL,
+			   &io_dma_mwait_us);
+	io_dma_umonitor_detect();
+	/* Writable: an operator who flips IA32_MCU_OPT_CTRL[6] at runtime
+	 * (wrmsr) can update the cached verdict without rebooting. */
+	debugfs_create_u32("io_uring_dma_umonitor_effective", 0644, NULL,
+			   &io_dma_umonitor_eff);
+	debugfs_create_u32("io_uring_dma_tpause_ns", 0644, NULL,
+			   &io_dma_tpause_ns);
 	debugfs_create_file("io_uring_dma_cpu_latency_us", 0644, NULL, NULL,
 			    &io_dma_cpu_lat_fops);
 	debugfs_create_file("io_uring_dma_pfn_cache", 0444, NULL, NULL,
@@ -967,6 +1027,127 @@ void io_dma_poll_workfn(struct work_struct *w)
  * serialized against the teardown drain via ctx->dma.poll_armed, so it is safe
  * to run here concurrently with io_ring_exit_work().
  */
+#ifdef CONFIG_X86
+#include <asm/cpufeature.h>
+#include <asm/cpuid/api.h>
+#include <asm/mwait.h>
+#include <asm/tsc.h>
+
+static inline void io_umonitor(const void *addr)
+{
+	asm volatile("umonitor %0" : : "r" (addr));
+}
+
+static inline void io_umwait(u32 state, u64 tsc_deadline)
+{
+	asm volatile("umwait %0" : : "r" (state),
+		     "a" ((u32)tsc_deadline), "d" ((u32)(tsc_deadline >> 32)));
+}
+
+/* One C0.2 TPAUSE slice; no monitor involved (Intel doc 826393: TPAUSE
+ * is unaffected by the MONITOR/UMONITOR tracking-table issue). */
+static inline void io_tpause_slice(void)
+{
+	u64 dl = rdtsc() +
+		 (u64)READ_ONCE(io_dma_tpause_ns) * tsc_khz / 1000000;
+
+	__tpause(0 /* C0.2 */, (u32)(dl >> 32), (u32)dl);
+}
+
+/* Detect once whether UMONITOR arms a monitor here (see the knob's
+ * comment; Intel doc 826393). Called from io_dma_debugfs_init(). */
+static void io_dma_umonitor_detect(void)
+{
+	unsigned int eax, ebx, ecx, edx;
+	u64 arch, mcu;
+
+	if (!boot_cpu_has(X86_FEATURE_WAITPKG))
+		return;
+	cpuid_count(0x7, 2, &eax, &ebx, &ecx, &edx);
+	if (edx & BIT(7)) {		/* MONITOR_MITG_NO: unaffected part */
+		io_dma_umonitor_eff = 1;
+		return;
+	}
+	if (rdmsrq_safe(MSR_IA32_ARCH_CAPABILITIES, &arch))
+		arch = 0;
+	if (!(arch & BIT_ULL(29))) {	/* no IGN_UMONITOR support: ucode
+					 * predates the mitigation, UMONITOR
+					 * still arms (overflow risk applies:
+					 * we arm at most once per doze) */
+		io_dma_umonitor_eff = 1;
+		return;
+	}
+	if (!rdmsrq_safe(MSR_IA32_MCU_OPT_CTRL, &mcu))
+		io_dma_umonitor_eff = !(mcu & BIT_ULL(6)); /* IGN_UMONITOR */
+}
+
+/*
+ * Doze on the head task's completion record instead of spinning cookie
+ * queries: UMONITOR the status byte the device will write, UMWAIT until
+ * that write (typical), the TSC deadline, or an interrupt. Detection
+ * becomes a single cache-line wake with the core in C0.1/C0.2 -- no
+ * polling while waiting, no C1-exit/HWP-ramp tax on wake.
+ *
+ * The task -> record lookup runs under poll_armed so a concurrent poller
+ * can't complete and recycle the head task mid-peek; the record memory
+ * itself is a per-WQ pool that outlives descriptors, so once we hold the
+ * address a stale read is harmless (bounded by the deadline). Falls back
+ * to one cpu_relax() when the peek loses the race, the channel can't
+ * provide record addresses, or the head is a later-cookie completion
+ * whose record byte is already set.
+ */
+static void io_dma_mwait_wait(struct io_ring_ctx *ctx)
+{
+	const u8 *status = NULL;
+
+	if (!static_cpu_has(X86_FEATURE_WAITPKG)) {
+		cpu_relax();
+		return;
+	}
+
+	if (atomic_cmpxchg(&ctx->dma.poll_armed, 0, 1) == 0) {
+		struct io_dma_task *t = READ_ONCE(ctx->dma.poll_list);
+
+		if (t)
+			status = t->compl_status;
+		atomic_set_release(&ctx->dma.poll_armed, 0);
+	}
+	if (!status) {
+		cpu_relax();
+		return;
+	}
+
+	/* Monitor protocol: arm, re-check, then wait -- a record write
+	 * between the check and the wait still ends it. A context switch
+	 * between MONITOR and MWAIT clears the armed state, in which case
+	 * MWAIT retires immediately (SDM) -- no lost wake either way.
+	 * One arm per doze, never re-armed in a tight loop, keeping the
+	 * monitor-table pressure at the completion rate (doc 826393).
+	 * When UMONITOR is a mitigation no-op, TPAUSE-slice instead:
+	 * same C0.2 residency, staleness bounded by one slice. */
+	if (io_dma_umonitor_eff) {
+		io_umonitor(status);
+		if (READ_ONCE(*status) == 0 && !kthread_should_stop())
+			io_umwait(0 /* C0.2 */, rdtsc() +
+				  (u64)READ_ONCE(io_dma_mwait_us) * tsc_khz / 1000);
+	} else {
+		io_tpause_slice();
+	}
+}
+
+#else
+static void io_dma_mwait_wait(struct io_ring_ctx *ctx)
+{
+	cpu_relax();
+}
+
+
+static void io_dma_umonitor_detect(void)
+{
+}
+#endif
+
+
 static int io_dma_compl_thread_fn(void *data)
 {
 	struct io_ring_ctx *ctx = data;
@@ -980,12 +1161,10 @@ static int io_dma_compl_thread_fn(void *data)
 			io_dma_poll_pass(ctx, false);
 			if (!io_dma_pending(ctx))
 				break;
-			/*
-			 * Wait between drains. mwait (UMONITOR/UMWAIT on the
-			 * head completion record) lands in a later step; until
-			 * then the thread spins between passes.
-			 */
-			cpu_relax();
+			/* Doze on the head completion record until the
+			 * device writes it (or the deadline/an interrupt
+			 * ends the doze). */
+			io_dma_mwait_wait(ctx);
 		}
 	}
 	return 0;
@@ -1014,8 +1193,31 @@ void io_dma_compl_thread_start(struct io_ring_ctx *ctx)
 	}
 
 	node = dev_to_node(ctx->dma.chan->device->dev);
-	cpu = (node != NUMA_NO_NODE) ? cpumask_first(cpumask_of_node(node))
-				     : nr_cpu_ids;
+	cpu = nr_cpu_ids;
+	if (node != NUMA_NO_NODE) {
+		const struct cpumask *mask = cpumask_of_node(node);
+		unsigned int weight = cpumask_weight(mask);
+
+		/*
+		 * Spread the spinning threads across the node from the TOP of
+		 * its cpumask down, one CPU per ring (global sequence).
+		 * cpumask_first put every ring's thread on the node's first
+		 * CPU -- where applications also pin their first worker --
+		 * so N rings meant N busy-spinners plus the app thread
+		 * timesharing one CPU while the rest of the node idled
+		 * (measured: 32x32 64KB xnode recv at 11.5 GB/s vs 19.8 for
+		 * the CQ-wait-poll path; the mode's own floor is the best of
+		 * all, 6.4us). High CPUs are the least likely to collide
+		 * with low-CPU-first application pinning conventions.
+		 */
+		if (weight) {
+			static atomic_t seq;
+			unsigned int idx = weight - 1 -
+				((unsigned int)atomic_fetch_inc(&seq) % weight);
+
+			cpu = cpumask_nth(idx, mask);
+		}
+	}
 	if (cpu >= nr_cpu_ids)
 		cpu = cpumask_first(cpu_online_mask);
 	kthread_bind(t, cpu);
@@ -1327,6 +1529,9 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 		tx->callback_param = dma;
 	}
 
+	/* Capture before the doorbell: dmaengine_submit() makes the descriptor
+	 * eligible for a concurrent reap-and-recycle. */
+	dma->compl_status = io_dma_tx_compl_status(req->ctx->dma.chan, tx);
 	dma->cookie = dmaengine_submit(tx);
 	if (dma_submit_error(dma->cookie)) {
 		kfree(heap_entries);
@@ -1792,6 +1997,9 @@ static ssize_t io_dma_submit_batch_sg(struct io_kiocb *req, struct device *dev,
 		tx->callback_param = dma;
 	}
 
+	/* Capture before the doorbell: dmaengine_submit() makes the descriptor
+	 * eligible for a concurrent reap-and-recycle. */
+	dma->compl_status = io_dma_tx_compl_status(req->ctx->dma.chan, tx);
 	dma->cookie = dmaengine_submit(tx);
 	if (dma_submit_error(dma->cookie)) {
 		dma_unmap_sg(dev, src_sg, nr_entries, DMA_TO_DEVICE);
@@ -1972,6 +2180,9 @@ static ssize_t io_dma_submit_single_entry(struct io_kiocb *req,
 		tx->callback_param = dma;
 	}
 
+	/* Capture before the doorbell: dmaengine_submit() makes the descriptor
+	 * eligible for a concurrent reap-and-recycle. */
+	dma->compl_status = io_dma_tx_compl_status(req->ctx->dma.chan, tx);
 	dma->cookie = dmaengine_submit(tx);
 	if (dma_submit_error(dma->cookie)) {
 		if (entry->src_is_page)
@@ -2811,41 +3022,24 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 
 			/*
 			 * Take the in-flight DMA reference BEFORE the tasks
-			 * become reachable by any completer. In non-IRQ mode the
-			 * hardware doorbell was already rung in
-			 * io_uring_copy_to_iter(), so the instant the tasks are
-			 * published to the submit_list below a concurrent drain --
-			 * the poll_work kworker, the busypoll kthread, or
-			 * io_ring_exit_work -- can reach dma_refcnt == 0 in
-			 * __io_dma_task_complete(). Were the ref taken after
-			 * publishing, that drain would complete the req, see
-			 * dma_ref_held == false and drop nothing, and this path
-			 * would then set refcount/dma_ref_held on an
-			 * already-completed req: double-complete / orphaned ref /
-			 * use-after-free. Taking it here (before publish, and
-			 * before IRQ mode's deferred doorbell) closes the window;
-			 * dropped in __io_dma_task_complete() at dma_refcnt == 0.
-			 * Mirrors io_wq_submit_work().
+			 * are published: the doorbell has already rung (non-IRQ
+			 * modes), so the instant a task is visible a concurrent
+			 * drain can reach dma_refcnt == 0 and complete the req;
+			 * a ref taken after publish would then land on an
+			 * already-completed req (double-complete/UAF).  Dropped
+			 * in __io_dma_task_complete() at dma_refcnt == 0.
 			 *
-			 * The take must ALSO be under ctx->dma.lock, the lock
+			 * The take must also be under ctx->dma.lock, which
 			 * every completer holds through its dma_refcnt == 0
-			 * block. A multishot reissue reaches here while the
-			 * PREVIOUS cycle's completer may still be between
-			 * publishing pending_aux_cqe / kicking the poll (which
-			 * is what let this reissue run) and dropping the
-			 * previous in-flight ref. Taken unlocked, this
-			 * ref/flag write interleaves into that window: the
-			 * completer then either skips its drop or donates it to
-			 * the new cycle, and one reference leaks each time --
-			 * accumulating on the long-lived multishot req until it
-			 * can never be freed and ring teardown wedges. The lock
-			 * orders this take strictly after that drop.
+			 * block: a multishot reissue can run while the previous
+			 * cycle's completer is still between its wakeup and its
+			 * ref drop, and an unlocked take interleaved there
+			 * leaks one reference per race until teardown wedges.
 			 *
-			 * io_recv is about to return IOU_ISSUE_SKIP_COMPLETE,
-			 * handing the req to the DMA engine while it stays in the
-			 * poll cancel-hash; without this ref, teardown
-			 * cancellation (io_poll_remove_all) could free the still-
-			 * hashed req while DMA references it.
+			 * The ref itself is needed because io_recv returns
+			 * IOU_ISSUE_SKIP_COMPLETE with the req still in the
+			 * poll cancel-hash; without it, teardown cancellation
+			 * could free the req while DMA references it.
 			 */
 			spin_lock_irqsave(&ctx->dma.lock, flags);
 			if (!(req->flags & REQ_F_REFCOUNT))
@@ -2935,7 +3129,7 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 			 */
 			dma_async_issue_pending(ctx->dma.chan);
 		} else if (io_dma_pending(ctx)) {
-			if (READ_ONCE(io_dma_completion_mode) == IO_DMA_COMP_MWAIT &&
+			if (io_dma_mode_wakes_thread(READ_ONCE(io_dma_completion_mode)) &&
 			    ctx->dma.compl_thread)
 				wake_up(&ctx->dma.compl_wait);
 			else
@@ -2985,14 +3179,13 @@ static void io_dma_rescue_kick(struct io_ring_ctx *ctx)
 {
 	if (IS_ERR_OR_NULL(ctx->dma.chan))
 		return;
-	if (READ_ONCE(io_dma_completion_mode) == IO_DMA_COMP_MWAIT &&
+	if (io_dma_mode_wakes_thread(READ_ONCE(io_dma_completion_mode)) &&
 	    ctx->dma.compl_thread) {
 		/* The compl thread's own drain passes re-check
 		 * io_dma_pending() in its loop condition; only
 		 * foreign callers need to wake it. */
-		if (ctx->dma.compl_thread != current) {
+		if (ctx->dma.compl_thread != current)
 			wake_up(&ctx->dma.compl_wait);
-		}
 	} else if (atomic_read(&ctx->dma.poll_active) == 0) {
 		queue_work(system_unbound_wq, &ctx->dma.poll_work);
 	}
@@ -3139,26 +3332,18 @@ out_disarm:
 
 	/*
 	 * Tasks remain parked: still DMA_IN_PROGRESS at walk time, or
-	 * published during our splice. The splice above (llist_del_all, then
-	 * the poll_list write) has a window where those tasks are invisible
-	 * to io_dma_pending() -- a concurrently exiting workfn can read both
-	 * lists empty at its post-clear re-check and leave, while the
-	 * submitter's kick was already consumed (elided against that same
-	 * workfn). If this caller is a one-shot drain (inline reap on enter,
-	 * CQ-wait poll, the no-task issue-path drain), nothing is scheduled
-	 * to ever look at the parked task again: its completion record is
-	 * written and nobody reads it, the in-flight ref pins the req
-	 * forever, and the connection starves (observed as deterministic
-	 * end-of-run stalls in kworker/busypoll modes on 64KB xnode recv).
-	 * Close the hole here, on the disarm edge every poller passes
-	 * through: whenever we leave pollable work behind, ensure a
-	 * persistent poller is scheduled. Callers that poll in a loop and
-	 * re-check io_dma_pending() before abandoning the ring (workfn,
-	 * compl thread, inline/cq-wait spinners) pass rescue=false: kicking
-	 * a kworker for a descriptor this loop will re-examine nanoseconds
-	 * later is pure overhead (observed as 260K-700K redundant
-	 * queue_work()s per 20GB at cq_poll_us=50). They instead fire
-	 * io_dma_rescue_kick() once on their exit edge if work remains.
+	 * published during our splice. The splice (llist_del_all, then the
+	 * poll_list write) has a window where those tasks are invisible to
+	 * io_dma_pending(): an exiting workfn can read both lists empty at
+	 * its post-clear re-check and leave while the submitter's kick was
+	 * already elided against it. If this caller is a one-shot drain,
+	 * nothing is scheduled to ever look at the parked task again and
+	 * the in-flight ref pins the req forever. Close the hole on the
+	 * disarm edge every poller passes through: whenever pollable work
+	 * is left behind, ensure a persistent poller is scheduled. Looping
+	 * callers that re-check io_dma_pending() before abandoning the ring
+	 * pass rescue=false (a kick per drain pass is redundant) and fire
+	 * io_dma_rescue_kick() once on their exit edge instead.
 	 */
 	if (rescue)
 		io_dma_rescue_kick(ctx);
