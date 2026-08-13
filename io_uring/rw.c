@@ -9,7 +9,6 @@
 #include <linux/fsnotify.h>
 #include <linux/poll.h>
 #include <linux/nospec.h>
-#include <linux/shmem_fs.h>
 #include <linux/compat.h>
 #include <linux/io_uring/cmd.h>
 #include <linux/indirect_call_wrapper.h>
@@ -956,89 +955,122 @@ static int __io_read(struct io_kiocb *req, struct io_br_sel *sel,
 	if (unlikely(ret))
 		return ret;
 
-	/* DMA-offloaded page cache read for registered buffers.
-	 * Bypass generic_file_read_iter() and read directly from the
+	/* DMA-offloaded page cache read for registered buffers. We
+	 * bypass generic_file_read_iter() and read directly from the
 	 * page cache, submitting DMA copies to the registered buffer.
+	 * Every reject and failure reason is counted in the debugfs
+	 * "filemap:" section. This path fails silently into the normal
+	 * buffered read, which hid both a shmem hazard and a
+	 * descriptor-exhaustion -EAGAIN storm until counted.
 	 */
 	if (!IS_ERR_OR_NULL(req->ctx->dma.chan) &&
 	    (req->flags & REQ_F_ISREG) &&
-	    (req->flags & REQ_F_BUF_NODE) && req->buf_node &&
-	    req->buf_node->buf->dma_addrs &&
-	    iov_iter_is_bvec(&io->iter) &&
-	    !(kiocb->ki_flags & IOCB_DIRECT) &&
-	    (req->file->f_op->fop_flags & FOP_DMA_READ)) {
-		io_uring_dma_prep(req);
-		/*
-		 * On a reissue after a short claim the iter and ki_pos have
-		 * advanced by io->bytes_done, but rw->addr is the SQE's
-		 * original address.  We address the destination from where
-		 * the iter stands.  Otherwise the retry lands the tail's
-		 * data at the buffer head.
-		 */
-		req->dma.dst_user_addr = rw->addr + io->bytes_done;
-
-		ret = io_dma_filemap_read(req, kiocb, rw->addr + io->bytes_done,
-					  iov_iter_count(&io->iter));
-
-		/*
-		 * Only a descriptor-pool shortage truncates the claim
-		 * to the contiguous prefix; every other failure fails
-		 * the whole read. We would return that claim directly,
-		 * so it would reach userspace as a short read, which
-		 * the buffered path never produces for data it can
-		 * reach. We read the tail with the CPU instead and
-		 * claim the whole request. The tail lands past the
-		 * prefix, so it cannot race the DMA still in flight.
-		 * A claim cut short by end of file also lands here;
-		 * the tail read then returns zero and the claim
-		 * stands, which costs one call and spares the
-		 * datapath an i_size check.
-		 *
-		 * We clear IOCB_NOWAIT for the tail. The request is
-		 * already committed, since a prefix is on its way to
-		 * the buffer and we cannot punt it, so a short read is
-		 * the only other option. The tail usually comes from
-		 * folios the collection loop just brought in, but it
-		 * can reach the device, so a submission that asked not
-		 * to block can block here.
-		 */
-		if (ret > 0 && ret < (ssize_t)iov_iter_count(&io->iter)) {
-			bool nowait = kiocb->ki_flags & IOCB_NOWAIT;
-			ssize_t tail;
-
-			kiocb->ki_flags &= ~IOCB_NOWAIT;
-			iov_iter_advance(&io->iter, ret);
-			tail = io_iter_do_read(rw, &io->iter);
-			if (nowait)
-				kiocb->ki_flags |= IOCB_NOWAIT;
-			if (tail > 0)
-				ret += tail;
-			else
-				iov_iter_revert(&io->iter, ret);
-		}
-
-		if (ret > 0 && req->dma.dma_refcnt > 0) {
-			/*
-			 * The asynchronous completion posts saved_res
-			 * as the CQE result without passing through
-			 * kiocb_done(), so the bytes a previous issue
-			 * already delivered and the f_pos update for
-			 * offset -1 reads must be folded in here.
-			 * ki_pos is final before the tasks are kicked.
+	    (req->flags & REQ_F_BUF_NODE) && req->buf_node) {
+		if (!req->buf_node->buf->dma_addrs) {
+			io_dma_fm_record(IO_DMA_FM_NO_DMA_ADDRS);
+		} else if (!iov_iter_is_bvec(&io->iter)) {
+			io_dma_fm_record(IO_DMA_FM_NOT_BVEC);
+		} else if (kiocb->ki_flags & IOCB_DIRECT) {
+			io_dma_fm_record(IO_DMA_FM_DIRECT);
+		} else if (!(req->file->f_op->fop_flags & FOP_DMA_READ)) {
+			/* The offload reads the page cache directly and
+			 * skips ->read_iter, which loses NFS revalidation,
+			 * network-fs protocol work, and shmem's swap
+			 * handling. On shmem a cache miss would reach
+			 * filemap_create_folio() and call a NULL
+			 * ->read_folio. Filesystems opt in when their
+			 * buffered read is plain filemap_read() semantics.
 			 */
-			req->dma.saved_res = io_fixup_rw_res(req, ret);
-			req->dma.saved_cflags = 0;
-			req->dma.claim_len = ret;
-			if (req->flags & REQ_F_CUR_POS)
-				req->file->f_pos = kiocb->ki_pos;
-			ret2 = io_dma_submit_queued_tasks(req);
-			if (ret2 == -EIOCBQUEUED)
-				return IOU_ISSUE_SKIP_COMPLETE;
+			io_dma_fm_record(IO_DMA_FM_SHMEM);
+		} else {
+			io_uring_dma_prep(req);
+			/*
+			 * On a reissue after a short claim the iter and
+			 * ki_pos have advanced by io->bytes_done, but
+			 * rw->addr is the SQE's original address.  We
+			 * address the destination from where the iter
+			 * stands.  Otherwise the retry lands the tail's
+			 * data at the buffer head.
+			 */
+			req->dma.dst_user_addr = rw->addr + io->bytes_done;
+
+			ret = io_dma_filemap_read(req, kiocb,
+						  rw->addr + io->bytes_done,
+						  iov_iter_count(&io->iter));
+
+			if (ret > 0)
+				io_dma_fm_record(IO_DMA_FM_ENGAGED);
+			else if (ret == -EAGAIN)
+				io_dma_fm_record(IO_DMA_FM_EAGAIN);
+			else if (ret == -ENOMEM)
+				io_dma_fm_record(IO_DMA_FM_ENOMEM);
+			else if (ret == -EFAULT)
+				io_dma_fm_record(IO_DMA_FM_EFAULT);
+			else if (ret < 0)
+				io_dma_fm_record(IO_DMA_FM_OTHER);
+
+			/*
+			 * Only a descriptor-pool shortage truncates the claim
+			 * to the contiguous prefix; every other failure fails
+			 * the whole read. We would return that claim directly,
+			 * so it would reach userspace as a short read, which
+			 * the buffered path never produces for data it can
+			 * reach. We read the tail with the CPU instead and
+			 * claim the whole request. The tail lands past the
+			 * prefix, so it cannot race the DMA still in flight.
+			 * A claim cut short by end of file also lands here;
+			 * the tail read then returns zero and the claim
+			 * stands, which costs one call and spares the
+			 * datapath an i_size check.
+			 *
+			 * We clear IOCB_NOWAIT for the tail. The request is
+			 * already committed, since a prefix is on its way to
+			 * the buffer and we cannot punt it, so a short read is
+			 * the only other option. The tail usually comes from
+			 * folios the collection loop just brought in, but it
+			 * can reach the device, so a submission that asked not
+			 * to block can block here.
+			 */
+			if (ret > 0 && ret < (ssize_t)iov_iter_count(&io->iter)) {
+				bool nowait = kiocb->ki_flags & IOCB_NOWAIT;
+				ssize_t tail;
+
+				kiocb->ki_flags &= ~IOCB_NOWAIT;
+				iov_iter_advance(&io->iter, ret);
+				tail = io_iter_do_read(rw, &io->iter);
+				if (nowait)
+					kiocb->ki_flags |= IOCB_NOWAIT;
+				if (tail > 0) {
+					ret += tail;
+					io_dma_fm_record(IO_DMA_FM_CPU_TAIL);
+				} else {
+					iov_iter_revert(&io->iter, ret);
+				}
+			}
+
+			if (ret > 0 && req->dma.dma_refcnt > 0) {
+				/*
+				 * The asynchronous completion posts saved_res
+				 * as the CQE result without passing through
+				 * kiocb_done(), so the bytes a previous issue
+				 * already delivered and the f_pos update for
+				 * offset -1 reads must be folded in here.
+				 * ki_pos is final before the tasks are kicked.
+				 */
+				req->dma.saved_res = io_fixup_rw_res(req, ret);
+				req->dma.saved_cflags = 0;
+				req->dma.claim_len = ret;
+				if (req->flags & REQ_F_CUR_POS)
+					req->file->f_pos = kiocb->ki_pos;
+				ret2 = io_dma_submit_queued_tasks(req);
+				if (ret2 == -EIOCBQUEUED)
+					return IOU_ISSUE_SKIP_COMPLETE;
+			}
+			if (ret > 0)
+				return ret;
+			/* On failure we continue to the normal read path. */
+			req->dma.dma_active = false;
 		}
-		if (ret > 0)
-			return ret;
-		/* On failure we continue to the normal read path. */
-		req->dma.dma_active = false;
 	}
 
 	ret = io_iter_do_read(rw, &io->iter);
