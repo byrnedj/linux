@@ -9,8 +9,8 @@
 #include <linux/fsnotify.h>
 #include <linux/poll.h>
 #include <linux/nospec.h>
-#include <linux/shmem_fs.h>
 #include <linux/compat.h>
+#include <linux/shmem_fs.h>
 #include <linux/io_uring/cmd.h>
 #include <linux/indirect_call_wrapper.h>
 
@@ -959,38 +959,65 @@ static int __io_read(struct io_kiocb *req, struct io_br_sel *sel,
 	/* DMA-offloaded page cache read for registered buffers.
 	 * Bypass generic_file_read_iter() and read directly from the
 	 * page cache, submitting DMA copies to the registered buffer.
+	 * Every reject/failure reason is counted (debugfs "filemap:"
+	 * section) -- this path fails SILENTLY into the normal buffered
+	 * read, which made both the shmem zero-fill bug and a
+	 * descriptor-exhaustion -EAGAIN storm invisible until counted.
 	 */
 	if (!IS_ERR_OR_NULL(req->ctx->dma.chan) &&
 	    (req->flags & REQ_F_ISREG) &&
-	    (req->flags & REQ_F_BUF_NODE) && req->buf_node &&
-	    req->buf_node->buf->dma_addrs &&
-	    iov_iter_is_bvec(&io->iter) &&
-	    !(kiocb->ki_flags & IOCB_DIRECT) &&
-	    !shmem_mapping(req->file->f_mapping)) {
-		io_uring_dma_prep(req);
-		/*
-		 * On a reissue after a short claim the iter and ki_pos have
-		 * advanced by io->bytes_done, but rw->addr is the SQE's
-		 * original address.  Address the destination from where the
-		 * iter stands, or the retry lands the tail's data at the
-		 * buffer head.
-		 */
-		req->dma.dst_user_addr = rw->addr + io->bytes_done;
+	    (req->flags & REQ_F_BUF_NODE) && req->buf_node) {
+		if (!req->buf_node->buf->dma_addrs) {
+			io_dma_fm_record(IO_DMA_FM_NO_DMA_ADDRS);
+		} else if (!iov_iter_is_bvec(&io->iter)) {
+			io_dma_fm_record(IO_DMA_FM_NOT_BVEC);
+		} else if (kiocb->ki_flags & IOCB_DIRECT) {
+			io_dma_fm_record(IO_DMA_FM_DIRECT);
+		} else if (shmem_mapping(req->file->f_mapping)) {
+			/* filemap_get_pages() yields no data folios for
+			 * shmem/tmpfs files; the DMA path read ZEROES
+			 * while reporting success. Take the normal
+			 * buffered path instead. */
+			io_dma_fm_record(IO_DMA_FM_SHMEM);
+		} else {
+			io_uring_dma_prep(req);
+			/*
+			 * On a reissue after a short claim the iter and
+			 * ki_pos have advanced by io->bytes_done, but
+			 * rw->addr is the SQE's original address.  Address
+			 * the destination from where the iter stands, or
+			 * the retry lands the tail's data at the buffer
+			 * head.
+			 */
+			req->dma.dst_user_addr = rw->addr + io->bytes_done;
 
-		ret = io_dma_filemap_read(req, kiocb, rw->addr + io->bytes_done,
-					  iov_iter_count(&io->iter));
+			ret = io_dma_filemap_read(req, kiocb,
+						  rw->addr + io->bytes_done,
+						  iov_iter_count(&io->iter));
 
-		if (ret > 0 && req->dma.dma_refcnt > 0) {
-			req->dma.saved_res = ret;
-			req->dma.saved_cflags = 0;
-			ret2 = io_dma_submit_queued_tasks(req);
-			if (ret2 == -EIOCBQUEUED)
-				return IOU_ISSUE_SKIP_COMPLETE;
+			if (ret > 0)
+				io_dma_fm_record(IO_DMA_FM_ENGAGED);
+			else if (ret == -EAGAIN)
+				io_dma_fm_record(IO_DMA_FM_EAGAIN);
+			else if (ret == -ENOMEM)
+				io_dma_fm_record(IO_DMA_FM_ENOMEM);
+			else if (ret == -EFAULT)
+				io_dma_fm_record(IO_DMA_FM_EFAULT);
+			else if (ret < 0)
+				io_dma_fm_record(IO_DMA_FM_OTHER);
+
+			if (ret > 0 && req->dma.dma_refcnt > 0) {
+				req->dma.saved_res = ret;
+				req->dma.saved_cflags = 0;
+				ret2 = io_dma_submit_queued_tasks(req);
+				if (ret2 == -EIOCBQUEUED)
+					return IOU_ISSUE_SKIP_COMPLETE;
+			}
+			if (ret > 0)
+				return ret;
+			/* On failure, fall through to normal read path */
+			req->dma.dma_active = false;
 		}
-		if (ret > 0)
-			return ret;
-		/* On failure, fall through to normal read path */
-		req->dma.dma_active = false;
 	}
 
 	/* Arm DMA copy offload for this read; the filemap path
