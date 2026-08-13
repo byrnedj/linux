@@ -75,6 +75,19 @@ static void op_flag_setup(unsigned long flags, u32 *desc_flags)
 		*desc_flags |= IDXD_OP_FLAG_RCI;
 }
 
+/*
+ * Cache-Control is valid only on data-mover descriptors and only when
+ * GENCAP reports Cache Control Support for memory destinations. On a
+ * device without the capability the flag encoding is reserved and the
+ * descriptor fails with DSA_COMP_INVALID_FLAGS, so honour the advisory
+ * prep flag by dropping it there.
+ */
+static inline u32 idxd_cc_flag(struct idxd_wq *wq, unsigned long flags)
+{
+	return (flags & DMA_PREP_CACHE_CONTROL) &&
+	       wq->idxd->hw.gen_cap.cache_control_mem ? IDXD_OP_FLAG_CC : 0;
+}
+
 static inline void idxd_prep_desc_common(struct idxd_wq *wq,
 					 struct dsa_hw_desc *hw, char opcode,
 					 u64 addr_f1, u64 addr_f2, u64 len,
@@ -131,6 +144,7 @@ idxd_dma_submit_memcpy(struct dma_chan *c, dma_addr_t dma_dest,
 		return NULL;
 
 	op_flag_setup(flags, &desc_flags);
+	desc_flags |= idxd_cc_flag(wq, flags);
 	desc = idxd_alloc_desc(wq, IDXD_OP_NONBLOCK);
 	if (IS_ERR(desc))
 		return NULL;
@@ -241,7 +255,8 @@ idxd_dma_prep_memcpy_sg(struct dma_chan *chan,
 
 		memset(batch->descs + i, 0, sizeof(struct dsa_hw_desc));
 		idxd_prep_desc_common(wq, batch->descs + i, DSA_OPCODE_MEMMOVE,
-				dma_src, dma_dst, len, 0, IDXD_OP_FLAG_CC);
+				dma_src, dma_dst, len, 0,
+				idxd_cc_flag(wq, flags));
 		batch->num++;
 
 		dst_nents -= fetch_sg_and_pos(&dst_sg, &dst_avail, len);
@@ -273,15 +288,20 @@ idxd_dma_prep_memcpy_sg(struct dma_chan *chan,
 		 * A one element batch is an invalid Descriptor Count on
 		 * hardware without Batch1 support, and GENCAP has no bit
 		 * to probe for it. Dispatch the single element as a plain
-		 * MEMMOVE instead.
+		 * MEMMOVE instead. Cache-Control is valid there, so it
+		 * rides along.
 		 */
 		idxd_prep_desc_common(wq, desc->hw, DSA_OPCODE_MEMMOVE,
 				batch->descs[0].src_addr,
 				batch->descs[0].dst_addr,
 				batch->descs[0].xfer_size,
 				desc->compl_dma,
-				desc_flags | IDXD_OP_FLAG_CC);
+				desc_flags | idxd_cc_flag(wq, flags));
 	} else {
+		/*
+		 * The BATCH descriptor itself moves no data, so it never
+		 * carries Cache-Control; the elements above do.
+		 */
 		idxd_prep_desc_common(wq, desc->hw, DSA_OPCODE_BATCH,
 				batch->dma_descs, 0, batch->num,
 				desc->compl_dma, desc_flags);
