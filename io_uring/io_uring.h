@@ -631,6 +631,21 @@ enum {
 void io_dma_fmw_record(unsigned int reason);
 ssize_t io_dma_filemap_write(struct io_kiocb *req, struct kiocb *iocb,
 			     struct iov_iter *from, u64 src_user_addr);
+
+/* Filemap DMA-read gate/result accounting; see io_uring/dma.c. */
+enum {
+	IO_DMA_FM_ENGAGED,
+	IO_DMA_FM_SHMEM,
+	IO_DMA_FM_NOT_BVEC,
+	IO_DMA_FM_DIRECT,
+	IO_DMA_FM_NO_DMA_ADDRS,
+	IO_DMA_FM_EAGAIN,
+	IO_DMA_FM_ENOMEM,
+	IO_DMA_FM_EFAULT,
+	IO_DMA_FM_OTHER,
+	IO_DMA_FM_NR,
+};
+void io_dma_fm_record(unsigned int reason);
 extern unsigned int io_dma_reap_on_enter;
 extern unsigned int io_dma_drain_wait_us;
 extern atomic64_t io_dma_drain_cycles;
