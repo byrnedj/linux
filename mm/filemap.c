@@ -2679,7 +2679,35 @@ static int filemap_readahead(struct kiocb *iocb, struct file *file,
 	return 0;
 }
 
-static int filemap_get_pages(struct kiocb *iocb, size_t count,
+/**
+ * filemap_get_pages - get a batch of folios for a buffered read
+ * @iocb: the iocb to read for; ki_pos is the read position
+ * @count: the number of bytes the caller intends to read
+ * @fbatch: batch to fill with data folios
+ * @need_uptodate: require every returned folio to be uptodate as a
+ *	whole, reading in full one that is only partially uptodate
+ *
+ * Fill @fbatch with the folios that hold the data from ki_pos on,
+ * creating and reading them in as needed. The batch may cover only a
+ * prefix of the @count bytes: it stops at a hole, at a folio that is
+ * not uptodate or is marked for readahead, when @fbatch is full, or
+ * where an error hit a folio after the first. The caller consumes what
+ * it got and calls again for the rest. Without @need_uptodate the last
+ * folio may be only partially uptodate, with the bytes of the read
+ * that it holds uptodate. The caller owns one reference on each
+ * returned folio and must put them all.
+ *
+ * IOCB_NOIO starts no I/O and returns -EAGAIN where I/O is needed, but
+ * may still sleep, on the invalidate lock for example. IOCB_NOWAIT
+ * returns -EAGAIN rather than wait for a locked or not uptodate folio,
+ * but on a cache miss it still starts readahead. Under IOCB_WAITQ a
+ * locked folio that is not uptodate queues @iocb->ki_waitq and returns
+ * -EIOCBQUEUED.
+ *
+ * Return: 0 if @fbatch holds at least one folio, a negative error
+ * otherwise.
+ */
+int filemap_get_pages(struct kiocb *iocb, size_t count,
 		struct folio_batch *fbatch, bool need_uptodate)
 {
 	struct file *filp = iocb->ki_filp;
