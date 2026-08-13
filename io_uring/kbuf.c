@@ -9,6 +9,7 @@
 #include <linux/poll.h>
 #include <linux/vmalloc.h>
 #include <linux/io_uring.h>
+#include <linux/dma-mapping.h>
 
 #include <uapi/linux/io_uring.h>
 
@@ -19,6 +20,8 @@
 
 /* BIDs are addressed by a 16-bit field in a CQE */
 #define MAX_BIDS_PER_BGID (1 << 16)
+
+static void io_pbuf_dma_unmap(struct io_buffer_list *bl);
 
 /* Mapped buffer ring, return io_uring_buf from head */
 #define io_ring_head_to_buf(br, head, mask)	(&(br)->bufs[(head) & (mask)])
@@ -457,6 +460,8 @@ static int io_remove_buffers_legacy(struct io_ring_ctx *ctx,
 
 static void io_put_bl(struct io_ring_ctx *ctx, struct io_buffer_list *bl)
 {
+	io_pbuf_dma_unmap(bl);
+
 	if (bl->flags & IOBL_BUF_RING)
 		io_free_region(ctx->user, &bl->region);
 	else
@@ -626,6 +631,152 @@ int io_manage_buffers_legacy(struct io_kiocb *req, unsigned int issue_flags)
 	return IOU_COMPLETE;
 }
 
+static void io_pbuf_dma_unmap(struct io_buffer_list *bl)
+{
+	unsigned int folio_order;
+	size_t folio_size;
+	int nr_folios, i;
+
+	if (!bl->dma_addrs)
+		return;
+
+	folio_order = bl->dma_folio_shift - PAGE_SHIFT;
+	folio_size = 1UL << bl->dma_folio_shift;
+	nr_folios = bl->dma_nr_pages >> folio_order;
+
+	for (i = 0; i < nr_folios; i++) {
+		if (!dma_mapping_error(bl->dma_dev, bl->dma_addrs[i]))
+			dma_unmap_page(bl->dma_dev, bl->dma_addrs[i],
+				       folio_size, DMA_FROM_DEVICE);
+	}
+	kvfree(bl->dma_addrs);
+	bl->dma_addrs = NULL;
+
+	if (bl->dma_pages) {
+		unpin_user_pages(bl->dma_pages, bl->dma_nr_pages);
+		kvfree(bl->dma_pages);
+		bl->dma_pages = NULL;
+	}
+
+	bl->dma_nr_pages = 0;
+	bl->dma_folio_shift = 0;
+	bl->dma_dev = NULL;
+	bl->dma_data_base = 0;
+}
+
+static int io_pbuf_dma_map(struct io_buffer_list *bl, struct device *dev,
+			   u64 data_addr, u64 data_size)
+{
+	unsigned int folio_shift, pages_per_folio, nr_folios;
+	unsigned long nr_pages;
+	size_t folio_size;
+	int i, ret;
+
+	if (data_addr & ~PAGE_MASK)
+		return -EINVAL;
+	if (!data_size || (data_size & ~PAGE_MASK))
+		return -EINVAL;
+
+	nr_pages = data_size >> PAGE_SHIFT;
+
+	bl->dma_pages = kvmalloc_array(nr_pages, sizeof(struct page *),
+				       GFP_KERNEL);
+	if (!bl->dma_pages)
+		return -ENOMEM;
+
+	ret = pin_user_pages_fast(data_addr, nr_pages,
+				  FOLL_WRITE | FOLL_LONGTERM,
+				  bl->dma_pages);
+	if (ret != nr_pages) {
+		if (ret > 0)
+			unpin_user_pages(bl->dma_pages, ret);
+		kvfree(bl->dma_pages);
+		bl->dma_pages = NULL;
+		return ret < 0 ? ret : -EFAULT;
+	}
+
+	/* Detect folio size from the first pinned page. */
+	folio_shift = compound_order(compound_head(bl->dma_pages[0])) + PAGE_SHIFT;
+	folio_size = 1UL << folio_shift;
+	pages_per_folio = folio_size >> PAGE_SHIFT;
+
+	/* Region must be aligned to and a multiple of the folio size. */
+	if ((data_addr | data_size) & (folio_size - 1)) {
+		unpin_user_pages(bl->dma_pages, nr_pages);
+		kvfree(bl->dma_pages);
+		bl->dma_pages = NULL;
+		return -EINVAL;
+	}
+
+	nr_folios = nr_pages >> (folio_shift - PAGE_SHIFT);
+
+	bl->dma_addrs = kvmalloc_array(nr_folios, sizeof(dma_addr_t),
+				       GFP_KERNEL);
+	if (!bl->dma_addrs) {
+		unpin_user_pages(bl->dma_pages, nr_pages);
+		kvfree(bl->dma_pages);
+		bl->dma_pages = NULL;
+		return -ENOMEM;
+	}
+
+	bl->dma_dev = dev;
+	bl->dma_data_base = data_addr;
+	bl->dma_nr_pages = nr_pages;
+	bl->dma_folio_shift = folio_shift;
+
+	for (i = 0; i < nr_folios; i++) {
+		struct page *head = compound_head(bl->dma_pages[i * pages_per_folio]);
+
+		bl->dma_addrs[i] = dma_map_page(dev, head, 0, folio_size,
+						 DMA_FROM_DEVICE);
+		if (dma_mapping_error(dev, bl->dma_addrs[i])) {
+			/*
+			 * Unpin ALL pinned pages, not just those inside
+			 * successfully mapped folios: dma_nr_pages bounds
+			 * both the unmap loop and the unpin in
+			 * io_pbuf_dma_unmap(), so unpin the tail here
+			 * before handing it the mapped prefix.
+			 */
+			unpin_user_pages(bl->dma_pages + i * pages_per_folio,
+					 nr_pages - i * pages_per_folio);
+			bl->dma_nr_pages = i * pages_per_folio;
+			io_pbuf_dma_unmap(bl);
+			return -ENOMEM;
+		}
+	}
+
+	return 0;
+}
+
+/**
+ * io_kbuf_dma_addr - look up the pre-mapped DMA address for a user VA
+ * @bl: the buffer list with DMA mappings
+ * @user_addr: the user virtual address from the buffer ring entry
+ *
+ * Returns the DMA address, or 0 if not mapped.
+ */
+dma_addr_t io_kbuf_dma_addr(struct io_buffer_list *bl, u64 user_addr)
+{
+	unsigned long offset, folio_idx, folio_off;
+	unsigned int folio_order;
+
+	if (!bl || !bl->dma_addrs)
+		return 0;
+
+	if (user_addr < bl->dma_data_base)
+		return 0;
+
+	offset = user_addr - bl->dma_data_base;
+	folio_order = bl->dma_folio_shift - PAGE_SHIFT;
+	folio_idx = offset >> bl->dma_folio_shift;
+	folio_off = offset & ((1UL << bl->dma_folio_shift) - 1);
+
+	if (folio_idx >= (bl->dma_nr_pages >> folio_order))
+		return 0;
+
+	return bl->dma_addrs[folio_idx] + folio_off;
+}
+
 int io_register_pbuf_ring(struct io_ring_ctx *ctx, void __user *arg)
 {
 	struct io_uring_buf_reg reg;
@@ -640,9 +791,19 @@ int io_register_pbuf_ring(struct io_ring_ctx *ctx, void __user *arg)
 
 	if (copy_from_user(&reg, arg, sizeof(reg)))
 		return -EFAULT;
-	if (!mem_is_zero(reg.resv, sizeof(reg.resv)))
-		return -EINVAL;
-	if (reg.flags & ~(IOU_PBUF_RING_MMAP | IOU_PBUF_RING_INC))
+	if (reg.flags & IOU_PBUF_RING_DMA) {
+		/*
+		 * resv[1]:resv[0] = data_addr, resv[3]:resv[2] = data_size
+		 * (little-endian __u32 pairs); resv[4] stays reserved.
+		 */
+		if (reg.resv[4])
+			return -EINVAL;
+	} else {
+		if (!mem_is_zero(reg.resv, sizeof(reg.resv)))
+			return -EINVAL;
+	}
+	if (reg.flags & ~(IOU_PBUF_RING_MMAP | IOU_PBUF_RING_INC |
+			  IOU_PBUF_RING_DMA))
 		return -EINVAL;
 	if (!is_power_of_2(reg.ring_entries))
 		return -EINVAL;
@@ -704,10 +865,45 @@ int io_register_pbuf_ring(struct io_ring_ctx *ctx, void __user *arg)
 		bl->min_left_sub_one = reg.min_left - 1;
 	if (reg.flags & IOU_PBUF_RING_INC)
 		bl->flags |= IOBL_INC;
+
+	/* DMA pre-map the data buffer region if requested. If no DMA channel
+	 * is available on this ctx, silently skip the pre-map and let the
+	 * recv path fall back to CPU copy (io_recv already gates on
+	 * IS_ERR_OR_NULL(ctx->dma.chan) before setting msg_io_iocb).
+	 */
+	if (reg.flags & IOU_PBUF_RING_DMA) {
+		/*
+		 * resv[] slots are __u32; the data region's address and size
+		 * are carried as little-endian pairs: addr = resv[1]:resv[0],
+		 * size = resv[3]:resv[2].
+		 */
+		u64 data_addr = ((u64)reg.resv[1] << 32) | reg.resv[0];
+		u64 data_size = ((u64)reg.resv[3] << 32) | reg.resv[2];
+
+		if (!data_addr || !data_size) {
+			pr_err("io_uring DMA: bad register args addr=%llx size=%llx\n",
+			       data_addr, data_size);
+			ret = -EINVAL;
+			goto fail;
+		}
+		if (IS_ERR_OR_NULL(ctx->dma.chan)) {
+			pr_info_ratelimited("io_uring DMA: no channel available, buffer ring registered without DMA pre-map (CPU fallback)\n");
+		} else {
+			ret = io_pbuf_dma_map(bl, ctx->dma.chan->device->dev,
+					      data_addr, data_size);
+			if (ret) {
+				pr_err("io_uring DMA: io_pbuf_dma_map failed ret=%d addr=%llx size=%llx\n",
+				       ret, data_addr, data_size);
+				goto fail;
+			}
+		}
+	}
+
 	ret = io_buffer_add_list(ctx, bl, reg.bgid);
 	if (!ret)
 		return 0;
 fail:
+	io_pbuf_dma_unmap(bl);
 	io_free_region(ctx->user, &bl->region);
 	kfree(bl);
 	return ret;
