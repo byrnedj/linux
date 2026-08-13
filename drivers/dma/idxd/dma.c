@@ -157,7 +157,13 @@ static enum dma_status idxd_dma_tx_status(struct dma_chan *dma_chan,
 					  dma_cookie_t cookie,
 					  struct dma_tx_state *txstate)
 {
-	return DMA_OUT_OF_ORDER;
+	/*
+	 * DSA completes descriptors out of order; accurate per-descriptor
+	 * status lands with the descriptor rework in the next patch.  Until
+	 * then report generic cookie-order status, which is conservative
+	 * for an out-of-order engine.
+	 */
+	return dma_cookie_status(dma_chan, cookie, txstate);
 }
 
 /*
@@ -227,7 +233,6 @@ int idxd_register_dma_device(struct idxd_device *idxd)
 
 	dma_cap_set(DMA_INTERRUPT, dma->cap_mask);
 	dma_cap_set(DMA_PRIVATE, dma->cap_mask);
-	dma_cap_set(DMA_COMPLETION_NO_ORDER, dma->cap_mask);
 	dma->device_release = idxd_dma_release;
 
 	dma->device_prep_dma_interrupt = idxd_dma_prep_interrupt;

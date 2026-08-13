@@ -526,7 +526,7 @@ enum dma_status dma_sync_wait(struct dma_chan *chan, dma_cookie_t cookie)
 
 	dma_async_issue_pending(chan);
 	do {
-		status = dma_async_is_tx_complete(chan, cookie, NULL, NULL);
+		status = dmaengine_async_is_tx_complete(chan, cookie);
 		if (time_after_eq(jiffies, dma_sync_wait_timeout)) {
 			dev_err(chan->device->dev, "%s: timeout!\n", __func__);
 			return DMA_ERROR;
@@ -1198,6 +1198,7 @@ int dma_async_device_register(struct dma_device *device)
 }
 
 	CHECK_CAP(dma_memcpy,      DMA_MEMCPY);
+	CHECK_CAP(dma_memcpy_sg,   DMA_MEMCPY_SG);
 	CHECK_CAP(dma_xor,         DMA_XOR);
 	CHECK_CAP(dma_xor_val,     DMA_XOR_VAL);
 	CHECK_CAP(dma_pq,          DMA_PQ);
@@ -1208,7 +1209,6 @@ int dma_async_device_register(struct dma_device *device)
 	CHECK_CAP(interleaved_dma, DMA_INTERLEAVE);
 
 #undef CHECK_CAP
-
 	if (!device->device_tx_status) {
 		dev_err(device->dev, "Device tx_status is not defined\n");
 		return -EIO;
