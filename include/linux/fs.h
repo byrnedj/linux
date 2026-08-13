@@ -1965,6 +1965,17 @@ struct file_operations {
 	int (*uring_cmd_iopoll)(struct io_uring_cmd *, struct io_comp_batch *,
 				unsigned int poll_flags);
 	int (*mmap_prepare)(struct vm_area_desc *);
+	/*
+	 * The checks ->read_iter or ->write_iter would run before touching
+	 * the page cache, for a caller that copies through the page cache
+	 * without going through them (the io_uring DMA copy offload). For
+	 * READ it returns 0 or an error. For WRITE it stands in for
+	 * generic_write_checks() and file_modified(): it returns the byte
+	 * count to write, 0, or an error, and may truncate the iter and
+	 * advance the position, as the write_iter prologue would.
+	 */
+	ssize_t (*dma_copy_checks)(struct kiocb *iocb, struct iov_iter *iter,
+				   int rw);
 } __randomize_layout;
 
 /* Supports async buffered reads */
@@ -1983,6 +1994,13 @@ struct file_operations {
 #define FOP_ASYNC_LOCK		((__force fop_flags_t)(1 << 6))
 /* File system supports uncached read/write buffered IO */
 #define FOP_DONTCACHE		((__force fop_flags_t)(1 << 7))
+/* Buffered reads may be served by the io_uring DMA copy offload, which
+ * walks the page cache directly and bypasses ->read_iter. Only set this
+ * when the filesystem's buffered read is plain filemap_read() semantics
+ * with no per-read protocol work, or when ->dma_copy_checks runs the
+ * checks it does perform first.
+ */
+#define FOP_DMA_READ		((__force fop_flags_t)(1 << 8))
 
 /* Wrap a directory iterator that needs exclusive inode access */
 int wrap_directory_iterator(struct file *, struct dir_context *,

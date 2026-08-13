@@ -6,10 +6,15 @@
 #include <linux/task_work.h>
 #include <linux/bitmap.h>
 #include <linux/llist.h>
+#include <linux/dmaengine.h>
+#include <linux/iommu.h>
+#include <linux/workqueue.h>
+#include <linux/atomic.h>
 #include <uapi/linux/io_uring.h>
 
 struct iou_loop_params;
 struct io_uring_bpf_ops;
+struct folio;
 
 enum {
 	/*
@@ -118,7 +123,6 @@ struct io_br_sel {
 		ssize_t val;
 	};
 };
-
 
 /*
  * Arbitrary limit, can be raised if need be
@@ -312,6 +316,117 @@ enum {
 
 struct iou_ctx {};
 
+/* Devices a ring can stripe over: one channel per device in the pool. */
+#define IO_DMA_RING_CHANS	16
+
+struct io_dma_channel {
+	struct dma_chan		*chan;		/* primary; equals chans[0].
+						 * The write path, the gates,
+						 * and teardown key on it.
+						 */
+	/* One per device, in the pool's canonical device order. */
+	struct dma_chan		*chans[IO_DMA_RING_CHANS];
+	unsigned int		nr_chans;
+	unsigned int		stripe_rr;	/* next stripe channel when
+						 * rotating; a placement
+						 * hint updated from io-wq
+						 * too, so a lost update
+						 * only skews placement
+						 */
+
+	struct work_struct	poll_work;
+	atomic_t		poll_armed;
+
+	atomic_t		tasks_pending;	/* published, not yet reaped;
+						 * unlike the two lists this
+						 * has no splice window, so
+						 * the pending check cannot
+						 * misread empty while a
+						 * poller holds spliced tasks
+						 * in local variables
+						 */
+	spinlock_t		lock;
+
+	/* Pending pollable tasks are split for a lock-free producer and
+	 * consumer.  Submitters publish to submit_list, an llist that
+	 * needs no lock.  The ->lock hold they still take for the
+	 * in-flight ref is a few instructions and not the whole poller
+	 * walk.  The single armed poller splices submit_list into
+	 * poll_list, a consumer-owned FIFO that it walks with no lock at
+	 * all.  poll_list is handed between poller threads by the
+	 * poll_armed acquire and release pair.
+	 */
+	struct llist_head	submit_list;
+	struct io_dma_task	*poll_list;
+	struct io_dma_task	*poll_list_tail;
+
+	/* Preallocated io_dma_task freelist, sized to the ring depth.
+	 * The pool has its own lock because __io_dma_task_complete()
+	 * runs both under and outside ->lock, so the pool must not
+	 * reuse ->lock.
+	 */
+	spinlock_t		free_lock;
+	struct io_dma_task	*free_list;	/* chained via ->next */
+	unsigned int		free_count;	/* parked objects */
+	unsigned int		free_max;	/* pool cap == target size */
+};
+
+struct io_dma_kiocb {
+	unsigned int		dma_refcnt;
+	int			dma_result;
+	u32			min_fail_off;	/* lowest failed task offset,
+						 * U32_MAX when none failed
+						 */
+	int			saved_res;	/* result for the deferred CQE */
+	unsigned int		saved_cflags;	/* buffer flags for CQE */
+	bool			dma_active;	/* DMA copy armed for this req */
+	bool			dma_ref_held;	/* extra req ref held for in-flight DMA */
+	bool			cpu_redo;	/* a DMA failure handed the rest
+						 * of the read to the CPU path
+						 */
+	loff_t			claim_pos;	/* ki_pos at the claim, where
+						 * a CPU redo resumes from
+						 */
+	struct io_dma_task	*dma_tasks;
+	struct io_dma_task	*dma_tasks_tail;
+	u64			dst_user_addr;	/* user VA for reg buf DMA lookup */
+};
+
+struct io_dma_batch_entry {
+	dma_addr_t		src_dma;	/* DMA-mapped source address */
+	dma_addr_t		dst_dma;	/* pre-mapped dest DMA address */
+	u32			src_len;	/* source mapping length */
+	struct folio		*folio;		/* page cache folio ref */
+};
+
+#define IO_DMA_BATCH_MAX	32
+
+struct io_dma_task {
+	struct io_kiocb		*req;
+	struct llist_node	llnode;		/* ctx submit_list linkage */
+	dma_cookie_t		cookie;
+	struct dma_chan		*chan;		/* submission channel; the
+						 * poller and the completion
+						 * accounting follow the task,
+						 * not the ring's primary
+						 */
+	dma_addr_t		src_dma;	/* DMA-mapped source address */
+	dma_addr_t		dst_dma;	/* pre-mapped dest DMA address */
+	u32			len;
+	u32			off;		/* byte offset of this task's
+						 * range within the request's
+						 * DMA region
+						 */
+	dma_addr_t		src_map_addr;	/* for dma_unmap at completion */
+	u32			src_map_len;
+	struct folio		*src_folio;	/* page cache folio ref to put on completion */
+	bool			src_is_page;	/* dma_unmap_page vs dma_unmap_single */
+	bool			is_batch;	/* a batch task with batch_entries */
+	u8			batch_nr;	/* number of batch entries */
+	struct io_dma_batch_entry *batch_entries; /* heap-allocated cleanup array */
+	struct io_dma_task	*next;
+};
+
 struct io_ring_ctx {
 	/* const or read-mostly hot data */
 	struct {
@@ -410,6 +525,8 @@ struct io_ring_ctx {
 		 */
 		u64					hybrid_poll_time;
 	} ____cacheline_aligned_in_smp;
+
+	struct io_dma_channel		dma;
 
 	struct {
 		/*
@@ -769,6 +886,8 @@ struct io_kiocb {
 
 		struct io_rsrc_node	*buf_node;
 	};
+
+	struct io_dma_kiocb		dma;
 
 	union {
 		/* used by request caches, completion batching and iopoll */

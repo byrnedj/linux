@@ -9,6 +9,7 @@
 #include <linux/fsnotify.h>
 #include <linux/poll.h>
 #include <linux/nospec.h>
+#include <linux/shmem_fs.h>
 #include <linux/compat.h>
 #include <linux/io_uring/cmd.h>
 #include <linux/indirect_call_wrapper.h>
@@ -388,6 +389,7 @@ static int io_init_rw_fixed(struct io_kiocb *req, unsigned int issue_flags,
 
 int io_prep_read_fixed(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 {
+	req->dma.cpu_redo = false;
 	return __io_prep_rw(req, sqe, ITER_DEST);
 }
 
@@ -651,8 +653,8 @@ static inline void io_rw_done(struct io_kiocb *req, ssize_t ret)
 		io_complete_rw(&rw->kiocb, ret);
 }
 
-static int kiocb_done(struct io_kiocb *req, ssize_t ret,
-		      struct io_br_sel *sel, unsigned int issue_flags)
+int kiocb_done(struct io_kiocb *req, ssize_t ret, struct io_br_sel *sel,
+		       unsigned int issue_flags)
 {
 	struct io_rw *rw = io_kiocb_to_cmd(req, struct io_rw);
 	unsigned final_ret = io_fixup_rw_res(req, ret);
@@ -922,6 +924,7 @@ static int __io_read(struct io_kiocb *req, struct io_br_sel *sel,
 	struct io_async_rw *io = req->async_data;
 	struct kiocb *kiocb = &rw->kiocb;
 	ssize_t ret;
+	int ret2;
 	loff_t *ppos;
 
 	if (req->flags & REQ_F_IMPORT_BUFFER) {
@@ -953,6 +956,105 @@ static int __io_read(struct io_kiocb *req, struct io_br_sel *sel,
 	ret = rw_verify_area(READ, req->file, ppos, req->cqe.res);
 	if (unlikely(ret))
 		return ret;
+
+	/* DMA-offloaded page cache read for registered buffers.
+	 * Bypass generic_file_read_iter() and read directly from the
+	 * page cache, submitting DMA copies to the registered buffer.
+	 */
+	/* Only the non-vectored fixed read qualifies. For READV_FIXED
+	 * rw->addr is the address of the iovec array, not of the data,
+	 * and the offload addresses the destination from rw->addr. Reads
+	 * at the file position stay off too: the completion can report a
+	 * short result after f_pos has already advanced by the full claim.
+	 * A read that a DMA failure handed to the CPU path stays there.
+	 */
+	if (!IS_ERR_OR_NULL(req->ctx->dma.chan) &&
+	    req->opcode == IORING_OP_READ_FIXED && !req->dma.cpu_redo &&
+	    (req->flags & REQ_F_ISREG) && !(req->flags & REQ_F_CUR_POS) &&
+	    (req->flags & REQ_F_BUF_NODE) && req->buf_node &&
+	    req->buf_node->buf->dma_addrs &&
+	    iov_iter_is_bvec(&io->iter) &&
+	    !(kiocb->ki_flags & IOCB_DIRECT) &&
+	    (req->file->f_op->fop_flags & FOP_DMA_READ) &&
+	    req->file->f_mapping->a_ops->read_folio &&
+	    (!req->file->f_op->dma_copy_checks ||
+	     req->file->f_op->dma_copy_checks(kiocb, &io->iter, READ) >= 0)) {
+		io_uring_dma_prep(req);
+		/*
+		 * On a reissue after a short claim the iter and ki_pos have
+		 * advanced by io->bytes_done, but rw->addr is the SQE's
+		 * original address.  We address the destination from where
+		 * the iter stands.  Otherwise the retry lands the tail's
+		 * data at the buffer head.
+		 */
+		req->dma.dst_user_addr = rw->addr + io->bytes_done;
+
+		req->dma.claim_pos = kiocb->ki_pos;
+		ret = io_dma_filemap_read(req, kiocb, rw->addr + io->bytes_done,
+					  iov_iter_count(&io->iter));
+
+		/*
+		 * Only a descriptor-pool shortage truncates the claim
+		 * to the contiguous prefix; every other failure fails
+		 * the whole read. We would return that claim directly,
+		 * so it would reach userspace as a short read, which
+		 * the buffered path never produces for data it can
+		 * reach. We read the tail with the CPU instead and
+		 * claim the whole request. The tail lands past the
+		 * prefix, so it cannot race the DMA still in flight.
+		 * A claim cut short by end of file also lands here;
+		 * the tail read then returns zero and the claim
+		 * stands, which costs one call and spares the
+		 * datapath an i_size check.
+		 *
+		 * We clear IOCB_NOWAIT for the tail. The request is
+		 * already committed, since a prefix is on its way to
+		 * the buffer and we cannot punt it, so a short read is
+		 * the only other option. The tail usually comes from
+		 * folios the collection loop just brought in, but it
+		 * can reach the device, so a submission that asked not
+		 * to block can block here.
+		 */
+		if (ret > 0 && ret < (ssize_t)iov_iter_count(&io->iter)) {
+			bool nowait = kiocb->ki_flags & IOCB_NOWAIT;
+			ssize_t tail;
+
+			kiocb->ki_flags &= ~IOCB_NOWAIT;
+			iov_iter_advance(&io->iter, ret);
+			tail = io_iter_do_read(rw, &io->iter);
+			if (nowait)
+				kiocb->ki_flags |= IOCB_NOWAIT;
+			if (tail > 0)
+				ret += tail;
+			else
+				iov_iter_revert(&io->iter, ret);
+		}
+
+		if (ret > 0 && req->dma.dma_refcnt > 0) {
+			/*
+			 * The asynchronous completion posts saved_res
+			 * as the CQE result without passing through
+			 * kiocb_done(), so the bytes a previous issue
+			 * already delivered and the f_pos update for
+			 * offset -1 reads must be folded in here.
+			 * ki_pos is final before the tasks are kicked.
+			 */
+			req->dma.saved_res = io_fixup_rw_res(req, ret);
+			req->dma.saved_cflags = 0;
+			ret2 = io_dma_submit_queued_tasks(req);
+			if (ret2 == -EIOCBQUEUED) {
+				/* The completion bypasses kiocb_done(), so
+				 * the access notification is raised here.
+				 */
+				fsnotify_access(req->file);
+				return IOU_ISSUE_SKIP_COMPLETE;
+			}
+		}
+		if (ret > 0)
+			return ret;
+		/* On failure we continue to the normal read path. */
+		req->dma.dma_active = false;
+	}
 
 	ret = io_iter_do_read(rw, &io->iter);
 
@@ -1026,6 +1128,37 @@ static int __io_read(struct io_kiocb *req, struct io_br_sel *sel,
 	} while (ret > 0);
 
 	return ret;
+}
+
+/*
+ * A DMA read failed after its claim. Completion is out of order, so only
+ * the bytes below the lowest failed offset are known delivered. The page
+ * cache still holds the rest, so the read goes on from there on the CPU
+ * path, as a reissue with the gate closed, instead of reporting a failure
+ * the buffered read never produces for data it can reach. The DMA wrote
+ * the buffer directly, so the iter still stands where this issue began;
+ * a CPU tail already read past the claim is read again, which is
+ * harmless. Every task of the request has completed, or its provider has
+ * reported it dead, which idxd does only once the device can no longer
+ * execute it, so the redo does not race a late write into the buffer.
+ */
+void io_rw_dma_redo(struct io_tw_req tw_req, io_tw_token_t tw)
+{
+	struct io_kiocb *req = tw_req.req;
+	struct io_rw *rw = io_kiocb_to_cmd(req, struct io_rw);
+	struct io_async_rw *io = req->async_data;
+	u32 prefix = req->dma.min_fail_off;
+
+	if (prefix == U32_MAX)
+		prefix = 0;
+	iov_iter_restore(&io->iter, &io->iter_state);
+	iov_iter_advance(&io->iter, prefix);
+	iov_iter_save_state(&io->iter, &io->iter_state);
+	io->bytes_done += prefix;
+	rw->kiocb.ki_pos = req->dma.claim_pos + prefix;
+	req->dma.cpu_redo = true;
+	req->dma.dma_active = false;
+	io_req_task_submit(tw_req, tw);
 }
 
 int io_read(struct io_kiocb *req, unsigned int issue_flags)

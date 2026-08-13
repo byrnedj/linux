@@ -10,6 +10,7 @@
 #include <linux/compat.h>
 #include <linux/io_uring.h>
 #include <linux/io_uring/cmd.h>
+#include <linux/dma-mapping.h>
 
 #include <uapi/linux/io_uring.h>
 
@@ -161,9 +162,25 @@ static void io_release_ubuf(void *priv)
 static struct io_mapped_ubuf *io_alloc_imu(struct io_ring_ctx *ctx,
 					   int nr_bvecs)
 {
+	struct io_mapped_ubuf *imu;
+
 	if (nr_bvecs <= IO_CACHED_BVECS_SEGS)
-		return io_cache_alloc(&ctx->imu_cache, GFP_KERNEL);
-	return kvmalloc_flex(struct io_mapped_ubuf, bvec, nr_bvecs);
+		imu = io_cache_alloc(&ctx->imu_cache, GFP_KERNEL);
+	else
+		imu = kvmalloc_flex(struct io_mapped_ubuf, bvec, nr_bvecs);
+	if (!imu)
+		return NULL;
+
+	/* Neither allocator zeroes the object. Every buffer, including a
+	 * kernel bvec buffer that is never DMA-mapped, is unmapped through
+	 * io_buffer_unmap(), which reads these fields.
+	 */
+	imu->dma_addrs = NULL;
+	imu->dma_dev = NULL;
+	imu->dma_nr_devs = 0;
+	memset(imu->dma_addrs_dev, 0, sizeof(imu->dma_addrs_dev));
+	memset(imu->dma_devs, 0, sizeof(imu->dma_devs));
+	return imu;
 }
 
 static void io_free_imu(struct io_ring_ctx *ctx, struct io_mapped_ubuf *imu)
@@ -217,6 +234,25 @@ static void io_buffer_unmap(struct io_ring_ctx *ctx, struct io_mapped_ubuf *imu)
 	if (unlikely(refcount_read(&imu->refs) > 1)) {
 		if (!refcount_dec_and_test(&imu->refs))
 			return;
+	}
+
+	/* Unmap the DMA addresses if they were mapped. */
+	if (imu->dma_nr_devs) {
+		unsigned int d, i;
+
+		for (d = 0; d < imu->dma_nr_devs; d++) {
+			for (i = 0; i < imu->nr_bvecs; i++)
+				dma_unmap_page(imu->dma_devs[d],
+					       imu->dma_addrs_dev[d][i],
+					       imu->bvec[i].bv_len,
+					       DMA_FROM_DEVICE);
+			kvfree(imu->dma_addrs_dev[d]);
+			imu->dma_addrs_dev[d] = NULL;
+			put_device(imu->dma_devs[d]);
+			imu->dma_devs[d] = NULL;
+		}
+		imu->dma_nr_devs = 0;
+		imu->dma_addrs = NULL;
 	}
 
 	if (acct_pages)
@@ -932,6 +968,85 @@ static struct io_rsrc_node *io_sqe_buffer_register(struct io_ring_ctx *ctx,
 		off = 0;
 		size -= vec_len;
 	}
+
+	/* DMA-map each bvec page against every distinct device among the
+	 * ring's channels. Striped reads target several devices, and
+	 * under a strict IOMMU each needs its own mapping. Slot 0 is
+	 * the primary device. A failure on a secondary device drops
+	 * that device from the set rather than failing registration;
+	 * a batch that stripes to a device the buffer is not mapped on
+	 * finds no address and falls back to the CPU copy. The ring
+	 * takes at most IO_REG_BUF_DEVS channels so that a full set
+	 * fits here.
+	 */
+	if (!IS_ERR_OR_NULL(ctx->dma.chan)) {
+		unsigned int c, d;
+
+		imu->dma_nr_devs = 0;
+		for (c = 0; c < max_t(unsigned int, ctx->dma.nr_chans, 1); c++) {
+			struct device *dev;
+			dma_addr_t *addrs;
+
+			dev = (ctx->dma.nr_chans ? ctx->dma.chans[c]
+						 : ctx->dma.chan)->device->dev;
+			for (d = 0; d < imu->dma_nr_devs; d++)
+				if (imu->dma_devs[d] == dev)
+					break;
+			if (d < imu->dma_nr_devs)
+				continue;	/* device already mapped */
+			if (imu->dma_nr_devs == IO_REG_BUF_DEVS)
+				break;
+
+			addrs = kvmalloc_array(nr_pages, sizeof(dma_addr_t),
+					       GFP_KERNEL);
+			if (!addrs) {
+				if (!imu->dma_nr_devs) {
+					ret = -ENOMEM;
+					goto done;
+				}
+				break;
+			}
+			for (i = 0; i < nr_pages; i++) {
+				struct bio_vec *bv = &imu->bvec[i];
+
+				/* Only the bytes the bvec covers are mapped.
+				 * Adjacent buffers can share a huge folio, and
+				 * mapping the whole folio for each would expose
+				 * the neighbours' bytes to the device and, on a
+				 * non-coherent platform, put their cache lines
+				 * through every map and unmap of this buffer.
+				 */
+				addrs[i] = dma_map_page(dev, bv->bv_page,
+							bv->bv_offset,
+							bv->bv_len,
+							DMA_FROM_DEVICE);
+				if (dma_mapping_error(dev, addrs[i])) {
+					while (i-- > 0)
+						dma_unmap_page(dev, addrs[i],
+							imu->bvec[i].bv_len,
+							DMA_FROM_DEVICE);
+					kvfree(addrs);
+					addrs = NULL;
+					break;
+				}
+			}
+			if (!addrs) {
+				if (!imu->dma_nr_devs) {
+					ret = -ENOMEM;
+					goto done;
+				}
+				break;
+			}
+			imu->dma_addrs_dev[imu->dma_nr_devs] = addrs;
+			/* The unmap at release needs the device, which a
+			 * removal may otherwise free before the buffer goes.
+			 */
+			imu->dma_devs[imu->dma_nr_devs] = get_device(dev);
+			imu->dma_nr_devs++;
+		}
+		imu->dma_addrs = imu->dma_addrs_dev[0];
+		imu->dma_dev = imu->dma_devs[0];
+	}
 done:
 	if (ret) {
 		if (imu)
@@ -1209,6 +1324,65 @@ inline struct io_rsrc_node *io_find_buf_node(struct io_kiocb *req,
 	req->flags &= ~REQ_F_BUF_NODE;
 	io_ring_submit_unlock(ctx, issue_flags);
 	return NULL;
+}
+
+/*
+ * Resolve a registered-buffer user address to its device address and,
+ * when @seg_remain is non-NULL, report how many bytes remain in the
+ * per-folio mapping that backs it. Callers must clamp their chunks to
+ * that value. The segment layout follows the linear buffer offset,
+ * which for a large-folio buffer whose user mapping is not folio
+ * aligned (for example after mremap of a THP region) does not agree
+ * with the user virtual address phase, so deriving the remainder from
+ * the raw address would let a chunk cross the end of one mapping into
+ * an unrelated IOVA range.
+ */
+dma_addr_t io_reg_buf_dma_addr(struct io_mapped_ubuf *imu, u64 buf_addr,
+			       size_t *seg_remain, struct device *dev)
+{
+	size_t offset, folio_mask;
+	unsigned int seg_idx, d;
+	const dma_addr_t *dma_addrs = NULL;
+	const struct bio_vec *bvec;
+
+	if (!imu || !imu->dma_nr_devs)
+		return 0;
+	/* Pick the mapping for the target device; striped reads use
+	 * several. At most four entries, so the scan is cheap.
+	 */
+	for (d = 0; d < imu->dma_nr_devs; d++) {
+		if (imu->dma_devs[d] == dev) {
+			dma_addrs = imu->dma_addrs_dev[d];
+			break;
+		}
+	}
+	if (!dma_addrs)
+		return 0;
+	if (buf_addr < imu->ubuf || buf_addr >= imu->ubuf + imu->len)
+		return 0;
+
+	offset = buf_addr - imu->ubuf;
+	bvec = imu->bvec;
+	folio_mask = (1UL << imu->folio_shift) - 1;
+
+	/*
+	 * This is the same offset calculation as io_import_fixed(). Each
+	 * bvec is mapped from its first byte for its bv_len, so the
+	 * offset is taken from there and the segment ends where the
+	 * bvec does.
+	 */
+	if (offset < bvec->bv_len) {
+		if (seg_remain)
+			*seg_remain = bvec->bv_len - offset;
+		return dma_addrs[0] + offset;
+	}
+
+	offset -= bvec->bv_len;
+	seg_idx = 1 + (offset >> imu->folio_shift);
+	offset &= folio_mask;
+	if (seg_remain)
+		*seg_remain = imu->bvec[seg_idx].bv_len - offset;
+	return dma_addrs[seg_idx] + offset;
 }
 
 int io_import_reg_buf(struct io_kiocb *req, struct iov_iter *iter,
