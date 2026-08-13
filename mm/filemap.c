@@ -2673,7 +2673,7 @@ static int filemap_readahead(struct kiocb *iocb, struct file *file,
 	return 0;
 }
 
-static int filemap_get_pages(struct kiocb *iocb, size_t count,
+int filemap_get_pages(struct kiocb *iocb, size_t count,
 		struct folio_batch *fbatch, bool need_uptodate)
 {
 	struct file *filp = iocb->ki_filp;
