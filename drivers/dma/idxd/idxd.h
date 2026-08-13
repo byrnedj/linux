@@ -3,7 +3,6 @@
 #ifndef _IDXD_H_
 #define _IDXD_H_
 
-#include <linux/sbitmap.h>
 #include <linux/dmaengine.h>
 #include <linux/percpu-rwsem.h>
 #include <linux/wait.h>
@@ -15,6 +14,7 @@
 #include <linux/iommu.h>
 #include <linux/crypto.h>
 #include <uapi/linux/idxd.h>
+#include <linux/sbitmap.h>
 #include "registers.h"
 
 #define IDXD_DRIVER_VERSION	"1.00"
@@ -56,6 +56,7 @@ enum idxd_type {
 
 #define IDXD_ENQCMDS_RETRIES		32
 #define IDXD_ENQCMDS_MAX_RETRIES	64
+#define IDXD_DMA_CHANS			1
 
 enum idxd_complete_type {
 	IDXD_COMPLETE_NORMAL = 0,
@@ -175,7 +176,7 @@ struct idxd_cdev {
 
 #define WQ_DEFAULT_QUEUE_DEPTH		16
 #define WQ_DEFAULT_MAX_XFER		SZ_2M
-#define WQ_DEFAULT_MAX_BATCH		32
+#define WQ_DEFAULT_MAX_BATCH		128
 
 enum idxd_op_type {
 	IDXD_OP_BLOCK = 0,
@@ -222,8 +223,11 @@ struct idxd_wq {
 	dma_addr_t compls_addr;
 	int compls_size;
 	struct idxd_desc **descs;
-	struct sbitmap_queue sbq;
 	struct idxd_dma_chan *idxd_chan;
+	u32 outstanding;
+	struct llist_head free_llist;
+	int chan_count;
+	struct idxd_dma_chan *ichans;
 	char name[WQ_NAME_SIZE + 1];
 	u64 max_xfer_bytes;
 	u32 max_batch_size;
@@ -400,6 +404,22 @@ static inline unsigned int evl_size(struct idxd_device *idxd)
 {
 	return idxd->evl->size * evl_ent_size(idxd);
 }
+/*
+ * IDXD batch field for SW Batch descriptor
+ * @descs: Descriptor list address
+ * @dma_descs: DMA address for descs
+ * @cr: completion record list address
+ * @dma_cr: DMA address for completion records
+ * @num: Number of descs in batch
+ */
+struct idxd_batch {
+	struct dsa_hw_desc *descs;
+	dma_addr_t dma_descs;
+	struct dsa_completion_record *crs;
+	dma_addr_t dma_crs;
+	u32 num;
+	u32 max;
+};
 
 struct crypto_ctx {
 	struct acomp_req *req;
@@ -427,9 +447,13 @@ struct idxd_desc {
 	};
 	struct llist_node llnode;
 	struct list_head list;
-	int id;
-	int cpu;
+	u16 id;
+	u16 gen;
 	struct idxd_wq *wq;
+
+	struct idxd_batch *batch;
+
+	struct idxd_desc *next_free;
 };
 
 /*
@@ -755,6 +779,8 @@ static inline void idxd_desc_complete(struct idxd_desc *desc,
 
 int idxd_register_devices(struct idxd_device *idxd);
 void idxd_unregister_devices(struct idxd_device *idxd);
+int idxd_register_dma_channel(struct idxd_dma_chan *ichan);
+void idxd_unregister_dma_channel(struct idxd_dma_chan *ichan);
 void idxd_wqs_quiesce(struct idxd_device *idxd);
 bool idxd_queue_int_handle_resubmit(struct idxd_desc *desc);
 void multi_u64_to_bmap(unsigned long *bmap, u64 *val, int count);

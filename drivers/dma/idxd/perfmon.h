@@ -6,7 +6,6 @@
 
 #include <linux/slab.h>
 #include <linux/pci.h>
-#include <linux/sbitmap.h>
 #include <linux/dmaengine.h>
 #include <linux/percpu-rwsem.h>
 #include <linux/wait.h>
