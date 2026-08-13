@@ -1983,6 +1983,12 @@ struct file_operations {
 #define FOP_ASYNC_LOCK		((__force fop_flags_t)(1 << 6))
 /* File system supports uncached read/write buffered IO */
 #define FOP_DONTCACHE		((__force fop_flags_t)(1 << 7))
+/* Buffered reads may be served by the io_uring DMA copy offload, which
+ * walks the page cache directly and bypasses ->read_iter. Only set this
+ * when the filesystem's buffered read is plain filemap_read() semantics
+ * with no per-read protocol work.
+ */
+#define FOP_DMA_READ		((__force fop_flags_t)(1 << 8))
 
 /* Wrap a directory iterator that needs exclusive inode access */
 int wrap_directory_iterator(struct file *, struct dir_context *,
