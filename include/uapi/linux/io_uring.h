@@ -251,6 +251,20 @@ enum io_uring_sqe_flags_bit {
  * values and keep it set to 0. Any other value is undefined behaviour.
  */
 #define IORING_SETUP_SQ_REWIND		(1U << 20)
+/*
+ * Acquire DMA-engine channels, for example Intel DSA work queues, for
+ * this ring at creation. This enables DMA-offloaded data copies
+ * between the page cache and registered buffers. Channels are a finite
+ * hardware resource. The ring takes one channel on each of up to four
+ * devices that support scatter-gather copies, preferring those on the
+ * caller's NUMA node, and may share them with other rings. Without
+ * this flag the ring takes none and all copies use the CPU. Ring
+ * creation fails with -EPERM without CAP_SYS_ADMIN unless the
+ * kernel.io_uring_dma_allow_unprivileged sysctl is set, with -EINVAL
+ * together with IORING_SETUP_IOPOLL, and with -ENODEV if no channel
+ * is available.
+ */
+#define IORING_SETUP_DMA		(1U << 21)
 
 enum io_uring_op {
 	IORING_OP_NOP,

@@ -299,6 +299,25 @@ static ssize_t ext4_write_checks(struct kiocb *iocb, struct iov_iter *from)
 	return count;
 }
 
+/*
+ * The io_uring DMA copy offload copies through the page cache without
+ * ext4_file_read_iter() or ext4_file_write_iter(). This runs the checks
+ * they would have run first: the shutdown test for both directions, and
+ * for a write the immutable test, the bitmap-format size limit and the
+ * zeroing of the old last block on a write past EOF.
+ */
+static ssize_t ext4_dma_copy_checks(struct kiocb *iocb, struct iov_iter *iter,
+				    int rw)
+{
+	struct inode *inode = file_inode(iocb->ki_filp);
+
+	if (unlikely(ext4_forced_shutdown(inode->i_sb)))
+		return -EIO;
+	if (rw == READ)
+		return 0;
+	return ext4_write_checks(iocb, iter);
+}
+
 static ssize_t ext4_buffered_write_iter(struct kiocb *iocb,
 					struct iov_iter *from)
 {
@@ -990,8 +1009,10 @@ const struct file_operations ext4_file_operations = {
 	.fallocate	= ext4_fallocate,
 	.fop_flags	= FOP_MMAP_SYNC | FOP_BUFFER_RASYNC |
 			  FOP_DIO_PARALLEL_WRITE |
-			  FOP_DONTCACHE,
+			  FOP_DONTCACHE |
+			  FOP_DMA_READ,
 	.setlease	= generic_setlease,
+	.dma_copy_checks = ext4_dma_copy_checks,
 };
 
 const struct inode_operations ext4_file_inode_operations = {

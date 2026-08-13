@@ -59,6 +59,7 @@
 #include <linux/audit.h>
 #include <linux/security.h>
 #include <linux/jump_label.h>
+#include <asm/shmparam.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/io_uring.h>
@@ -128,6 +129,12 @@ static struct workqueue_struct *iou_wq __ro_after_init;
 
 static int __read_mostly sysctl_io_uring_disabled;
 static int __read_mostly sysctl_io_uring_group = -1;
+/*
+ * DMA channels are machine-wide hardware resources, so ring creation
+ * with IORING_SETUP_DMA requires CAP_SYS_ADMIN unless the
+ * administrator opens it up host-wide with this sysctl.
+ */
+static unsigned int __read_mostly io_dma_allow_unprivileged;
 
 #ifdef CONFIG_SYSCTL
 static const struct ctl_table kernel_io_uring_disabled_table[] = {
@@ -2160,6 +2167,529 @@ static __cold void io_req_caches_free(struct io_ring_ctx *ctx)
 	__io_req_caches_free(ctx);
 }
 
+static void io_dma_pool_put(struct dma_chan *chan);
+
+static void io_release_dma_chan(struct io_ring_ctx *ctx)
+{
+	if (!IS_ERR_OR_NULL(ctx->dma.chan)) {
+		/* Quiesce the kworker poller before checking the lists
+		 * that it owns.
+		 */
+		cancel_work_sync(&ctx->dma.poll_work);
+
+		/*
+		 * Every listed task holds an in-flight reference on its
+		 * request, which holds a ctx reference, so the exit work
+		 * drains both lists through __io_dma_poll() before ctx
+		 * teardown can run. A task still listed here broke that
+		 * protocol and its engine may still access the folios
+		 * and the registered buffer, so it is left allocated
+		 * and mapped rather than released. The buffer is still
+		 * mapped and pinned at this point although the buffer
+		 * table is gone, because the request's buffer node
+		 * reference keeps it.
+		 */
+		WARN_ON_ONCE(ctx->dma.poll_list ||
+			     !llist_empty(&ctx->dma.submit_list));
+		ctx->dma.poll_list = NULL;
+		ctx->dma.poll_list_tail = NULL;
+
+		/* Free the parked io_dma_task pool back to slab. */
+		while (ctx->dma.free_list) {
+			struct io_dma_task *t = ctx->dma.free_list;
+
+			ctx->dma.free_list = t->next;
+			kmem_cache_free(dma_cachep, t);
+		}
+		ctx->dma.free_count = 0;
+	}
+
+	if (ctx->dma.chan && !IS_ERR(ctx->dma.chan)) {
+		unsigned int c;
+
+		pr_info("io_uring DMA: releasing channel %s requester=%s[%d] tgid=%d ctx=%p\n",
+			dma_chan_name(ctx->dma.chan), current->comm,
+			task_pid_nr(current), task_tgid_nr(current), ctx);
+		io_dma_pool_put(ctx->dma.chan);
+		/* chans[0] is the primary released above. */
+		for (c = 1; c < ctx->dma.nr_chans; c++)
+			io_dma_pool_put(ctx->dma.chans[c]);
+	}
+	ctx->dma.chan = NULL;
+	ctx->dma.nr_chans = 0;
+}
+
+/*
+ * Per-device channel pool.
+ *
+ * Rings do not own dmaengine channels. A channel carries descriptors
+ * from many rings, a full WQ surfaces as a failed descriptor allocation
+ * at prep time, and the submitter falls back to the CPU copy. The pool
+ * is indexed by device, in the slot order discovery assigns, and every
+ * ring takes one channel per device in that order: the file-position
+ * stripe then sends a region to the same device from every ring that
+ * holds the same devices in the same order, which is what keeps the
+ * per-device PFN caches from re-duplicating a shared working set. A
+ * ring takes no more than IO_REG_BUF_DEVS devices, so where more are on
+ * offer, rings start at a rotating device, hold different sets or the
+ * same set in a different order, and give up that agreement.
+ * Within a device the pool hands out fresh channels while the device
+ * still has one and then shares the least-referenced.
+ * Channel entries are refcounted and the dmaengine channel is released
+ * when the last ring detaches. Device entries are keyed by the
+ * provider's own device, which the pool pins, so the order stays
+ * canonical while the device exists and a driver rebind, which registers
+ * a new dma_device, lands on the same entry. A removed device never comes
+ * back, since a rescan registers a new one. Its entry is retired at the
+ * next ring creation, and a new device on its node takes the slot of
+ * that node freed last, so a device removed and rescanned normally takes
+ * its predecessor's place and the devices that did not change keep
+ * theirs. The removed device's channels stay in the slot until the rings
+ * holding them release them.
+ */
+#define IO_DMA_POOL_DEVS	IO_DMA_RING_CHANS
+#define IO_DMA_POOL_CHANS	16	/* per device */
+
+struct io_dma_pool_chan {
+	struct dma_chan		*chan;
+	int			refcnt;
+};
+
+struct io_dma_pool_dev {
+	struct device		*dev;	/* the provider's device, pinned. A
+					 * driver rebind registers it again
+					 * under the same key, where a new
+					 * dma_device would not. NULL once
+					 * the device was removed, which
+					 * frees the slot.
+					 */
+	int			node;
+	unsigned int		rr;	/* tie-break rotation when sharing */
+	unsigned int		retired;	/* retire pass that freed it */
+	int			nr;
+	struct io_dma_pool_chan	chans[IO_DMA_POOL_CHANS];
+};
+
+static struct io_dma_pool_dev io_dma_pool[IO_DMA_POOL_DEVS];
+static int io_dma_pool_ndevs;
+static unsigned int io_dma_pool_retired;	/* the last retire pass */
+/*
+ * Where the next ring created on each node starts when it takes fewer
+ * devices than it is offered. One counter for every node would let
+ * rings created on other nodes in between make a node's rings skip
+ * some of its devices.
+ */
+static unsigned int io_dma_pool_ring_rr[MAX_NUMNODES];
+static DEFINE_MUTEX(io_dma_pool_mutex);
+
+static bool io_dma_pool_filter_new(struct dma_chan *chan, void *param)
+{
+	int i;
+
+	for (i = 0; i < io_dma_pool_ndevs; i++)
+		if (io_dma_pool[i].dev == chan->device->dev)
+			return false;
+	return true;
+}
+
+static bool io_dma_pool_filter_dev(struct dma_chan *chan, void *param)
+{
+	return chan->device->dev == param;
+}
+
+/*
+ * Retire the entries of removed devices and unpin them. Channels that
+ * rings still hold on a removed device stay in its slot, where
+ * io_dma_pool_put() finds them by channel. The pin keeps the device
+ * readable here, so the removal needs no notifier, and so no lock order
+ * against device removal. The slots a pass frees carry its number, which
+ * tells the slot a rescanned device's predecessor freed from older ones.
+ */
+static void io_dma_pool_retire(void)
+{
+	unsigned int pass = io_dma_pool_retired + 1;
+	int i;
+
+	lockdep_assert_held(&io_dma_pool_mutex);
+
+	for (i = 0; i < io_dma_pool_ndevs; i++) {
+		struct io_dma_pool_dev *pd = &io_dma_pool[i];
+
+		/*
+		 * device_del() clears the registered state without the pool
+		 * mutex. A stale read only delays the retire to a later ring
+		 * creation.
+		 */
+		if (pd->dev && !data_race(device_is_registered(pd->dev))) {
+			put_device(pd->dev);
+			pd->dev = NULL;
+			pd->retired = pass;
+			io_dma_pool_retired = pass;
+		}
+	}
+}
+
+/*
+ * The slot for a new device on @node with @need channels. A freed slot
+ * still holds the channels rings keep on its removed device, so a slot of
+ * that node a removed device freed is a candidate only while it has room
+ * for all of the new device's own. The candidate freed last is taken, the
+ * lowest of those freed together, so that a device removed and rescanned
+ * takes its predecessor's place and the devices that did not change keep
+ * theirs. Without a candidate a new slot is taken, and once the table is
+ * full the freed slot with the most room, one of the node's own if any
+ * has room, since a slot keeps its place in the order for as long as its
+ * device exists while the orphans crowding it go away with their rings.
+ * Discovery asks only while io_dma_pool_has_room(), so one is found.
+ */
+static struct io_dma_pool_dev *io_dma_pool_slot(int node, int need)
+{
+	struct io_dma_pool_dev *best = NULL;
+	int i, any;
+
+	for (i = 0; i < io_dma_pool_ndevs; i++) {
+		struct io_dma_pool_dev *pd = &io_dma_pool[i];
+
+		if (!pd->dev && pd->node == node &&
+		    IO_DMA_POOL_CHANS - pd->nr >= need &&
+		    (!best || pd->retired > best->retired))
+			best = pd;
+	}
+	if (best)
+		return best;
+	if (io_dma_pool_ndevs < IO_DMA_POOL_DEVS)
+		return &io_dma_pool[io_dma_pool_ndevs++];
+	for (any = 0; any < 2 && !best; any++) {
+		for (i = 0; i < io_dma_pool_ndevs; i++) {
+			struct io_dma_pool_dev *pd = &io_dma_pool[i];
+
+			if (!pd->dev && pd->nr < IO_DMA_POOL_CHANS &&
+			    (any || pd->node == node) &&
+			    (!best || pd->nr < best->nr))
+				best = pd;
+		}
+	}
+	return best;
+}
+
+/*
+ * Whether a new device would find a slot: the table has a free one, or a
+ * freed one has room for a channel.
+ */
+static bool io_dma_pool_has_room(void)
+{
+	int i;
+
+	if (io_dma_pool_ndevs < IO_DMA_POOL_DEVS)
+		return true;
+	for (i = 0; i < io_dma_pool_ndevs; i++)
+		if (!io_dma_pool[i].dev &&
+		    io_dma_pool[i].nr < IO_DMA_POOL_CHANS)
+			return true;
+	return false;
+}
+
+/*
+ * Retire removed devices, then add every capable device not yet in the
+ * table, and return the number of devices the table holds. This runs on
+ * each ring creation, so a device whose queues are enabled after the
+ * first ring joins the table then. Rings created before it keep their
+ * narrower set until they go away.
+ */
+static int io_dma_pool_discover(dma_cap_mask_t *mask)
+{
+	int i, ndevs = 0;
+
+	lockdep_assert_held(&io_dma_pool_mutex);
+
+	io_dma_pool_retire();
+	/*
+	 * A probe takes a channel of a device not in the table and releases
+	 * it. Releasing a channel's last client synchronizes the channel
+	 * under dma_list_mutex, which for idxd drains its queue and holds up
+	 * every other dmaengine client meanwhile. So discovery probes only
+	 * while a new device would find a slot, and a device that would
+	 * find none joins at a later ring creation, once a slot has room.
+	 */
+	while (io_dma_pool_has_room()) {
+		struct io_dma_pool_dev *pd;
+		struct dma_chan *chan;
+		int need;
+
+		chan = dma_request_channel(*mask, io_dma_pool_filter_new, NULL);
+		if (IS_ERR_OR_NULL(chan))
+			break;
+		/* Every channel the device has now, as far as a slot holds
+		 * them. Channels its provider registers later may not fit.
+		 */
+		need = min_t(int, READ_ONCE(chan->device->chancnt),
+			     IO_DMA_POOL_CHANS);
+		pd = io_dma_pool_slot(dev_to_node(chan->device->dev), need);
+		pd->dev = get_device(chan->device->dev);
+		pd->node = dev_to_node(pd->dev);
+		/* Discovery only identifies the device; rings take their
+		 * channels through io_dma_pool_get().
+		 */
+		dma_release_channel(chan);
+	}
+	for (i = 0; i < io_dma_pool_ndevs; i++)
+		if (io_dma_pool[i].dev)
+			ndevs++;
+	return ndevs;
+}
+
+static struct dma_chan *io_dma_pool_get(struct io_dma_pool_dev *pd,
+					dma_cap_mask_t *mask)
+{
+	struct io_dma_pool_chan *best = NULL;
+	struct dma_chan *chan;
+	int i;
+
+	lockdep_assert_held(&io_dma_pool_mutex);
+
+	/* A fresh channel while the device still has one. */
+	if (pd->nr < IO_DMA_POOL_CHANS) {
+		chan = dma_request_channel(*mask, io_dma_pool_filter_dev,
+					   pd->dev);
+		if (!IS_ERR_OR_NULL(chan)) {
+			pd->chans[pd->nr++] = (struct io_dma_pool_chan){
+				.chan = chan, .refcnt = 1 };
+			return chan;
+		}
+	}
+	/* Otherwise share the least-referenced one; ties rotate. A channel
+	 * its provider has orphaned to the rings that hold it completes
+	 * nothing any more, so a new ring does not join them.
+	 */
+	for (i = 0; i < pd->nr; i++) {
+		struct io_dma_pool_chan *pc = &pd->chans[(pd->rr + i) % pd->nr];
+
+		if (dma_chan_orphaned(pc->chan))
+			continue;
+		if (!best || pc->refcnt < best->refcnt)
+			best = pc;
+	}
+	if (!best)
+		return NULL;
+	pd->rr++;
+	best->refcnt++;
+	return best->chan;
+}
+
+static void io_dma_pool_put(struct dma_chan *chan)
+{
+	int d, i;
+
+	mutex_lock(&io_dma_pool_mutex);
+	/*
+	 * Found by the channel and not by its device: a removed device's
+	 * channels stay in its old slot, which a new device may hold by now.
+	 */
+	for (d = 0; d < io_dma_pool_ndevs; d++) {
+		struct io_dma_pool_dev *pd = &io_dma_pool[d];
+
+		for (i = 0; i < pd->nr; i++) {
+			if (pd->chans[i].chan != chan)
+				continue;
+			if (--pd->chans[i].refcnt == 0) {
+				dma_release_channel(chan);
+				pd->chans[i] = pd->chans[--pd->nr];
+			}
+			goto out;
+		}
+	}
+out:
+	mutex_unlock(&io_dma_pool_mutex);
+}
+
+/*
+ * How far a device on @dnode is from a ring created on @node: 0 on that
+ * node, else the NUMA distance. A device with no node is the farthest,
+ * since the distance tables do not cover it.
+ */
+static int io_dma_pool_dist(int node, int dnode)
+{
+	if (dnode == node)
+		return 0;
+	if (dnode == NUMA_NO_NODE)
+		return INT_MAX;
+	return node_distance(node, dnode);
+}
+
+/*
+ * The nearest distance from @node beyond @dist at which the pool has a
+ * device, or -1 when it has none farther.
+ */
+static int io_dma_pool_next_dist(int node, int dist)
+{
+	int i, next = -1;
+
+	lockdep_assert_held(&io_dma_pool_mutex);
+
+	for (i = 0; i < io_dma_pool_ndevs; i++) {
+		int d = io_dma_pool_dist(node, io_dma_pool[i].node);
+
+		if (io_dma_pool[i].dev && d > dist && (next < 0 || d < next))
+			next = d;
+	}
+	return next;
+}
+
+/*
+ * Take up to @want channels for @ctx, one per device, from the devices at
+ * distance @dist from @node, in the pool's canonical order.
+ */
+static void io_dma_pool_take(struct io_ring_ctx *ctx, dma_cap_mask_t *mask,
+			     int node, int dist, unsigned int want)
+{
+	int devs[IO_DMA_POOL_DEVS];
+	unsigned int n = 0, start = 0, first = 0, got = 0, i;
+
+	lockdep_assert_held(&io_dma_pool_mutex);
+
+	for (i = 0; i < io_dma_pool_ndevs; i++) {
+		int d = io_dma_pool_dist(node, io_dma_pool[i].node);
+
+		/* A freed slot has no device to take a channel from. */
+		if (io_dma_pool[i].dev && d == dist)
+			devs[n++] = i;
+	}
+	if (want > n)
+		want = n;
+	/*
+	 * A ring taking fewer devices than it is offered cannot agree
+	 * with its peers on which device owns a region: stripe_chans
+	 * below the device count trades the dedup for spread, so start
+	 * those rings at a rotating device.
+	 */
+	if (want && want < n)
+		start = io_dma_pool_ring_rr[node] % n;
+	/*
+	 * A device with nothing to give, unbound or fully claimed
+	 * elsewhere, is passed over for the next one, so it narrows the
+	 * stripe only when no other device is left to take.
+	 */
+	for (i = 0; i < n && got < want; i++) {
+		struct dma_chan *c = io_dma_pool_get(
+			&io_dma_pool[devs[(start + i) % n]], mask);
+
+		if (!c)
+			continue;
+		if (!got)
+			first = i;
+		ctx->dma.chans[ctx->dma.nr_chans++] = c;
+		got++;
+	}
+	/*
+	 * Only a pass that placed the ring moves the rotation on, so that
+	 * rings that go on to farther devices after a pass that took
+	 * nothing still start at each of those devices in turn. It moves
+	 * on past the first device the ring took a channel from, and so
+	 * past the devices the walk skipped to reach it. Moving it by one
+	 * would give each skipped device's turn to that device as well.
+	 */
+	if (got && want < n)
+		io_dma_pool_ring_rr[node] += first + 1;
+}
+
+static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
+				struct io_uring_params *p)
+{
+	dma_cap_mask_t mask;
+	int node = numa_node_id();
+	int ndevs, rc = 0;
+
+	dma_cap_zero(mask);
+	dma_cap_set(DMA_MEMCPY, mask);
+	/*
+	 * The batch path is the whole point of the offload, and the
+	 * sgl-lifetime and coherence assumptions in the submit path are
+	 * documented against providers that implement MEMCPY_SG. A
+	 * MEMCPY-only provider would turn every batch flush into map and
+	 * unmap overhead plus a CPU fallback.
+	 */
+	dma_cap_set(DMA_MEMCPY_SG, mask);
+
+	/*
+	 * One channel per device, in the pool's canonical order, so rings
+	 * that hold the same devices from the same start agree on which
+	 * device a file region stripes to. Devices on the caller's NUMA
+	 * node are preferred: a cross-socket engine pays UPI hops on every
+	 * descriptor fetch and data move, which showed up as bimodal
+	 * throughput depending on which channel a ring happened to win.
+	 * Fresh channels while a device has them, shared least-referenced
+	 * after. A shortfall narrows the stripe, and one that leaves the
+	 * ring nothing on the caller's node sends it to the nearest other
+	 * devices instead.
+	 */
+	{
+		/* A registered buffer is mapped on at most IO_REG_BUF_DEVS
+		 * devices, and a batch striped to an unmapped device falls
+		 * back to the CPU, so the ring takes no more than that.
+		 */
+		unsigned int want = min3(READ_ONCE(io_dma_stripe_chans) ?: IO_DMA_RING_CHANS,
+					 (unsigned int)IO_DMA_RING_CHANS,
+					 (unsigned int)IO_REG_BUF_DEVS);
+		int dist;
+
+		mutex_lock(&io_dma_pool_mutex);
+		ndevs = io_dma_pool_discover(&mask);
+		/*
+		 * Locality is a preference, not a requirement. A node can
+		 * have no device in the pool, or have devices none of
+		 * which can hand out a channel, because their queues were
+		 * disabled or given to user space after discovery or
+		 * because other clients hold every channel. A ring without
+		 * a channel would fail to be created, so it then takes its
+		 * channels from the nearest devices that have any to give,
+		 * one distance at a time, and its stripe never mixes near
+		 * and far engines.
+		 */
+		for (dist = 0; dist >= 0 && !ctx->dma.nr_chans;
+		     dist = io_dma_pool_next_dist(node, dist))
+			io_dma_pool_take(ctx, &mask, node, dist, want);
+		mutex_unlock(&io_dma_pool_mutex);
+	}
+	if (!ctx->dma.nr_chans) {
+		rc = -ENODEV;
+		pr_err("io_uring DMA: no channel available: %d requester=%s[%d] tgid=%d\n",
+		       rc, current->comm,
+		       task_pid_nr(current), task_tgid_nr(current));
+		goto failed;
+	}
+	ctx->dma.chan = ctx->dma.chans[0];
+	ctx->dma.stripe_rr = 0;
+	{
+		char names[IO_DMA_RING_CHANS * 16];
+		unsigned int i;
+		int len = 0;
+
+		for (i = 0; i < ctx->dma.nr_chans; i++)
+			len += scnprintf(names + len, sizeof(names) - len,
+					 "%s%s", i ? " " : "",
+					 dma_chan_name(ctx->dma.chans[i]));
+		dev_info(ctx->dma.chan->device->dev,
+			 "io_uring DMA: ring %p stripe set (%u of %d devices, node %d, caller node %d): %s requester=%s[%d] tgid=%d\n",
+			 ctx, ctx->dma.nr_chans, ndevs,
+			 dev_to_node(ctx->dma.chan->device->dev), node, names,
+			 current->comm, task_pid_nr(current),
+			 task_tgid_nr(current));
+	}
+
+	init_llist_head(&ctx->dma.submit_list);
+	ctx->dma.poll_list = NULL;
+	ctx->dma.poll_list_tail = NULL;
+	spin_lock_init(&ctx->dma.lock);
+	INIT_WORK(&ctx->dma.poll_work, io_dma_poll_workfn);
+	atomic_set(&ctx->dma.poll_armed, 0);
+	io_dma_init_freelist(ctx, p);
+
+	return 0;
+failed:
+	io_release_dma_chan(ctx);
+	return rc;
+}
+
 static __cold void io_ring_ctx_free(struct io_ring_ctx *ctx)
 {
 	io_unregister_bpf_ops(ctx);
@@ -2181,6 +2711,8 @@ static __cold void io_ring_ctx_free(struct io_ring_ctx *ctx)
 		put_task_struct(ctx->submitter_task);
 
 	WARN_ON_ONCE(!list_empty(&ctx->ltimeout_list));
+
+	io_release_dma_chan(ctx);
 
 	if (ctx->mm_account) {
 		mmdrop(ctx->mm_account);
@@ -2345,6 +2877,17 @@ static __cold void io_ring_exit_work(struct work_struct *work)
 		do {
 			if (ctx->flags & IORING_SETUP_DEFER_TASKRUN)
 				io_cancel_local_task_work(ctx);
+			/*
+			 * Drain any DMA tasks whose hardware has completed
+			 * so that their completion callbacks run and their
+			 * reqs queue completion task_work. The callbacks
+			 * unmap, put folios, and drop dma_refcnt. Without
+			 * this, DMA-offloaded reqs hold refs to ctx
+			 * indefinitely during teardown.
+			 */
+			if (!IS_ERR_OR_NULL(ctx->dma.chan) &&
+			    io_dma_pending(ctx))
+				__io_dma_poll(ctx);
 			cond_resched();
 		} while (io_uring_try_cancel_requests(ctx, NULL, true, false));
 
@@ -2591,7 +3134,6 @@ struct file *io_uring_ctx_get_file(unsigned int fd, bool registered)
 	return ERR_PTR(-EOPNOTSUPP);
 }
 
-
 SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
 		u32, min_complete, u32, flags, const void __user *, argp,
 		size_t, argsz)
@@ -2684,6 +3226,7 @@ iopoll_locked:
 			if (likely(!ret2))
 				ret2 = io_cqring_wait(ctx, min_complete, flags,
 						      &ext_arg);
+
 		}
 
 		if (!ret) {
@@ -3056,6 +3599,35 @@ static __cold int io_uring_create(struct io_ctx_config *config)
 		goto err;
 
 	p->features = IORING_FEAT_FLAGS;
+	/*
+	 * DMA-engine channels are a finite hardware resource with one
+	 * dmaengine channel per DSA WQ, so they are strictly opt-in.
+	 * Only rings created with IORING_SETUP_DMA take one.
+	 * Unconditional acquisition would spend channels on rings that
+	 * never DMA and race the asynchronous channel release of any
+	 * ring being torn down, silently degrading the loser to CPU
+	 * copies. An application that asks and cannot be served fails
+	 * loudly here instead.
+	 */
+	if (p->flags & IORING_SETUP_DMA) {
+		/*
+		 * Channels are machine-wide hardware resources and the
+		 * pool prefers a fresh channel per ring, so an
+		 * unprivileged task could otherwise drain every DSA WQ
+		 * and starve other dmaengine clients.
+		 */
+		ret = -EPERM;
+		if (!READ_ONCE(io_dma_allow_unprivileged) &&
+		    !capable(CAP_SYS_ADMIN))
+			goto err;
+		/* The DMA offload serves buffered I/O only. */
+		ret = -EINVAL;
+		if (p->flags & IORING_SETUP_IOPOLL)
+			goto err;
+		ret = io_allocate_dma_chan(ctx, p);
+		if (ret)
+			goto err;
+	}
 
 	if (copy_to_user(config->uptr, p, sizeof(*p))) {
 		ret = -EFAULT;
@@ -3257,6 +3829,9 @@ static int __init io_uring_init(void)
 	req_cachep = kmem_cache_create("io_kiocb", sizeof(struct io_kiocb), &kmem_args,
 				SLAB_HWCACHE_ALIGN | SLAB_PANIC | SLAB_ACCOUNT |
 				SLAB_TYPESAFE_BY_RCU);
+
+	dma_cachep = KMEM_CACHE(io_dma_task,
+				SLAB_HWCACHE_ALIGN | SLAB_PANIC | SLAB_ACCOUNT);
 
 	iou_wq = alloc_workqueue("iou_exit", WQ_UNBOUND, 64);
 	BUG_ON(!iou_wq);
