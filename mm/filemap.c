@@ -2673,7 +2673,24 @@ static int filemap_readahead(struct kiocb *iocb, struct file *file,
 	return 0;
 }
 
-static int filemap_get_pages(struct kiocb *iocb, size_t count,
+/**
+ * filemap_get_pages - get a batch of folios for a buffered read
+ * @iocb: the iocb to read for; ki_pos is the read position
+ * @count: the number of bytes the caller intends to read
+ * @fbatch: batch to fill with data folios
+ * @need_uptodate: whether partially uptodate folios are acceptable
+ *
+ * Fill @fbatch with uptodate folios covering the read window, creating
+ * and reading them in as needed. The caller owns one reference on each
+ * returned folio and must put them all. A return of 0 with a shortened
+ * batch is possible when an error occurs after the first folio was
+ * obtained; the caller consumes what it got and retries for the rest.
+ * With IOCB_NOWAIT or IOCB_NOIO set, returns -EAGAIN rather than
+ * sleeping or starting I/O.
+ *
+ * Return: 0 on success, a negative error otherwise.
+ */
+int filemap_get_pages(struct kiocb *iocb, size_t count,
 		struct folio_batch *fbatch, bool need_uptodate)
 {
 	struct file *filp = iocb->ki_filp;
