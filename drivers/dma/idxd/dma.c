@@ -78,6 +78,8 @@ static void op_flag_setup(unsigned long flags, u32 *desc_flags)
 	*desc_flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
 	if (flags & DMA_PREP_INTERRUPT)
 		*desc_flags |= IDXD_OP_FLAG_RCI;
+	if (flags & DMA_PREP_CACHE_CONTROL)
+		*desc_flags |= IDXD_OP_FLAG_CC;
 }
 
 static inline void idxd_prep_desc_common(struct idxd_wq *wq,
@@ -259,7 +261,9 @@ idxd_dma_prep_memcpy_sg(struct dma_chan *chan,
 
 		memset(batch->descs + i, 0, sizeof(struct dsa_hw_desc));
 		idxd_prep_desc_common(wq, batch->descs + i, DSA_OPCODE_MEMMOVE,
-				dma_src, dma_dst, len, 0, IDXD_OP_FLAG_CC);
+				dma_src, dma_dst, len, 0,
+				(flags & DMA_PREP_CACHE_CONTROL) ?
+					IDXD_OP_FLAG_CC : 0);
 		batch->num++;
 
 		dst_nents -= fetch_sg_and_pos(&dst_sg, &dst_avail, len);
@@ -277,6 +281,14 @@ idxd_dma_prep_memcpy_sg(struct dma_chan *chan,
 		batch->num);
 	/* prepare DSA_OPCODE_BATCH */
 	op_flag_setup(flags, &desc_flags);
+	/*
+	 * Cache-Control is a data-mover flag and is set on the MEMMOVE
+	 * sub-descriptors above (when DMA_PREP_CACHE_CONTROL was requested).
+	 * The BATCH descriptor itself moves no data, so CC is invalid on it
+	 * and DSA fails the batch with DSA_COMP_INVALID_FLAGS (0x11). Strip it
+	 * from the dispatch descriptor only.
+	 */
+	desc_flags &= ~IDXD_OP_FLAG_CC;
 	idxd_prep_desc_common(wq, desc->hw, DSA_OPCODE_BATCH,
 			batch->dma_descs, 0, batch->num,
 			desc->compl_dma, desc_flags);
