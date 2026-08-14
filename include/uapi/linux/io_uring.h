@@ -251,6 +251,14 @@ enum io_uring_sqe_flags_bit {
  * values and keep it set to 0. Any other value is undefined behaviour.
  */
 #define IORING_SETUP_SQ_REWIND		(1U << 20)
+/*
+ * Acquire a DMA-engine (e.g. Intel DSA) channel for this ring at creation,
+ * enabling DMA-offloaded recv/read copies into registered or provided
+ * buffers. Channels are a finite hardware resource; without this flag the
+ * ring takes none and all copies use the CPU. Ring creation fails with
+ * -ENODEV if no channel is available.
+ */
+#define IORING_SETUP_DMA		(1U << 21)
 
 enum io_uring_op {
 	IORING_OP_NOP,
@@ -897,6 +905,12 @@ struct io_uring_buf_ring {
 enum io_uring_register_pbuf_ring_flags {
 	IOU_PBUF_RING_MMAP	= 1,
 	IOU_PBUF_RING_INC	= 2,
+	/* Pre-map a data buffer region for DMA offload. When set, resv[0]
+	 * holds the base user VA and resv[1] holds the size of the
+	 * contiguous data buffer region. Pages are pinned and DMA-mapped
+	 * at registration time for use with dmaengine_prep_dma_memcpy().
+	 */
+	IOU_PBUF_RING_DMA	= 4,
 };
 
 /* argument for IORING_(UN)REGISTER_PBUF_RING */

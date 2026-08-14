@@ -47,3 +47,11 @@ bool io_poll_remove_all(struct io_ring_ctx *ctx, struct io_uring_task *tctx,
 			bool cancel_all);
 
 void io_poll_task_func(struct io_tw_req tw_req, io_tw_token_t tw);
+
+/*
+ * Re-trigger the poll state machine to re-examine the monitored fd.
+ * Callers like the DMA offload completion path use this to drive a
+ * multishot retry when the socket is known to still have data (e.g.
+ * IORING_CQE_F_SOCK_NONEMPTY was set) but no new waker will fire.
+ */
+void io_poll_kick(struct io_kiocb *req);

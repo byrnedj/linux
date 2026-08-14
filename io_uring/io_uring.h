@@ -7,6 +7,7 @@
 #include <linux/resume_user_mode.h>
 #include <linux/poll.h>
 #include <linux/io_uring_types.h>
+#include <linux/workqueue.h>
 #include <uapi/linux/eventpoll.h>
 #include "alloc_cache.h"
 #include "io-wq.h"
@@ -71,7 +72,8 @@ struct io_ctx_config {
 			IORING_SETUP_HYBRID_IOPOLL |\
 			IORING_SETUP_CQE_MIXED |\
 			IORING_SETUP_SQE_MIXED |\
-			IORING_SETUP_SQ_REWIND)
+			IORING_SETUP_SQ_REWIND | \
+			IORING_SETUP_DMA)
 
 #define IORING_ENTER_FLAGS (IORING_ENTER_GETEVENTS |\
 			IORING_ENTER_SQ_WAKEUP |\
@@ -173,6 +175,10 @@ static inline bool io_should_wake(struct io_wait_queue *iowq)
 int io_prepare_config(struct io_ctx_config *config);
 
 bool io_cqe_cache_refill(struct io_ring_ctx *ctx, bool overflow, bool cqe32);
+void io_dma_poll_workfn(struct work_struct *w);
+void io_dma_debugfs_init(void);
+extern unsigned int io_dma_max_clients_per_chan;
+extern unsigned int io_dma_admission_rejects;
 void io_req_defer_failed(struct io_kiocb *req, s32 res);
 bool io_post_aux_cqe(struct io_ring_ctx *ctx, u64 user_data, s32 res, u32 cflags);
 void io_add_aux_cqe(struct io_ring_ctx *ctx, u64 user_data, s32 res, u32 cflags);
@@ -582,4 +588,87 @@ static inline bool io_has_work(struct io_ring_ctx *ctx)
 	return test_bit(IO_CHECK_CQ_OVERFLOW_BIT, &ctx->check_cq) ||
 	       io_local_work_pending(ctx);
 }
+
+void io_uring_dma_prep(struct io_kiocb *req);
+void io_dma_free_recv_kvec(struct io_kiocb *req);
+void io_dma_init_freelist(struct io_ring_ctx *ctx, struct io_uring_params *p);
+int io_dma_submit_queued_tasks(struct io_kiocb *req);
+void io_dma_unmap_batch(struct io_ring_ctx *ctx, struct device *dev,
+			struct io_dma_batch_entry *entries, unsigned int nr,
+			bool put_folios);
+void io_dma_batch_cleanup(struct io_ring_ctx *ctx, struct device *dev,
+			  struct io_dma_task *dma);
+ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
+			    u64 dst_user_addr, size_t want);
+extern struct kmem_cache *dma_cachep;
+void io_dma_cache_init(void);
+int __io_dma_poll(struct io_ring_ctx *ctx);
+void io_dma_task_release_res(struct io_ring_ctx *ctx, struct device *dev,
+			     struct io_dma_task *dma);
+
+/* Any pollable DMA tasks in flight?  poll_list belongs to the armed
+ * poller; reading it here is a racy heuristic, which is all the wakeup
+ * and wait-loop checks need. */
+static inline bool io_dma_pending(struct io_ring_ctx *ctx)
+{
+	return !llist_empty(&ctx->dma.submit_list) ||
+	       READ_ONCE(ctx->dma.poll_list) != NULL;
+}
+bool io_dma_cq_wait_poll(struct io_ring_ctx *ctx, struct io_wait_queue *iowq);
+void io_dma_dump_stuck(struct io_ring_ctx *ctx);
+bool io_dma_inline_wait(struct io_kiocb *req, unsigned int budget_us);
+/* Filemap DMA-WRITE gate/result accounting; see io_uring/dma.c. */
+enum {
+	IO_DMA_FMW_ENGAGED,
+	IO_DMA_FMW_NO_AOPS,	/* fs has no write_begin/end (e.g. XFS iomap) */
+	IO_DMA_FMW_NOT_BVEC,
+	IO_DMA_FMW_DIRECT,
+	IO_DMA_FMW_NO_DMA_ADDRS,
+	IO_DMA_FMW_EAGAIN,
+	IO_DMA_FMW_CPU_REDO,	/* DMA timeout/error -> idempotent CPU re-copy */
+	IO_DMA_FMW_ERROR,
+	IO_DMA_FMW_NR,
+};
+void io_dma_fmw_record(unsigned int reason);
+ssize_t io_dma_filemap_write(struct io_kiocb *req, struct kiocb *iocb,
+			     struct iov_iter *from, u64 src_user_addr);
+
+/* Filemap DMA-read gate/result accounting; see io_uring/dma.c. */
+enum {
+	IO_DMA_FM_ENGAGED,
+	IO_DMA_FM_SHMEM,
+	IO_DMA_FM_NOT_BVEC,
+	IO_DMA_FM_DIRECT,
+	IO_DMA_FM_NO_DMA_ADDRS,
+	IO_DMA_FM_EAGAIN,
+	IO_DMA_FM_ENOMEM,
+	IO_DMA_FM_EFAULT,
+	IO_DMA_FM_OTHER,
+	IO_DMA_FM_NR,
+};
+void io_dma_fm_record(unsigned int reason);
+extern unsigned int io_dma_reap_on_enter;
+extern unsigned int io_dma_drain_wait_us;
+extern atomic64_t io_dma_drain_cycles;
+
+/*
+ * One opportunistic completion-detection pass on the ring task's own kernel
+ * entry (io_uring_enter). Detecting here instead of on the kworker lets the
+ * poll task_work that posts the CQE run before this enter returns -- no
+ * extra wakeup. Cheap when idle: two lockless emptiness checks.
+ */
+static inline void io_dma_reap_inline(struct io_ring_ctx *ctx)
+{
+	if (READ_ONCE(io_dma_reap_on_enter) &&
+	    !IS_ERR_OR_NULL(ctx->dma.chan) && io_dma_pending(ctx))
+		__io_dma_poll(ctx);
+}
+bool io_dma_irq_mode(void);
+void io_dma_dbg_register(struct io_ring_ctx *ctx);
+void io_dma_dbg_unregister(struct io_ring_ctx *ctx);
+void io_dma_compl_thread_start(struct io_ring_ctx *ctx);
+void io_dma_compl_thread_stop(struct io_ring_ctx *ctx);
+int kiocb_done(struct io_kiocb *req, ssize_t ret, struct io_br_sel *sel, unsigned int issue_flags);
+void io_submit_flush_completions(struct io_ring_ctx *ctx);
+
 #endif

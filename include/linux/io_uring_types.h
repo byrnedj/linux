@@ -6,10 +6,17 @@
 #include <linux/task_work.h>
 #include <linux/bitmap.h>
 #include <linux/llist.h>
+#include <linux/dmaengine.h>
+#include <linux/iommu.h>
+#include <linux/workqueue.h>
+#include <linux/atomic.h>
 #include <uapi/linux/io_uring.h>
 
 struct iou_loop_params;
 struct io_uring_bpf_ops;
+struct folio;
+struct scatterlist;
+struct kvec;
 
 enum {
 	/*
@@ -312,6 +319,200 @@ enum {
 
 struct iou_ctx {};
 
+struct io_dma_channel {
+	struct dma_chan		*chan;
+	bool			use_phys_addrs;
+
+	/* Ring asked for IORING_SETUP_DMA but the per-channel client cap
+	 * (io_uring_dma_max_clients_per_chan) was reached: chan stays NULL,
+	 * every offload gate falls through to the CPU path, and DMA buffer
+	 * ring registration is accepted unmapped instead of failing.
+	 */
+	bool			admission_limited;
+
+	struct work_struct	poll_work;
+	atomic_t		poll_armed;
+
+	/* poll_work is executing its drain loop. Submitters elide the
+	 * per-submission queue_work() while this is set -- the loop re-checks
+	 * the pending lists after every pass, and its exit protocol (clear
+	 * poll_active, full barrier, re-check, resume if non-empty) closes the
+	 * publish-vs-exit race -- so the workqueue pool lock leaves the
+	 * per-recv submit path (profiled at 3.7% of node cycles as
+	 * queue_work_on -> queued_spin_lock_slowpath under 20GB/s ingest).
+	 */
+	atomic_t		poll_active;
+
+	/* Per-ctx completion kthread (mwait mode); NULL falls back
+	 * to the poll_work kworker. Submit wakes it via compl_wait.
+	 */
+	struct task_struct	*compl_thread;
+	struct wait_queue_head	compl_wait;
+
+	/* IRQ mode: set true under ->lock just before dma_release_channel().
+	 * idxd's abort callbacks then orphan (unmap+free, no req completion)
+	 * instead of completing reqs in the unsafe late-teardown context.
+	 */
+	bool			releasing;
+
+	/* Teardown diagnostics, dumped by io_dma_dump_stuck(): descriptor
+	 * doorbells vs. interrupt callbacks received, and in-flight DMA req
+	 * refs taken vs. dropped. Balanced counters mean the wedge is not in
+	 * completion delivery.
+	 */
+	atomic_t		diag_irq_submitted;
+	atomic_t		diag_irq_completed;
+	atomic_t		diag_irq_orphaned;
+	atomic_t		diag_refs_taken;
+	atomic_t		diag_refs_dropped;
+
+	/* Lost-wakeup instrumentation for the poll_active kick-elision
+	 * protocol: submit-side kick outcomes, workfn drain entries and
+	 * exit-race resumes, and the ktime of the last workfn exit. A
+	 * stalled task whose submit_ns is AFTER dbg_workfn_exit_ns was
+	 * published with no poller running and no kick delivered
+	 * (submit-side hole); BEFORE means the workfn's exit re-check
+	 * missed it (exit-protocol hole). Dumped via the debugfs file
+	 * io_uring_dma_poll_state; dbg_node links the ctx into the
+	 * global dump registry while it owns a channel.
+	 */
+	atomic64_t		dbg_kick_queued;
+	atomic64_t		dbg_kick_elided;
+	atomic64_t		dbg_workfn_runs;
+	atomic64_t		dbg_workfn_resumes;
+	/* Pollers that disarmed with tasks still parked and (re)scheduled a
+	 * persistent poller from __io_dma_poll's exit -- the lost-wakeup
+	 * closure path. */
+	atomic64_t		dbg_rescue_kicks;
+	u64			dbg_workfn_exit_ns;
+	struct list_head	dbg_node;
+
+	spinlock_t		lock;
+
+	/* Pending pollable tasks, split for lock-free producer/consumer:
+	 * submitters publish to submit_list (llist, no lock -- the ->lock
+	 * hold they still take for the in-flight ref is a few instructions,
+	 * not the whole poller walk), and the single armed poller
+	 * (poll_armed) splices it into poll_list, a consumer-owned FIFO it
+	 * walks with no lock at all.  poll_list is handed between poller
+	 * threads by the poll_armed acquire/release pair.
+	 */
+	struct llist_head	submit_list;
+	struct io_dma_task	*poll_list;
+	struct io_dma_task	*poll_list_tail;
+
+	/* Preallocated io_dma_task freelist, sized to ring depth.
+	 * Separate lock: __io_dma_task_complete() runs both under and
+	 * outside ->lock, so the pool must not reuse ->lock.
+	 */
+	spinlock_t		free_lock;
+	struct io_dma_task	*free_list;	/* chained via ->next */
+	unsigned int		free_count;	/* parked objects */
+	unsigned int		free_max;	/* pool cap == target size */
+
+	/* Scratch scatterlists (2 * IO_DMA_BATCH_MAX entries) for arrays that
+	 * dmaengine_prep_dma_memcpy_sg() consumes within the call. All batch
+	 * submissions run in the issue path under uring_lock, so one scratch
+	 * per channel suffices. NULL → submitters fall back to kmalloc.
+	 */
+	struct scatterlist	*sg_scratch;
+};
+
+struct io_dma_kiocb {
+	unsigned int		dma_refcnt;
+	int			dma_result;
+	int			saved_res;	/* total recv bytes for CQE */
+	unsigned int		saved_cflags;	/* buffer flags for CQE */
+	size_t			remaining;
+	struct io_dma_task	*dma_tasks;
+	struct io_dma_task	*dma_tasks_tail;
+	unsigned short		buf_group;	/* for DMA addr lookup */
+	bool			dma_active;	/* DMA copy armed for this req */
+	bool			irq_mode;	/* completion via dmaengine callback,
+						 * captured at prep so a mid-recv mode
+						 * switch can't split a req across the
+						 * IRQ and poll completion paths */
+	bool			dma_ref_held;	/* extra req ref held for in-flight DMA */
+	bool			mshot_in_flight; /* multishot recv awaiting DMA completion */
+	bool			pending_aux_cqe; /* DMA done, io_recv must post aux CQE */
+	bool			dma_terminal;	/* DMA done, terminate poll-armed req
+						 * with saved_res (one-shot, or
+						 * multishot error) */
+	u64			dst_user_addr;	/* user VA for reg buf DMA lookup */
+	void (*cb_fn)(struct kiocb *, void *, int);
+	void			*cb_arg;
+	struct kvec		*recv_kvec;	/* cached recv-copy source kvec;
+						 * allocated on first use, reused
+						 * across multishot reissues, freed
+						 * when the req leaves the slab cache */
+	unsigned int		recv_kvec_nr;	/* capacity of recv_kvec, in entries */
+};
+
+struct io_pfn_map;
+
+struct io_dma_batch_entry {
+	dma_addr_t		src_dma;	/* DMA-mapped source address */
+	struct io_pfn_map	*pfn_map;	/* persistent-mapping cache entry
+						 * backing src_dma (ref held), or
+						 * NULL when src_dma is a plain
+						 * per-chunk mapping */
+	dma_addr_t		dst_dma;	/* pre-mapped dest DMA address */
+	void			*src_kaddr;	/* CPU-reachable source; lets the
+						 * recv error path CPU-copy a chunk
+						 * collected but not yet submitted */
+	struct folio		*folio;		/* page cache folio ref, or NULL */
+	u64			dst_uaddr;	/* dst user VA of this chunk, for
+						 * the same recv error-path CPU copy
+						 * (a bundle dst is a multi-segment
+						 * iovec, so a linear offset cannot
+						 * name the destination) */
+	u32			src_len;	/* source mapping length */
+	bool			src_is_page;	/* src mapped via dma_map_page()
+						 * (folio source) vs dma_map_single()
+						 * (skb kvec source) */
+};
+
+/* Sized so one 64KB HW-GRO skb (up to ~16 page frags + linear head,
+ * folio-bounded => <=18 chunks) always fits ONE batch descriptor. At 16,
+ * nearly every skb split into two submissions -- one full, one nearly
+ * empty -- and the ENQCMDS portal write (serializing UC store + wmb pair,
+ * plus enqcmds retries) was the single hottest DSA-mode symbol at 4.8% of
+ * node cycles under 20GB/s ingest. */
+#define IO_DMA_BATCH_MAX	32
+
+struct io_dma_task {
+	struct io_kiocb		*req;
+	struct llist_node	llnode;		/* ctx submit_list linkage */
+	dma_cookie_t		cookie;
+	const u8		*compl_status;	/* device completion-record status
+						 * byte (0 = in flight), for
+						 * monitor-based waits; NULL if
+						 * the channel can't provide it */
+	u64			submit_ns;	/* ktime at hw submit, for latency stats */
+	dma_addr_t		src_dma;	/* DMA-mapped source address */
+	dma_addr_t		dst_dma;	/* pre-mapped dest DMA address */
+	u32			len;
+	dma_addr_t		src_map_addr;	/* for dma_unmap at completion */
+	u32			src_map_len;
+	struct io_pfn_map	*src_pfn_map;	/* cache entry backing the single
+						 * source mapping (ref dropped at
+						 * completion instead of unmap) */
+	struct folio		*src_folio;	/* page cache folio ref to put on completion */
+	bool			src_is_page;	/* true → dma_unmap_page, false → dma_unmap_single */
+	bool			is_batch;	/* true → batch task with batch_entries */
+	bool			sg_inline;	/* batch_src_sg points at the task
+						 * allocation's inline array; don't
+						 * kfree it at cleanup */
+	u8			batch_nr;	/* number of batch entries */
+	struct io_dma_batch_entry *batch_entries; /* heap-allocated cleanup array,
+						   * NULL for SG-mapped recv batches */
+	struct scatterlist	*batch_src_sg;	/* recv batch: source SG mapped with
+						 * one dma_map_sg(); the unmap handle,
+						 * freed at completion */
+	unsigned int		batch_src_nents;/* original nents for dma_unmap_sg() */
+	struct io_dma_task	*next;
+};
+
 struct io_ring_ctx {
 	/* const or read-mostly hot data */
 	struct {
@@ -410,6 +611,8 @@ struct io_ring_ctx {
 		 */
 		u64					hybrid_poll_time;
 	} ____cacheline_aligned_in_smp;
+
+	struct io_dma_channel		dma;
 
 	struct {
 		/*
@@ -769,6 +972,8 @@ struct io_kiocb {
 
 		struct io_rsrc_node	*buf_node;
 	};
+
+	struct io_dma_kiocb		dma;
 
 	union {
 		/* used by request caches, completion batching and iopoll */

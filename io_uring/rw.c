@@ -10,6 +10,7 @@
 #include <linux/poll.h>
 #include <linux/nospec.h>
 #include <linux/compat.h>
+#include <linux/shmem_fs.h>
 #include <linux/io_uring/cmd.h>
 #include <linux/indirect_call_wrapper.h>
 
@@ -651,8 +652,8 @@ static inline void io_rw_done(struct io_kiocb *req, ssize_t ret)
 		io_complete_rw(&rw->kiocb, ret);
 }
 
-static int kiocb_done(struct io_kiocb *req, ssize_t ret,
-		      struct io_br_sel *sel, unsigned int issue_flags)
+int kiocb_done(struct io_kiocb *req, ssize_t ret, struct io_br_sel *sel,
+		       unsigned int issue_flags)
 {
 	struct io_rw *rw = io_kiocb_to_cmd(req, struct io_rw);
 	unsigned final_ret = io_fixup_rw_res(req, ret);
@@ -922,6 +923,7 @@ static int __io_read(struct io_kiocb *req, struct io_br_sel *sel,
 	struct io_async_rw *io = req->async_data;
 	struct kiocb *kiocb = &rw->kiocb;
 	ssize_t ret;
+	int ret2;
 	loff_t *ppos;
 
 	if (req->flags & REQ_F_IMPORT_BUFFER) {
@@ -954,6 +956,82 @@ static int __io_read(struct io_kiocb *req, struct io_br_sel *sel,
 	if (unlikely(ret))
 		return ret;
 
+	/* DMA-offloaded page cache read for registered buffers.
+	 * Bypass generic_file_read_iter() and read directly from the
+	 * page cache, submitting DMA copies to the registered buffer.
+	 * Every reject/failure reason is counted (debugfs "filemap:"
+	 * section) -- this path fails SILENTLY into the normal buffered
+	 * read, which made both the shmem zero-fill bug and a
+	 * descriptor-exhaustion -EAGAIN storm invisible until counted.
+	 */
+	if (!IS_ERR_OR_NULL(req->ctx->dma.chan) &&
+	    (req->flags & REQ_F_ISREG) &&
+	    (req->flags & REQ_F_BUF_NODE) && req->buf_node) {
+		if (!req->buf_node->buf->dma_addrs) {
+			io_dma_fm_record(IO_DMA_FM_NO_DMA_ADDRS);
+		} else if (!iov_iter_is_bvec(&io->iter)) {
+			io_dma_fm_record(IO_DMA_FM_NOT_BVEC);
+		} else if (kiocb->ki_flags & IOCB_DIRECT) {
+			io_dma_fm_record(IO_DMA_FM_DIRECT);
+		} else if (shmem_mapping(req->file->f_mapping)) {
+			/* filemap_get_pages() yields no data folios for
+			 * shmem/tmpfs files; the DMA path read ZEROES
+			 * while reporting success. Take the normal
+			 * buffered path instead. */
+			io_dma_fm_record(IO_DMA_FM_SHMEM);
+		} else {
+			io_uring_dma_prep(req);
+			/*
+			 * On a reissue after a short claim the iter and
+			 * ki_pos have advanced by io->bytes_done, but
+			 * rw->addr is the SQE's original address.  Address
+			 * the destination from where the iter stands, or
+			 * the retry lands the tail's data at the buffer
+			 * head.
+			 */
+			req->dma.dst_user_addr = rw->addr + io->bytes_done;
+
+			ret = io_dma_filemap_read(req, kiocb,
+						  rw->addr + io->bytes_done,
+						  iov_iter_count(&io->iter));
+
+			if (ret > 0)
+				io_dma_fm_record(IO_DMA_FM_ENGAGED);
+			else if (ret == -EAGAIN)
+				io_dma_fm_record(IO_DMA_FM_EAGAIN);
+			else if (ret == -ENOMEM)
+				io_dma_fm_record(IO_DMA_FM_ENOMEM);
+			else if (ret == -EFAULT)
+				io_dma_fm_record(IO_DMA_FM_EFAULT);
+			else if (ret < 0)
+				io_dma_fm_record(IO_DMA_FM_OTHER);
+
+			if (ret > 0 && req->dma.dma_refcnt > 0) {
+				req->dma.saved_res = ret;
+				req->dma.saved_cflags = 0;
+				ret2 = io_dma_submit_queued_tasks(req);
+				if (ret2 == -EIOCBQUEUED)
+					return IOU_ISSUE_SKIP_COMPLETE;
+			}
+			if (ret > 0)
+				return ret;
+			/* On failure, fall through to normal read path */
+			req->dma.dma_active = false;
+		}
+	}
+
+	/* Set up DMA copy offload for socket reads.
+	 * Pass io_kiocb via kiocb->private so sock_read_iter()
+	 * can forward it to msg.msg_io_iocb for tcp_recvmsg().
+	 */
+	if (force_nonblock && !IS_ERR_OR_NULL(req->ctx->dma.chan)) {
+		io_uring_dma_prep(req);
+		req->dma.dst_user_addr = rw->addr;
+		kiocb->private = req;
+	} else {
+		kiocb->private = NULL;
+	}
+
 	ret = io_iter_do_read(rw, &io->iter);
 
 	/*
@@ -963,6 +1041,22 @@ static int __io_read(struct io_kiocb *req, struct io_br_sel *sel,
 	 */
 	if (ret == -EOPNOTSUPP && force_nonblock)
 		ret = -EAGAIN;
+
+
+	if (ret >= 0) {
+		/* Pre-compute CQE result for DMA completion path.
+		 * Must happen BEFORE io_dma_submit_queued_tasks() because
+		 * DMA can complete synchronously during submit.
+		 */
+		if (!IS_ERR_OR_NULL(req->ctx->dma.chan) && req->dma.dma_active) {
+			req->dma.saved_res = ret;
+			req->dma.saved_cflags = 0;
+		}
+		ret2 = io_dma_submit_queued_tasks(req);
+		if (ret2 < 0) {
+			ret = ret2;
+		}
+	}
 
 	if (ret == -EAGAIN) {
 		/* If we can poll, just do that. */
@@ -1178,7 +1272,43 @@ int io_write(struct io_kiocb *req, unsigned int issue_flags)
 		return -EAGAIN;
 	kiocb->ki_flags |= IOCB_WRITE;
 
-	if (likely(req->file->f_op->write_iter))
+	/* DMA-offloaded buffered write for registered buffers. Only in the
+	 * blocking (io-wq) pass -- buffered regular-file writes always punt
+	 * there -- so io_dma_filemap_write() may sleep. Falls back to the
+	 * normal path on -EAGAIN; every reason is counted (debugfs
+	 * "filemap_write:" section). */
+	ret2 = -EAGAIN;
+	if (!force_nonblock && !IS_ERR_OR_NULL(req->ctx->dma.chan) &&
+	    (req->flags & REQ_F_ISREG) &&
+	    (req->flags & REQ_F_BUF_NODE) && req->buf_node) {
+		const struct address_space_operations *aops =
+			req->file->f_mapping->a_ops;
+
+		if (!req->buf_node->buf->dma_addrs) {
+			io_dma_fmw_record(IO_DMA_FMW_NO_DMA_ADDRS);
+		} else if (!iov_iter_is_bvec(&io->iter)) {
+			io_dma_fmw_record(IO_DMA_FMW_NOT_BVEC);
+		} else if (kiocb->ki_flags & IOCB_DIRECT) {
+			io_dma_fmw_record(IO_DMA_FMW_DIRECT);
+		} else if (!aops->write_begin || !aops->write_end) {
+			/* iomap filesystems (XFS) take the normal path */
+			io_dma_fmw_record(IO_DMA_FMW_NO_AOPS);
+		} else {
+			/* Same reissue rule as the read path: the source
+			 * registered-buffer base must track the iter. */
+			ret2 = io_dma_filemap_write(req, kiocb, &io->iter,
+						    rw->addr + io->bytes_done);
+			if (ret2 > 0)
+				io_dma_fmw_record(IO_DMA_FMW_ENGAGED);
+			else if (ret2 == -EAGAIN)
+				io_dma_fmw_record(IO_DMA_FMW_EAGAIN);
+			else if (ret2 < 0)
+				io_dma_fmw_record(IO_DMA_FMW_ERROR);
+		}
+	}
+	if (ret2 != -EAGAIN) {
+		/* handled by the DMA path (incl. short writes and errors) */
+	} else if (likely(req->file->f_op->write_iter))
 		ret2 = req->file->f_op->write_iter(kiocb, &io->iter);
 	else if (req->file->f_op->write)
 		ret2 = loop_rw_iter(WRITE, rw, &io->iter);

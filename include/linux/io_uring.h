@@ -6,6 +6,8 @@
 #include <linux/xarray.h>
 #include <uapi/linux/io_uring.h>
 
+typedef void (*io_uring_copy_to_iter_cb)(struct kiocb *, void *, int);
+
 #if defined(CONFIG_IO_URING)
 void __io_uring_cancel(bool cancel_all);
 void __io_uring_free(struct task_struct *tsk);
@@ -36,6 +38,14 @@ static inline int io_uring_fork(struct task_struct *tsk)
 
 	return 0;
 }
+
+ssize_t io_uring_copy_to_iter(struct kiocb *iocb, struct iov_iter *dst_iter,
+			struct iov_iter *src_iter,
+			void (*cb_fn)(struct kiocb *, void *, int), void *cb_arg,
+			unsigned long flags);
+struct kvec *io_uring_recv_kvec(struct kiocb *iocb, unsigned int nr);
+void io_uring_dma_fb_partial_skb(size_t len);
+void io_uring_dma_fb_tcp_kvec(void);
 #else
 static inline void io_uring_task_cancel(void)
 {
@@ -57,6 +67,23 @@ static inline bool io_is_uring_fops(struct file *file)
 static inline int io_uring_fork(struct task_struct *tsk)
 {
 	return 0;
+}
+static inline ssize_t io_uring_copy_to_iter(struct kiocb *iocb, struct iov_iter *dst_iter,
+			struct iov_iter *src_iter,
+			void (*cb_fn)(struct kiocb *, void *, int), void *cb_arg,
+			unsigned long flags)
+{
+	return -EOPNOTSUPP;
+}
+static inline struct kvec *io_uring_recv_kvec(struct kiocb *iocb, unsigned int nr)
+{
+	return NULL;
+}
+static inline void io_uring_dma_fb_partial_skb(size_t len)
+{
+}
+static inline void io_uring_dma_fb_tcp_kvec(void)
+{
 }
 #endif
 

@@ -209,6 +209,33 @@ static inline void io_mshot_prep_retry(struct io_kiocb *req,
 	sr->len = sr->mshot_len;
 }
 
+/*
+ * Flush the pending aux CQE left by a multishot DMA recv completion.
+ * Called at the top of io_recv when req->dma.pending_aux_cqe is set.
+ * Posts the CQE, resets multishot bookkeeping, and clears the flag so
+ * io_recv can proceed with a fresh recv on the next burst of data.
+ * Returns true if the CQE was posted; false on CQ overflow (caller
+ * should terminate the multishot).
+ */
+static bool io_dma_flush_pending_aux_cqe(struct io_kiocb *req)
+{
+	struct io_async_msghdr *kmsg = req->async_data;
+	s32 res = req->dma.saved_res;
+	u32 cflags = req->dma.saved_cflags;
+
+	if (!io_req_post_cqe(req, res, cflags | IORING_CQE_F_MORE))
+		return false;
+
+	if (kmsg)
+		io_mshot_prep_retry(req, kmsg);
+
+	req->dma.saved_res = 0;
+	req->dma.saved_cflags = 0;
+	req->dma.pending_aux_cqe = false;
+	req->dma.mshot_in_flight = false;
+	return true;
+}
+
 static int io_net_import_vec(struct io_kiocb *req, struct io_async_msghdr *iomsg,
 			     const struct iovec __user *uiov, unsigned uvec_seg,
 			     int ddir)
@@ -958,6 +985,9 @@ static inline bool io_recv_finish(struct io_kiocb *req,
 
 	/* Finish the request / stop multishot. */
 finish:
+	pr_debug("io_recv_finish: opcode=%d res=%zd cflags=0x%x req_flags=0x%llx buf_index=%d\n",
+		req->opcode, sel->val, cflags,
+		(unsigned long long)req->flags, req->buf_index);
 	io_req_set_res(req, sel->val, cflags);
 	sel->val = IOU_COMPLETE;
 	io_req_msg_cleanup(req, issue_flags);
@@ -1217,6 +1247,13 @@ int io_recv(struct io_kiocb *req, unsigned int issue_flags)
 	int ret, min_ret = 0;
 	bool force_nonblock = issue_flags & IO_URING_F_NONBLOCK;
 	bool mshot_finished;
+	/*
+	 * Cap for the inline multishot DMA drain below: without it a fast
+	 * sender keeping the socket non-empty would pin this task_work on
+	 * one channel and starve the ring's other requests. 16 matches
+	 * netty's per-readiness read cap on the epoll transport.
+	 */
+	unsigned int drain_left = 16;
 
 	sock = sock_from_file(req->file);
 	if (unlikely(!sock))
@@ -1225,6 +1262,48 @@ int io_recv(struct io_kiocb *req, unsigned int issue_flags)
 	if (!(req->flags & REQ_F_POLLED) &&
 	    (sr->flags & IORING_RECVSEND_POLL_FIRST))
 		return -EAGAIN;
+
+	/*
+	 * A multishot DMA recv that completed since our last run left an
+	 * aux CQE waiting to be posted (saved_res/saved_cflags). Flush it
+	 * before starting a new recv on this same req — done here (rather
+	 * than in the DMA completion task_work) so that CQE posting and
+	 * subsequent recv state changes happen in one well-defined place
+	 * under the poll state machine's ownership, avoiding the races
+	 * that an out-of-band poll_refs bump would introduce.
+	 */
+	if (req->dma.pending_aux_cqe) {
+		if (!io_dma_flush_pending_aux_cqe(req)) {
+			/*
+			 * CQ ring is full. Transition multishot to a terminal
+			 * completion: set the saved result on the req and
+			 * return IOU_COMPLETE so the poll state machine tears
+			 * the poll down and posts a final CQE (no F_MORE).
+			 */
+			s32 res = req->dma.saved_res;
+			u32 cflags = req->dma.saved_cflags;
+
+			pr_debug("io_recv: aux CQE flush failed (CQ full), terminating mshot\n");
+			req->dma.pending_aux_cqe = false;
+			req->dma.mshot_in_flight = false;
+			req->dma.saved_res = 0;
+			req->dma.saved_cflags = 0;
+			io_req_set_res(req, res, cflags);
+			return IOU_COMPLETE;
+		}
+		pr_debug("io_recv: flushed pending aux CQE\n");
+	}
+
+	/*
+	 * If a previous multishot DMA recv on this req is still queued in
+	 * the DMA engine (e.g., poll fired for a second-chunk before the
+	 * first chunk's DMA callback ran), defer: io_uring_dma_prep() would
+	 * clobber its per-request bookkeeping.
+	 */
+	if (req->dma.mshot_in_flight) {
+		pr_debug("io_recv: mshot_in_flight guard hit, deferring\n");
+		return IOU_RETRY;
+	}
 
 	flags = sr->msg_flags;
 	if (force_nonblock)
@@ -1257,10 +1336,136 @@ retry_multishot:
 	kmsg->msg.msg_flags = 0;
 	kmsg->msg.msg_inq = -1;
 
+	/*
+	 * DSA offload eligibility:
+	 *
+	 * One-shot recv may offload from any issue context, including the
+	 * first inline issue: its DMA completion is a plain task_work
+	 * terminal completion that touches no poll state, so it does not
+	 * care whether poll was ever armed.  (Gating it on REQ_F_POLLED
+	 * would make engagement depend on socket occupancy at issue time.)
+	 *
+	 * Multishot must be poll-armed: its completion is driven through
+	 * poll ownership (io_poll_kick) to post aux CQEs and re-arm, which
+	 * is only valid once __io_arm_poll_handler() has initialized
+	 * poll_refs and hashed the req.  A not-yet-armed multishot falls
+	 * through to a normal copy and arms poll on -EAGAIN; later
+	 * poll-driven issues then offload.
+	 */
+	if (force_nonblock && !IS_ERR_OR_NULL(req->ctx->dma.chan) &&
+	    ((req->flags & REQ_F_POLLED) ||
+	     !(sr->flags & IORING_RECV_MULTISHOT))) {
+		/* DSA offload path: arm DMA; copy routes via io_uring_copy_to_iter. */
+		kmsg->msg.msg_io_iocb = req;
+		io_uring_dma_prep(req);
+		/* IRQ completion mode is recv-only; capture it once here. */
+		req->dma.irq_mode = io_dma_irq_mode();
+		req->dma.buf_group = sr->buf_group;
+	} else if (force_nonblock && IS_ERR_OR_NULL(req->ctx->dma.chan)) {
+		/*
+		 * CPU baseline (no DSA): route the copy through
+		 * io_uring_copy_to_iter() for a latency baseline. The copy is
+		 * synchronous (no SKIP_COMPLETE / poll-kick), so it has no
+		 * poll-armed dependency and is safe on any issue. cb_fn is
+		 * cleared because io_uring_dma_prep() (which normally zeroes it)
+		 * is skipped, and a partial read takes TCP's plain copy path
+		 * while io_dma_submit_queued_tasks() still runs.
+		 */
+		kmsg->msg.msg_io_iocb = req;
+		req->dma.cb_fn = NULL;
+	} else {
+		kmsg->msg.msg_io_iocb = NULL;
+	}
+
 	if (flags & MSG_WAITALL)
 		min_ret = iov_iter_count(&kmsg->msg.msg_iter);
 
 	ret = sock_recvmsg(sock, &kmsg->msg, flags);
+	if (ret > 0) {
+		int ret2;
+		pr_debug("io_recv: sock_recvmsg ret=%d dma_refcnt=%d dma_active=%d req_flags=0x%llx\n",
+			ret, !IS_ERR_OR_NULL(req->ctx->dma.chan) ? req->dma.dma_refcnt : -1,
+			!IS_ERR_OR_NULL(req->ctx->dma.chan) ? req->dma.dma_active : -1,
+			(unsigned long long)req->flags);
+		/* Pre-compute CQE values for DMA completion path.
+		 * Must happen BEFORE io_dma_submit_queued_tasks() because
+		 * DMA can complete synchronously during submit via __io_dma_poll().
+		 */
+		if (!IS_ERR_OR_NULL(req->ctx->dma.chan) && req->dma.dma_active) {
+			unsigned int cflags = 0;
+			if (kmsg->msg.msg_inq > 0)
+				cflags |= IORING_CQE_F_SOCK_NONEMPTY;
+			if (req->flags & (REQ_F_BUFFER_RING | REQ_F_BUFFER_SELECTED))
+				cflags |= IORING_CQE_F_BUFFER |
+					  (req->buf_index << IORING_CQE_BUFFER_SHIFT);
+			req->dma.saved_res = ret + sr->done_io;
+			req->dma.saved_cflags = cflags;
+		}
+		ret2 = io_dma_submit_queued_tasks(req);
+		pr_debug("io_recv: dma_submit ret2=%d\n", ret2);
+		if (ret2 < 0) {
+			if (ret2 == -EIOCBQUEUED) {
+				pr_debug("io_recv: SKIP_COMPLETE (DMA queued) res=%d mshot=%d cflags=0x%x inq=%d\n",
+					 req->dma.saved_res,
+					 !!(req->flags & REQ_F_APOLL_MULTISHOT),
+					 req->dma.saved_cflags,
+					 kmsg->msg.msg_inq);
+				/*
+				 * A bundle recv consumed one provided buffer
+				 * per iovec segment; commit all of them, not
+				 * just the first, or the ring head diverges
+				 * from what the CQE reports and later recvs
+				 * scribble over buffers userspace still owns.
+				 * saved_cflags already carries the first bid,
+				 * which is all io_put_kbufs() would add.
+				 */
+				if (sr->flags & IORING_RECVSEND_BUNDLE)
+					io_put_kbufs(req, ret, sel.buf_list,
+						     io_bundle_nbufs(kmsg, ret));
+				else
+					io_put_kbuf(req, req->dma.saved_res, sel.buf_list);
+				/* For multishot recv, the completion task_work
+				 * needs to know this request has an in-flight
+				 * DMA so subsequent poll wakeups defer instead
+				 * of clobbering dma bookkeeping.
+				 */
+				if (req->flags & REQ_F_APOLL_MULTISHOT)
+					req->dma.mshot_in_flight = true;
+				/* Don't call io_req_msg_cleanup here:
+				 * the request is still in-flight (DMA pending).
+				 * async_data will be freed by io_clean_op when
+				 * the request completes after DMA finishes.
+				 */
+				/*
+				 * Inline multishot drain: if the socket
+				 * has more data queued, wait out this
+				 * cycle's copy, post its aux CQE, and run
+				 * another buffer+recv+offload cycle in
+				 * this same poll task_work -- one wake
+				 * drains the socket instead of one
+				 * task_work round trip per arrival.  The
+				 * per-request DMA state holds a single
+				 * in-flight cycle, so the drain serializes
+				 * on each completion; pending_aux_cqe
+				 * distinguishes success from a DMA error.
+				 * Ends on empty socket, budget expiry,
+				 * need_resched, or CQ overflow.
+				 */
+				if ((req->flags & REQ_F_APOLL_MULTISHOT) &&
+				    kmsg->msg.msg_inq > 0 && drain_left &&
+				    io_dma_inline_wait(req,
+					READ_ONCE(io_dma_drain_wait_us)) &&
+				    req->dma.pending_aux_cqe &&
+				    io_dma_flush_pending_aux_cqe(req)) {
+					drain_left--;
+					atomic64_inc(&io_dma_drain_cycles);
+					goto retry_multishot;
+				}
+				return IOU_ISSUE_SKIP_COMPLETE;
+			}
+			ret = ret2;
+		}
+	}
 	if (ret < min_ret) {
 		if (ret == -EAGAIN && force_nonblock) {
 			io_kbuf_recycle(req, sel.buf_list, issue_flags);
