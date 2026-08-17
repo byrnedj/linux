@@ -18,6 +18,20 @@
 
 struct kmem_cache *dma_cachep;
 
+/*
+ * DSA cache control. When enabled (1, the default), destination writes
+ * are cache-allocating (IDXD_OP_FLAG_CC) so that data the application
+ * reads back immediately is warm in cache. When disabled (0), writes
+ * bypass the cache. This is configurable via
+ * /proc/sys/kernel/io_uring_dma_cache_control.
+ */
+unsigned int io_dma_cache_control __read_mostly = 1;
+
+static inline unsigned long io_dma_prep_flags(void)
+{
+	return READ_ONCE(io_dma_cache_control) ? DMA_PREP_CACHE_CONTROL : 0;
+}
+
 /* Datapath allocation takes from the pool first and then falls back
  * to the non-blocking slab. It never sleeps.
  */
@@ -211,7 +225,8 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 	}
 
 	tx = dmaengine_prep_dma_memcpy_sg(chan, dst_sgl, nr_entries,
-					   src_sgl, nr_entries, 0);
+					   src_sgl, nr_entries,
+					   io_dma_prep_flags());
 	if (!tx) {
 		kfree(sgls);
 		io_dma_task_free(req->ctx, dma);
@@ -278,7 +293,7 @@ static ssize_t io_dma_submit_single_entry(struct io_kiocb *req,
 	 * would orphan an idxd descriptor from the channel pool.
 	 */
 	tx = dmaengine_prep_dma_memcpy(chan, entry->dst_dma, entry->src_dma,
-				       entry->src_len, 0);
+				       entry->src_len, io_dma_prep_flags());
 	if (!tx) {
 		io_dma_task_free(req->ctx, dma);
 		return -EAGAIN;
