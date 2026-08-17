@@ -148,6 +148,15 @@ static const struct ctl_table kernel_io_uring_disabled_table[] = {
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec,
 	},
+	{
+		.procname	= "io_uring_dma_cache_control",
+		.data		= &io_dma_cache_control,
+		.maxlen		= sizeof(io_dma_cache_control),
+		.mode		= 0644,
+		.proc_handler	= proc_douintvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
 };
 #endif
 
