@@ -521,6 +521,21 @@ to create an io_uring instance.  If io_uring_group is set to -1 (the
 default), only processes with the CAP_SYS_ADMIN capability may create
 io_uring instances.
 
+io_uring_dma_allow_unprivileged
+===============================
+
+Ring creation with IORING_SETUP_DMA acquires a machine-wide DMA engine
+channel and therefore requires CAP_SYS_ADMIN. Setting this to 1 allows
+any process to create DMA offload rings. The default is 0.
+
+io_uring_dma_cache_control
+==========================
+
+Controls whether io_uring DMA-offloaded copies allocate their
+destination writes into the last level cache (1, the default) or
+bypass it (0). The setting applies host wide and takes effect on
+subsequently prepared descriptors.
+
 
 kernel_sys_info
 ===============
