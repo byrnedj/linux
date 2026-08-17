@@ -512,6 +512,32 @@ shrinks the kernel's attack surface.
 = ======================================================================
 
 
+io_uring_dma_allow_unprivileged
+===============================
+
+Ring creation with IORING_SETUP_DMA acquires DMA engine channels, one
+on each of up to four DMA devices, preferring the devices on the
+caller's NUMA node. A ring takes a new channel on a device while the
+device has a free one, up to sixteen per device, which takes that
+channel away from other DMA engine users, and otherwise shares one
+that rings already hold. Channels are a machine-wide hardware
+resource, so by default (0) creating such a ring requires
+CAP_SYS_ADMIN. Setting this to 1 allows any process that may create an
+io_uring instance, as io_uring_disabled and io_uring_group decide, to
+create DMA offload rings, with no per-user or per-ring limit. The
+setting is checked only when a ring is created: setting it back to 0
+does not take channels away from rings that already hold them.
+
+io_uring_dma_cache_control
+==========================
+
+Controls whether io_uring DMA-offloaded copies allocate their
+destination writes into the last level cache (1, the default) or
+bypass it (0). The setting is a hint to the device: devices that do
+not report cache control support ignore it, and on them 1 behaves as
+0. The setting applies host wide and takes effect on subsequently
+prepared descriptors.
+
 io_uring_group
 ==============
 
