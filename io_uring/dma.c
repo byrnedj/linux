@@ -20,6 +20,19 @@
 
 struct kmem_cache *dma_cachep;
 
+/*
+ * DSA cache control: when enabled (1, the default), destination writes are
+ * cache-allocating (IDXD_OP_FLAG_CC) so data the application reads back
+ * immediately is warm in cache; when disabled (0), writes bypass cache.
+ * Configurable via /proc/sys/kernel/io_uring_dma_cache_control.
+ */
+unsigned int io_dma_cache_control __read_mostly = 1;
+
+static inline unsigned long io_dma_prep_flags(void)
+{
+	return READ_ONCE(io_dma_cache_control) ? DMA_PREP_CACHE_CONTROL : 0;
+}
+
 /* Datapath alloc: pool first, then non-blocking slab, never sleeps. */
 static struct io_dma_task *io_dma_task_alloc(struct io_ring_ctx *ctx)
 {
@@ -117,7 +130,7 @@ static int __io_dma_task_submit(struct dma_chan *chan, struct io_dma_task *dma)
 	struct dma_async_tx_descriptor *tx;
 
 	tx = dmaengine_prep_dma_memcpy(chan, dma->dst_dma, dma->src_dma,
-				       dma->len, 0);
+				       dma->len, io_dma_prep_flags());
 	if (!tx) {
 		pr_err("dma prep failed: len=%u src=0x%llx dst=0x%llx\n",
 		       dma->len, (u64)dma->src_dma, (u64)dma->dst_dma);
@@ -200,7 +213,8 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 	}
 
 	tx = dmaengine_prep_dma_memcpy_sg(chan, dst_sgl, nr_entries,
-					   src_sgl, nr_entries, 0);
+					   src_sgl, nr_entries,
+					   io_dma_prep_flags());
 	if (!tx) {
 		kfree(sgls);
 		return -EAGAIN;
@@ -275,7 +289,7 @@ static ssize_t io_dma_submit_single_entry(struct io_kiocb *req,
 	/* Prep after the task alloc: an abandoned prep would orphan an
 	 * idxd descriptor from the channel pool. */
 	tx = dmaengine_prep_dma_memcpy(chan, entry->dst_dma, entry->src_dma,
-				       entry->src_len, 0);
+				       entry->src_len, io_dma_prep_flags());
 	if (!tx) {
 		io_dma_task_free(req->ctx, dma);
 		return -EAGAIN;
