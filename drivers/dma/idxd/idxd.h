@@ -331,6 +331,7 @@ struct idxd_device {
 	spinlock_t dev_lock;	/* spinlock for device */
 	spinlock_t cmd_lock;	/* spinlock for device commands */
 	struct completion *cmd_done;
+	u32 reset_epoch;	/* bumps on every device halt */
 	struct idxd_group **groups;
 	struct idxd_wq **wqs;
 	struct idxd_engine **engines;
@@ -429,6 +430,8 @@ struct idxd_desc {
 	struct list_head list;
 	int id;
 	int cpu;
+	u16 gen;
+	u32 epoch;		/* the device reset_epoch at submit */
 	struct idxd_wq *wq;
 };
 
