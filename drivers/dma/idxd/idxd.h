@@ -429,6 +429,7 @@ struct idxd_desc {
 	struct list_head list;
 	int id;
 	int cpu;
+	u16 gen;
 	struct idxd_wq *wq;
 };
 
