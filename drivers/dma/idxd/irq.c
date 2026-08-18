@@ -415,6 +415,14 @@ static irqreturn_t idxd_halt(struct idxd_device *idxd)
 	gensts.bits = ioread32(idxd->reg_base + IDXD_GENSTATS_OFFSET);
 	if (gensts.state == IDXD_DEVICE_STATE_HALT) {
 		idxd->state = IDXD_DEV_HALTED;
+		/*
+		 * Every descriptor submitted before this point is dead: the
+		 * device will never write its completion record. Pollers
+		 * compare their descriptor's epoch against this to retire
+		 * such descriptors instead of waiting for a record that never
+		 * comes.
+		 */
+		WRITE_ONCE(idxd->reset_epoch, idxd->reset_epoch + 1);
 		if (gensts.reset_type == IDXD_DEVICE_RESET_SOFTWARE) {
 			/*
 			 * If we need a software reset, we will throw the work
