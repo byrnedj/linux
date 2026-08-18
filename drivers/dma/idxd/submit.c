@@ -16,6 +16,9 @@ static struct idxd_desc *__get_desc(struct idxd_wq *wq, int idx, int cpu)
 	desc = wq->descs[idx];
 	memset(desc->hw, 0, sizeof(struct dsa_hw_desc));
 	memset(desc->completion, 0, idxd->data->compl_size);
+	/* Only DSA descriptors carry a pre-allocated batch (IAX has none). */
+	if (desc->batch)
+		desc->batch->num = 0;
 	desc->cpu = cpu;
 
 	if (device_pasid_enabled(idxd))
