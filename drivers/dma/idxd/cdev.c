@@ -654,6 +654,7 @@ err_cdev:
 	idxd_drv_disable_wq(wq);
 err:
 	destroy_workqueue(wq->wq);
+	wq->wq = NULL;	/* the EVL path tests it to tell user queues apart */
 	wq->type = IDXD_WQT_NONE;
 wq_err:
 	mutex_unlock(&wq->wq_lock);
