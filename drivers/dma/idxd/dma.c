@@ -180,6 +180,126 @@ idxd_dma_prep_memset(struct dma_chan *c, dma_addr_t dma_dest, int value,
 	return &desc->txd;
 }
 
+static inline int fetch_sg_and_pos(struct scatterlist **sg, size_t *remain,
+				   unsigned int len)
+{
+	struct scatterlist *next = *sg;
+	int count = 0;
+
+	*remain -= len;
+
+	while (*remain == 0 && next && !sg_is_last(next)) {
+		next = sg_next(next);
+		*remain = sg_dma_len(next);
+		count++;
+	}
+
+	*sg = next;
+
+	return count;
+}
+
+/*
+ * idxd_dma_prep_memcpy_sg - prepare a memcpy_sg transaction
+ *
+ * @chan: DMA channel
+ * @dst_sg: Destination scatter list
+ * @dst_nents: Number of entries in destination scatter list
+ * @src_sg: Source scatter list
+ * @src_nents: Number of entries in source scatter list
+ * @flags: DMA transaction flags
+ *
+ * Return: Async transaction descriptor on success and NULL on failure.
+ *
+ * The scatter lists are folded into one hardware BATCH descriptor of
+ * DSA_OPCODE_MEMMOVE elements. A single-element copy degrades to a
+ * plain MEMMOVE descriptor.
+ */
+static struct dma_async_tx_descriptor *
+idxd_dma_prep_memcpy_sg(struct dma_chan *chan,
+			struct scatterlist *dst_sg, unsigned int dst_nents,
+			struct scatterlist *src_sg, unsigned int src_nents,
+			unsigned long flags)
+{
+	struct idxd_wq *wq = to_idxd_wq(chan);
+	struct idxd_desc *desc;
+	struct idxd_batch *batch;
+	dma_addr_t dma_dst, dma_src;
+	size_t dst_avail, src_avail, len;
+	u32 desc_flags;
+	int i;
+
+	if (unlikely(!dst_sg || !src_sg))
+		return NULL;
+	if (unlikely(dst_nents == 0 || src_nents == 0))
+		return NULL;
+
+	if (min(dst_nents, src_nents) > wq->max_batch_size)
+		return NULL;
+
+	dst_avail = sg_dma_len(dst_sg);
+	src_avail = sg_dma_len(src_sg);
+
+	if (dst_nents == 1 && src_nents == 1) {
+		if (unlikely(dst_avail != src_avail))
+			return NULL;
+
+		return idxd_dma_submit_memcpy(chan, sg_dma_address(dst_sg),
+				sg_dma_address(src_sg), dst_avail, flags);
+	}
+
+	desc = idxd_alloc_desc(wq, IDXD_OP_NONBLOCK);
+	if (IS_ERR(desc))
+		return NULL;
+
+	/*
+	 * Fill the batch with DSA_OPCODE_MEMMOVE elements until
+	 * max_batch_size or a scatter list is consumed.
+	 */
+	batch = desc->batch;
+	for (i = 0; i < wq->max_batch_size; i++) {
+		dma_dst = sg_dma_address(dst_sg) + sg_dma_len(dst_sg) -
+			dst_avail;
+		dma_src = sg_dma_address(src_sg) + sg_dma_len(src_sg) -
+			src_avail;
+
+		len = min_t(size_t, dst_avail, src_avail);
+		len = min_t(size_t, len, wq->idxd->max_xfer_bytes);
+
+		memset(batch->descs + i, 0, sizeof(struct dsa_hw_desc));
+		idxd_prep_desc_common(wq, batch->descs + i, DSA_OPCODE_MEMMOVE,
+				dma_src, dma_dst, len, 0,
+				(flags & DMA_PREP_CACHE_CONTROL) ?
+					IDXD_OP_FLAG_CC : 0);
+		batch->num++;
+
+		dst_nents -= fetch_sg_and_pos(&dst_sg, &dst_avail, len);
+		src_nents -= fetch_sg_and_pos(&src_sg, &src_avail, len);
+
+		/* Stop when either scatter list is consumed. */
+		if (!dst_nents || !src_nents ||
+				!min_t(size_t, dst_avail, src_avail)) {
+			break;
+		}
+	}
+
+	op_flag_setup(flags, &desc_flags);
+	/*
+	 * Cache-Control is a data-mover flag and is set on the MEMMOVE
+	 * sub-descriptors above when DMA_PREP_CACHE_CONTROL was requested.
+	 * Since the BATCH descriptor itself moves no data, CC is invalid
+	 * on it and DSA fails the batch with DSA_COMP_INVALID_FLAGS
+	 * (0x11). Therefore we strip the flag from the dispatch
+	 * descriptor only.
+	 */
+	desc_flags &= ~IDXD_OP_FLAG_CC;
+	idxd_prep_desc_common(wq, desc->hw, DSA_OPCODE_BATCH,
+			batch->dma_descs, 0, batch->num,
+			desc->compl_dma, desc_flags);
+
+	return &desc->txd;
+}
+
 static int idxd_dma_alloc_chan_resources(struct dma_chan *chan)
 {
 	struct idxd_wq *wq = to_idxd_wq(chan);
@@ -356,6 +476,11 @@ int idxd_register_dma_device(struct idxd_device *idxd)
 	if (idxd->hw.opcap.bits[0] & IDXD_OPCAP_MEMFILL) {
 		dma_cap_set(DMA_MEMSET, dma->cap_mask);
 		dma->device_prep_dma_memset = idxd_dma_prep_memset;
+	}
+
+	if (idxd->hw.opcap.bits[0] & IDXD_OPCAP_BATCH) {
+		dma_cap_set(DMA_MEMCPY_SG, dma->cap_mask);
+		dma->device_prep_dma_memcpy_sg = idxd_dma_prep_memcpy_sg;
 	}
 
 	dma->device_tx_status = idxd_dma_tx_status;
