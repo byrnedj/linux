@@ -403,6 +403,20 @@ static inline unsigned int evl_size(struct idxd_device *idxd)
 	return idxd->evl->size * evl_ent_size(idxd);
 }
 
+/*
+ * IDXD batch field for SW Batch descriptor
+ * @descs: Descriptor list address
+ * @dma_descs: DMA address for descs
+ * @num: Number of descs in batch
+ * @max: Batch capacity, fixed at allocation
+ */
+struct idxd_batch {
+	struct dsa_hw_desc *descs;
+	dma_addr_t dma_descs;
+	u32 num;
+	u32 max;
+};
+
 struct crypto_ctx {
 	struct acomp_req *req;
 	struct crypto_tfm *tfm;
@@ -434,6 +448,7 @@ struct idxd_desc {
 	u16 gen;
 	u32 epoch;		/* the device reset_epoch at submit */
 	struct idxd_wq *wq;
+	struct idxd_batch *batch;
 };
 
 /*
