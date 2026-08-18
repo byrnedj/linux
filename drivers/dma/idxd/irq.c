@@ -334,12 +334,13 @@ static void process_evl_entry(struct idxd_device *idxd,
 			fault = kmem_cache_alloc(idxd->evl_cache, GFP_ATOMIC);
 			if (fault) {
 				struct idxd_wq *wq = idxd->wqs[entry_head->wq_idx];
+				struct workqueue_struct *work_q = wq->wq ? wq->wq : idxd->wq;
 
 				fault->wq = wq;
 				fault->status = status;
 				memcpy(&fault->entry, entry_head, ent_size);
 				INIT_WORK(&fault->work, idxd_evl_fault_work);
-				queue_work(wq->wq, &fault->work);
+				queue_work(work_q, &fault->work);
 			} else {
 				dev_warn(dev, "Failed to service fault work.\n");
 			}
