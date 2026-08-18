@@ -12,6 +12,18 @@
 #include "registers.h"
 #include "idxd.h"
 
+#define DMA_COOKIE_BITS (sizeof(dma_cookie_t) * 8)
+/*
+ * The descriptor id takes the lower 16 bits of the cookie.
+ */
+#define DESC_ID_BITS 16
+#define DESC_ID_MASK ((1 << DESC_ID_BITS) - 1)
+/*
+ * The generation is stored in the upper half of the cookie. Since
+ * dma_cookie_t is signed, we leave the upper-most bit for the sign.
+ */
+#define DESC_GEN_MAX ((1 << (DMA_COOKIE_BITS - DESC_ID_BITS - 1)) - 1)
+
 static inline struct idxd_wq *to_idxd_wq(struct dma_chan *c)
 {
 	struct idxd_dma_chan *idxd_chan;
@@ -93,7 +105,7 @@ idxd_dma_prep_interrupt(struct dma_chan *c, unsigned long flags)
 		return NULL;
 
 	op_flag_setup(flags, &desc_flags);
-	desc = idxd_alloc_desc(wq, IDXD_OP_BLOCK);
+	desc = idxd_alloc_desc(wq, IDXD_OP_NONBLOCK);
 	if (IS_ERR(desc))
 		return NULL;
 
@@ -119,7 +131,7 @@ idxd_dma_submit_memcpy(struct dma_chan *c, dma_addr_t dma_dest,
 		return NULL;
 
 	op_flag_setup(flags, &desc_flags);
-	desc = idxd_alloc_desc(wq, IDXD_OP_BLOCK);
+	desc = idxd_alloc_desc(wq, IDXD_OP_NONBLOCK);
 	if (IS_ERR(desc))
 		return NULL;
 
@@ -157,7 +169,70 @@ static enum dma_status idxd_dma_tx_status(struct dma_chan *dma_chan,
 					  dma_cookie_t cookie,
 					  struct dma_tx_state *txstate)
 {
-	return DMA_OUT_OF_ORDER;
+	struct idxd_wq *wq;
+	struct idxd_desc *desc;
+	u32 idx;
+	u8 status;
+
+	if (txstate)
+		memset(txstate, 0, sizeof(*txstate));
+
+	if (dma_submit_error(cookie))
+		return DMA_ERROR;
+
+	wq = to_idxd_wq(dma_chan);
+
+	idx = cookie & DESC_ID_MASK;
+	if (idx >= wq->num_descs)
+		return DMA_ERROR;
+
+	desc = wq->descs[idx];
+
+	if (desc->txd.cookie != cookie) {
+		/*
+		 * The cookie belongs to an old transaction that has
+		 * already completed and been recycled.
+		 */
+		return DMA_COMPLETE;
+	}
+
+	/*
+	 * Descriptors with a completion interrupt armed (RCI) are
+	 * completed and recycled by the IRQ handler. Reading their
+	 * completion record here would race with the handler. Since
+	 * the handler invalidates the cookie on completion, a matching
+	 * cookie means the command is still in progress.
+	 */
+	if (desc->hw->flags & IDXD_OP_FLAG_RCI)
+		return DMA_IN_PROGRESS;
+
+	status = desc->completion->status & DSA_COMP_STATUS_MASK;
+
+	if (status) {
+		/* Capture completion record fields before desc is freed below. */
+		u8 fault_info = desc->completion->fault_info;
+		u64 fault_addr = desc->completion->fault_addr;
+
+		/*
+		 * Check against the original status because ABORT is
+		 * software defined as 0xff, which DSA_COMP_STATUS_MASK
+		 * can mask out.
+		 */
+		if (unlikely(desc->completion->status == IDXD_COMP_DESC_ABORT))
+			idxd_dma_complete_txd(desc, IDXD_COMPLETE_ABORT, true, NULL, NULL);
+		else
+			idxd_dma_complete_txd(desc, IDXD_COMPLETE_NORMAL, true, NULL, NULL);
+
+		pr_debug("dsa completion: status=0x%02x fault_info=0x%02x fault_addr=0x%llx\n",
+			 status, fault_info, fault_addr);
+
+		if (status == DSA_COMP_SUCCESS)
+			return DMA_COMPLETE;
+
+		return DMA_ERROR;
+	}
+
+	return DMA_IN_PROGRESS;
 }
 
 /*
@@ -176,7 +251,14 @@ static dma_cookie_t idxd_dma_tx_submit(struct dma_async_tx_descriptor *tx)
 	int rc;
 	struct idxd_desc *desc = container_of(tx, struct idxd_desc, txd);
 
-	cookie = dma_cookie_assign(tx);
+	cookie = (desc->gen << DESC_ID_BITS) | (desc->id & DESC_ID_MASK);
+
+	if (desc->gen == DESC_GEN_MAX)
+		desc->gen = 1;
+	else
+		desc->gen++;
+
+	tx->cookie = cookie;
 
 	rc = idxd_submit_desc(wq, desc);
 	if (rc < 0) {
