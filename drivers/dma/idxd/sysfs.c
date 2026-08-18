@@ -1059,7 +1059,8 @@ static ssize_t wq_max_batch_size_store(struct device *dev, struct device_attribu
 	if (rc < 0)
 		return rc;
 
-	if (batch_size > idxd->max_batch_size)
+	/* WQCFG takes the limit as a power of two. */
+	if (batch_size > idxd->max_batch_size || !is_power_of_2(batch_size))
 		return -EINVAL;
 
 	idxd_wq_set_max_batch_size(idxd->data->type, wq, (u32)batch_size);
