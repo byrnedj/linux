@@ -39,7 +39,6 @@ enum dma_status {
 	DMA_IN_PROGRESS,
 	DMA_PAUSED,
 	DMA_ERROR,
-	DMA_OUT_OF_ORDER,
 };
 
 /**
@@ -63,7 +62,6 @@ enum dma_transaction_type {
 	DMA_SLAVE,
 	DMA_CYCLIC,
 	DMA_INTERLEAVE,
-	DMA_COMPLETION_NO_ORDER,
 	DMA_REPEAT,
 	DMA_LOAD_EOT,
 /* last transaction type for creation of the capabilities mask */
@@ -1519,8 +1517,7 @@ static inline enum dma_status dma_async_is_tx_complete(struct dma_chan *chan,
  * has finished. Once the first terminal answer has retired the
  * descriptor, a later query for the same cookie reads DMA_COMPLETE.
  *
- * Return: DMA_COMPLETE, DMA_IN_PROGRESS, DMA_PAUSED, DMA_ERROR or
- * DMA_OUT_OF_ORDER.
+ * Return: DMA_COMPLETE, DMA_IN_PROGRESS, DMA_PAUSED or DMA_ERROR.
  */
 static inline enum dma_status dmaengine_async_is_tx_complete(struct dma_chan *chan,
 	dma_cookie_t cookie)
