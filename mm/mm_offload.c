@@ -6,6 +6,7 @@
 #include <linux/mm_offload.h>
 #include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/srcu.h>
 #include <linux/static_call.h>
@@ -32,6 +33,9 @@ DEFINE_STATIC_CALL(mm_offload_clear_folio_fn, mm_offload_clear_folio_null);
 
 static DEFINE_MUTEX(provider_mutex);
 static const struct mm_offload_provider *active_provider;
+
+/* Operations currently inside the provider, i.e. potentially asleep. */
+static atomic_t ops_in_flight;
 
 /*
  * The active provider's migration reason mask. This is the single source of truth
@@ -161,11 +165,61 @@ int mm_offload_clear_folio(struct folio *folio, unsigned long addr_hint)
 
 	might_sleep();
 
+	atomic_inc(&ops_in_flight);
 	idx = srcu_read_lock(&mm_offload_srcu);
 	rc = static_call(mm_offload_clear_folio_fn)(folio, addr_hint);
 	srcu_read_unlock(&mm_offload_srcu, idx);
+	atomic_dec(&ops_in_flight);
 	return rc;
 }
+
+/**
+ * mm_offload_cpus_saturated - is every online CPU busy right now?
+ *
+ * Offloading only pays when the cycles it frees can run other work.
+ * On a machine with no idle CPU (e.g. a spin-waiting parallel runtime
+ * occupying every core) the sleeping task frees a core nothing can
+ * use, while the completion interrupts and context switches still
+ * cost; doing the work synchronously on the CPU is then the better
+ * choice. Providers can use this as an admission signal.
+ *
+ * A core idled by an already-sleeping offload is not spare capacity:
+ * on a saturated machine each offloaded fault vacates its own CPU, and
+ * counting those as idle would reopen the gate that just closed. Only
+ * report unsaturated when the idle CPUs outnumber the in-flight
+ * operations (excluding the caller, which is still running).
+ *
+ * The scan early-exits as soon as enough idle CPUs are found and the
+ * verdict is cached for a jiffy, so the common (unsaturated) case is
+ * cheap and the saturated case pays one full scan per jiffy.
+ */
+bool mm_offload_cpus_saturated(void)
+{
+	static unsigned long last_check;
+	static bool saturated;
+	unsigned long now = jiffies;
+
+	if (READ_ONCE(last_check) != now) {
+		unsigned int self = atomic_read(&ops_in_flight);
+		unsigned int idle = 0;
+		bool sat = true;
+		int cpu;
+
+		if (self)
+			self--;	/* the caller occupies its CPU */
+
+		WRITE_ONCE(last_check, now);
+		for_each_online_cpu(cpu) {
+			if (idle_cpu(cpu) && ++idle > self) {
+				sat = false;
+				break;
+			}
+		}
+		WRITE_ONCE(saturated, sat);
+	}
+	return READ_ONCE(saturated);
+}
+EXPORT_SYMBOL_GPL(mm_offload_cpus_saturated);
 
 /**
  * mm_offload_set_migrate_reason_mask - update the active provider's migration reason mask.

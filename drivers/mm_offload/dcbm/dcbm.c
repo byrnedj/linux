@@ -46,6 +46,7 @@ static atomic_long_t folios_failures;
 static atomic_long_t batches_refused;
 static atomic_long_t folios_cleared;
 static atomic_long_t clear_failures;
+static atomic_long_t folios_gated;
 
 static bool offloading_enabled;
 static unsigned int nr_dma_channels = 1;
@@ -54,6 +55,7 @@ static unsigned int max_inflight = DCBM_MAX_INFLIGHT_DEFAULT;
 static bool cache_ctrl = true;
 static unsigned long min_clear_bytes = SZ_2M;
 static bool cpu_warm = true;
+static bool util_gate = true;
 static DEFINE_MUTEX(dcbm_mutex);
 
 /*
@@ -641,6 +643,16 @@ static int folio_clear_dma(struct folio *folio, unsigned long addr_hint)
 	if (size < READ_ONCE(min_clear_bytes))
 		return -ENODEV;
 
+	/*
+	 * On a fully busy machine the cycles an offloaded clear frees
+	 * cannot run anything, while the interrupts and context
+	 * switches still cost; clear synchronously instead.
+	 */
+	if (READ_ONCE(util_gate) && mm_offload_cpus_saturated()) {
+		atomic_long_inc(&folios_gated);
+		return -EBUSY;
+	}
+
 	chan_mask = dcbm_claim_channels(
 			clamp_t(size_t, size / DCBM_CLEAR_CHUNK_BYTES, 1,
 				nr_channels), folio_nid(folio), &grp);
@@ -914,6 +926,24 @@ static const struct kernel_param_ops folios_cleared_param_ops = {
 module_param_cb(folios_cleared, &folios_cleared_param_ops, NULL, 0644);
 MODULE_PARM_DESC(folios_cleared, "Folios DMA-cleared (write to reset)");
 
+static int folios_gated_param_set(const char *val, const struct kernel_param *kp)
+{
+	atomic_long_set(&folios_gated, 0);
+	return 0;
+}
+
+static int folios_gated_param_get(char *buffer, const struct kernel_param *kp)
+{
+	return sysfs_emit(buffer, "%ld\n", atomic_long_read(&folios_gated));
+}
+
+static const struct kernel_param_ops folios_gated_param_ops = {
+	.set = folios_gated_param_set,
+	.get = folios_gated_param_get,
+};
+module_param_cb(folios_gated, &folios_gated_param_ops, NULL, 0644);
+MODULE_PARM_DESC(folios_gated, "Clears refused by the CPU saturation gate (write to reset)");
+
 static int clear_failures_param_set(const char *val, const struct kernel_param *kp)
 {
 	atomic_long_set(&clear_failures, 0);
@@ -937,6 +967,9 @@ MODULE_PARM_DESC(min_clear_bytes, "Smallest folio to clear by DMA (bytes)");
 
 module_param(cpu_warm, bool, 0644);
 MODULE_PARM_DESC(cpu_warm, "Clear the faulting neighbourhood on the CPU while DMA clears the rest");
+
+module_param(util_gate, bool, 0644);
+MODULE_PARM_DESC(util_gate, "Refuse clears while every CPU is busy");
 
 module_param(cache_ctrl, bool, 0644);
 MODULE_PARM_DESC(cache_ctrl, "Request cache-allocating writes (DMA_PREP_CACHE_CONTROL)");
