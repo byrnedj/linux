@@ -28,15 +28,38 @@ struct dma_work {
 	struct dma_chan *chan;
 	struct completion done;
 	atomic_t pending;
+	atomic_t error;
 	struct sg_table *src_sgt;
 	struct sg_table *dst_sgt;
 	bool mapped;
 };
 
-static void dma_completion_callback(void *data)
+/*
+ * Every descriptor carries its own completion. Engines such as Intel
+ * DSA complete the descriptors of one channel out of order when the
+ * work queue is served by several engines, so a callback on the last
+ * submitted descriptor does not mean the earlier ones have landed.
+ * The pending count starts at one for the submitter, so the work
+ * cannot complete before every descriptor has been submitted.
+ *
+ * A descriptor the hardware rejected or aborted completes with an
+ * error result; it must fail the batch, or a folio that was never
+ * written would be reported as copied.
+ */
+static void dma_completion_callback(void *data,
+				    const struct dmaengine_result *result)
 {
 	struct dma_work *work = data;
 
+	if (!result || result->result != DMA_TRANS_NOERROR)
+		atomic_set(&work->error, -EIO);
+
+	if (atomic_dec_and_test(&work->pending))
+		complete(&work->done);
+}
+
+static void dma_work_done_submitting(struct dma_work *work)
+{
 	if (atomic_dec_and_test(&work->pending))
 		complete(&work->done);
 }
@@ -171,35 +194,31 @@ static int submit_dma_transfers(struct dma_work *work)
 {
 	struct scatterlist *sg_src, *sg_dst;
 	struct dma_async_tx_descriptor *tx;
-	unsigned long flags = DMA_CTRL_ACK;
+	unsigned long flags = DMA_CTRL_ACK | DMA_PREP_INTERRUPT;
 	dma_cookie_t cookie;
 	int i;
 
+	/* Submission reference, dropped by dma_work_done_submitting(). */
 	atomic_set(&work->pending, 1);
+	atomic_set(&work->error, 0);
 
 	sg_src = work->src_sgt->sgl;
 	sg_dst = work->dst_sgt->sgl;
 	for_each_sgtable_dma_sg(work->src_sgt, sg_src, i) {
-		if (i == work->src_sgt->nents - 1)
-			flags |= DMA_PREP_INTERRUPT;
-
 		tx = dmaengine_prep_dma_memcpy(work->chan,
 					       sg_dma_address(sg_dst),
 					       sg_dma_address(sg_src),
 					       sg_dma_len(sg_src), flags);
-		if (!tx) {
-			atomic_set(&work->pending, 0);
+		if (!tx)
 			return -EIO;
-		}
 
-		if (i == work->src_sgt->nents - 1) {
-			tx->callback = dma_completion_callback;
-			tx->callback_param = work;
-		}
+		tx->callback_result = dma_completion_callback;
+		tx->callback_param = work;
+		atomic_inc(&work->pending);
 
 		cookie = dmaengine_submit(tx);
 		if (dma_submit_error(cookie)) {
-			atomic_set(&work->pending, 0);
+			atomic_dec(&work->pending);
 			return -EIO;
 		}
 		sg_dst = sg_next(sg_dst);
@@ -266,23 +285,25 @@ static int folios_copy_dma(struct list_head *dst_list,
 		if (!works[i].mapped)
 			continue;
 		ret = submit_dma_transfers(&works[i]);
-		if (ret)
+		if (ret) {
+			dma_work_done_submitting(&works[i]);
 			goto err_cleanup;
+		}
+		dma_async_issue_pending(works[i].chan);
+		dma_work_done_submitting(&works[i]);
 	}
 
 	for (i = 0; i < actual_channels; i++) {
-		if (atomic_read(&works[i].pending) > 0)
-			dma_async_issue_pending(works[i].chan);
-	}
-
-	for (i = 0; i < actual_channels; i++) {
-		if (atomic_read(&works[i].pending) == 0)
+		if (!works[i].mapped)
 			continue;
 		if (!wait_for_completion_timeout(&works[i].done,
 						 msecs_to_jiffies(10000))) {
 			ret = -ETIMEDOUT;
 			goto err_cleanup;
 		}
+		ret = atomic_read(&works[i].error);
+		if (ret)
+			goto err_cleanup;
 	}
 
 	/*
