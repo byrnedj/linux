@@ -34,6 +34,7 @@ static atomic_long_t batches_refused;
 static bool offloading_enabled;
 static unsigned int nr_dma_channels = 1;
 static unsigned int sg_elems = DCBM_SG_ELEMS_DEFAULT;
+static bool cache_ctrl = true;
 static DEFINE_MUTEX(dcbm_mutex);
 
 /*
@@ -76,6 +77,7 @@ struct dma_work {
 	atomic_t error;
 	struct dcbm_copy *copies;
 	unsigned int nr_copies;
+	bool submitted;
 };
 
 /*
@@ -244,8 +246,25 @@ static void unmap_folios(struct dma_work *work)
 	work->copies = NULL;
 }
 
-static void cleanup_dma_work(struct dma_work *works, int actual_channels,
-			     bool terminate)
+/*
+ * Wait for every descriptor of a slice that was handed to the engine.
+ * Nothing is ever terminated: the descriptors reference the folio
+ * mappings and the on-stack work until they complete, dmaengine has
+ * no per-descriptor abort, and a channel-wide terminate on an engine
+ * such as DSA tears down the channel's interrupt handle, after which
+ * no later descriptor on that channel completes. Anything submitted
+ * runs to completion; a failure only decides what the caller does
+ * afterwards.
+ */
+static int dma_work_wait(struct dma_work *work)
+{
+	if (!work->submitted)
+		return 0;
+	wait_for_completion(&work->done);
+	return atomic_read(&work->error);
+}
+
+static void cleanup_dma_work(struct dma_work *works, int actual_channels)
 {
 	int i;
 
@@ -255,8 +274,6 @@ static void cleanup_dma_work(struct dma_work *works, int actual_channels,
 	for (i = 0; i < actual_channels; i++) {
 		if (!works[i].chan)
 			continue;
-		if (terminate && works[i].copies)
-			dmaengine_terminate_sync(works[i].chan);
 		unmap_folios(&works[i]);
 	}
 	kfree(works);
@@ -336,6 +353,14 @@ static int submit_dma_transfers(struct dma_work *work)
 	unsigned long flags = DMA_CTRL_ACK | DMA_PREP_INTERRUPT;
 	unsigned int i;
 	int ret;
+
+	/*
+	 * Cache-allocating writes leave the copied data LLC-warm for the
+	 * first access after remapping, at the cost of cache footprint
+	 * for folios that are not touched soon.
+	 */
+	if (READ_ONCE(cache_ctrl))
+		flags |= DMA_PREP_CACHE_CONTROL;
 
 	/* Submission reference, dropped by dma_work_done_submitting(). */
 	atomic_set(&work->pending, 1);
@@ -420,26 +445,18 @@ static int folios_copy_dma(struct list_head *dst_list,
 		if (!works[i].copies)
 			continue;
 		ret = submit_dma_transfers(&works[i]);
-		if (ret) {
-			dma_work_done_submitting(&works[i]);
-			goto err_cleanup;
-		}
 		dma_async_issue_pending(works[i].chan);
 		dma_work_done_submitting(&works[i]);
+		works[i].submitted = true;
+		if (ret)
+			goto err_wait;
 	}
 
-	for (i = 0; i < actual_channels; i++) {
-		if (!works[i].copies)
-			continue;
-		if (!wait_for_completion_timeout(&works[i].done,
-						 msecs_to_jiffies(10000))) {
-			ret = -ETIMEDOUT;
-			goto err_cleanup;
-		}
-		ret = atomic_read(&works[i].error);
-		if (ret)
-			goto err_cleanup;
-	}
+	ret = 0;
+	for (i = 0; i < actual_channels; i++)
+		ret |= dma_work_wait(&works[i]);
+	if (ret)
+		goto err_cleanup;
 
 	/*
 	 * All folios copied; mark each dst with FOLIO_CONTENT_COPIED so
@@ -448,16 +465,20 @@ static int folios_copy_dma(struct list_head *dst_list,
 	list_for_each_entry(dst, dst_list, lru)
 		dst->migrate_info |= FOLIO_CONTENT_COPIED;
 
-	cleanup_dma_work(works, actual_channels, false);
+	cleanup_dma_work(works, actual_channels);
 	dcbm_release_channels(chan_mask);
 
 	atomic_long_add(nr_folios, &folios_migrated);
 	return 0;
 
+err_wait:
+	/* Whatever was queued before the failure runs out. */
+	for (i = 0; i < actual_channels; i++)
+		dma_work_wait(&works[i]);
 err_cleanup:
 	pr_warn_ratelimited("dcbm: DMA copy failed (%d), falling back to CPU\n",
 			    ret);
-	cleanup_dma_work(works, actual_channels, true);
+	cleanup_dma_work(works, actual_channels);
 	dcbm_release_channels(chan_mask);
 
 	atomic_long_add(nr_folios, &folios_failures);
@@ -693,6 +714,9 @@ static const struct kernel_param_ops batches_refused_param_ops = {
 };
 module_param_cb(batches_refused, &batches_refused_param_ops, NULL, 0644);
 MODULE_PARM_DESC(batches_refused, "Batches refused because all channels were busy (write to reset)");
+
+module_param(cache_ctrl, bool, 0644);
+MODULE_PARM_DESC(cache_ctrl, "Request cache-allocating writes (DMA_PREP_CACHE_CONTROL)");
 
 module_param(sg_elems, uint, 0644);
 MODULE_PARM_DESC(sg_elems, "Folios per scatter-gather transaction on DMA_MEMCPY_SG providers");
