@@ -16,8 +16,16 @@
 #include <linux/migrate.h>
 #include <linux/migrate_copy_offload.h>
 #include <linux/mutex.h>
+#include <linux/scatterlist.h>
+#include <linux/slab.h>
 
 #define MAX_DMA_CHANNELS	16
+/*
+ * Folios per scatter-gather transaction. A provider that supports
+ * DMA_MEMCPY_SG turns one transaction into one hardware batch, so
+ * this bounds the batch element count it must accept.
+ */
+#define DCBM_SG_ELEMS_DEFAULT	32
 
 static atomic_long_t folios_migrated;
 static atomic_long_t folios_failures;
@@ -25,6 +33,7 @@ static atomic_long_t batches_refused;
 
 static bool offloading_enabled;
 static unsigned int nr_dma_channels = 1;
+static unsigned int sg_elems = DCBM_SG_ELEMS_DEFAULT;
 static DEFINE_MUTEX(dcbm_mutex);
 
 /*
@@ -253,16 +262,87 @@ static void cleanup_dma_work(struct dma_work *works, int actual_channels,
 	kfree(works);
 }
 
+static int submit_one(struct dma_work *work, struct dma_async_tx_descriptor *tx)
+{
+	dma_cookie_t cookie;
+
+	tx->callback_result = dma_completion_callback;
+	tx->callback_param = work;
+	atomic_inc(&work->pending);
+
+	cookie = dmaengine_submit(tx);
+	if (dma_submit_error(cookie)) {
+		atomic_dec(&work->pending);
+		return -EIO;
+	}
+	return 0;
+}
+
+/*
+ * Hand the copies to the provider as scatter-gather transactions of
+ * up to sg_elems folios each. A batch-capable engine such as DSA
+ * executes one transaction as one hardware batch descriptor, so the
+ * submission cost is paid once per sg_elems folios instead of once
+ * per folio. The scatterlists carry the DMA addresses mapped by
+ * map_folios(); they are not mapped again.
+ */
+static int submit_sg_transfers(struct dma_work *work, unsigned long flags)
+{
+	struct scatterlist *src_sg, *dst_sg;
+	unsigned int elems = READ_ONCE(sg_elems);
+	unsigned int done = 0;
+	int ret = 0;
+
+	src_sg = kmalloc_array(2 * elems, sizeof(*src_sg), GFP_KERNEL);
+	if (!src_sg)
+		return -ENOMEM;
+	dst_sg = src_sg + elems;
+
+	while (done < work->nr_copies) {
+		unsigned int n = min(elems, work->nr_copies - done);
+		struct dma_async_tx_descriptor *tx;
+		unsigned int i;
+
+		sg_init_table(src_sg, n);
+		sg_init_table(dst_sg, n);
+		for (i = 0; i < n; i++) {
+			struct dcbm_copy *copy = &work->copies[done + i];
+
+			sg_dma_address(&src_sg[i]) = copy->src;
+			sg_dma_len(&src_sg[i]) = copy->len;
+			sg_dma_address(&dst_sg[i]) = copy->dst;
+			sg_dma_len(&dst_sg[i]) = copy->len;
+		}
+
+		tx = dmaengine_prep_dma_memcpy_sg(work->chan, dst_sg, n,
+						  src_sg, n, flags);
+		if (!tx) {
+			ret = -EIO;
+			break;
+		}
+		ret = submit_one(work, tx);
+		if (ret)
+			break;
+		done += n;
+	}
+
+	kfree(src_sg);
+	return ret;
+}
+
 static int submit_dma_transfers(struct dma_work *work)
 {
 	struct dma_async_tx_descriptor *tx;
 	unsigned long flags = DMA_CTRL_ACK | DMA_PREP_INTERRUPT;
-	dma_cookie_t cookie;
 	unsigned int i;
+	int ret;
 
 	/* Submission reference, dropped by dma_work_done_submitting(). */
 	atomic_set(&work->pending, 1);
 	atomic_set(&work->error, 0);
+
+	if (dma_has_cap(DMA_MEMCPY_SG, work->chan->device->cap_mask))
+		return submit_sg_transfers(work, flags);
 
 	for (i = 0; i < work->nr_copies; i++) {
 		struct dcbm_copy *copy = &work->copies[i];
@@ -272,15 +352,9 @@ static int submit_dma_transfers(struct dma_work *work)
 		if (!tx)
 			return -EIO;
 
-		tx->callback_result = dma_completion_callback;
-		tx->callback_param = work;
-		atomic_inc(&work->pending);
-
-		cookie = dmaengine_submit(tx);
-		if (dma_submit_error(cookie)) {
-			atomic_dec(&work->pending);
-			return -EIO;
-		}
+		ret = submit_one(work, tx);
+		if (ret)
+			return ret;
 	}
 	return 0;
 }
@@ -619,6 +693,9 @@ static const struct kernel_param_ops batches_refused_param_ops = {
 };
 module_param_cb(batches_refused, &batches_refused_param_ops, NULL, 0644);
 MODULE_PARM_DESC(batches_refused, "Batches refused because all channels were busy (write to reset)");
+
+module_param(sg_elems, uint, 0644);
+MODULE_PARM_DESC(sg_elems, "Folios per scatter-gather transaction on DMA_MEMCPY_SG providers");
 
 static int __init dcbm_init(void)
 {
