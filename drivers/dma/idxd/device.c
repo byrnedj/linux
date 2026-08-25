@@ -1409,7 +1409,6 @@ void idxd_wq_free_irq(struct idxd_wq *wq)
 void idxd_wq_flush_descs(struct idxd_wq *wq)
 {
 	struct idxd_irq_entry *ie = &wq->ie;
-	struct idxd_device *idxd = wq->idxd;
 
 	guard(mutex)(&wq->wq_lock);
 
@@ -1417,10 +1416,6 @@ void idxd_wq_flush_descs(struct idxd_wq *wq)
 		return;
 
 	idxd_flush_pending_descs(ie);
-	if (idxd->request_int_handles)
-		idxd_device_release_int_handle(idxd, ie->int_handle, IDXD_IRQ_MSIX);
-	idxd_device_clear_perm_entry(idxd, ie);
-	ie->int_handle = INVALID_INT_HANDLE;
 }
 
 int idxd_wq_request_irq(struct idxd_wq *wq)
