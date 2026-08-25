@@ -13,10 +13,12 @@
 #include <linux/module.h>
 #include <linux/dma-mapping.h>
 #include <linux/dmaengine.h>
+#include <linux/highmem.h>
 #include <linux/migrate.h>
 #include <linux/mm_offload.h>
 #include <linux/mutex.h>
 #include <linux/scatterlist.h>
+#include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/wait.h>
 
@@ -34,16 +36,24 @@
  * most this many descriptors before waiting for completions.
  */
 #define DCBM_MAX_INFLIGHT_DEFAULT	32
+/* Matches FOLIO_ZERO_LOCALITY_RADIUS in mm/memory.c */
+#define DCBM_WARM_RADIUS	2
+/* Aim for one fill chunk per this many bytes when spreading over channels */
+#define DCBM_CLEAR_CHUNK_BYTES	SZ_2M
 
 static atomic_long_t folios_migrated;
 static atomic_long_t folios_failures;
 static atomic_long_t batches_refused;
+static atomic_long_t folios_cleared;
+static atomic_long_t clear_failures;
 
 static bool offloading_enabled;
 static unsigned int nr_dma_channels = 1;
 static unsigned int sg_elems = DCBM_SG_ELEMS_DEFAULT;
 static unsigned int max_inflight = DCBM_MAX_INFLIGHT_DEFAULT;
 static bool cache_ctrl = true;
+static unsigned long min_clear_bytes = SZ_2M;
+static bool cpu_warm = true;
 static DEFINE_MUTEX(dcbm_mutex);
 
 /*
@@ -563,9 +573,153 @@ static int dcbm_get_channels(void)
 	return nr_channels ? 0 : -ENODEV;
 }
 
+/*
+ * Split [addr, addr + len) into one chunk per claimed channel (but no
+ * chunk smaller than DCBM_CLEAR_CHUNK_BYTES) and submit one memset per
+ * chunk, each with its own completion.
+ */
+static int submit_clear_range(struct dma_work *work, unsigned long chan_mask,
+			      dma_addr_t addr, size_t len, unsigned long flags)
+{
+	unsigned int nchunks = clamp_t(size_t, len / DCBM_CLEAR_CHUNK_BYTES,
+				       1, hweight_long(chan_mask));
+	size_t chunk = DIV_ROUND_UP(len, nchunks);
+	unsigned int idx = find_first_bit(&chan_mask, MAX_DMA_CHANNELS);
+
+	while (len) {
+		size_t this_len = min(chunk, len);
+		struct dma_async_tx_descriptor *tx;
+		int ret;
+
+		dma_work_throttle(work);
+		tx = dmaengine_prep_dma_memset(channels[idx].chan, addr, 0,
+					       this_len, flags);
+		if (!tx)
+			return -EIO;
+
+		ret = submit_one(work, tx);
+		if (ret)
+			return ret;
+
+		addr += this_len;
+		len -= this_len;
+
+		idx = find_next_bit(&chan_mask, MAX_DMA_CHANNELS, idx + 1);
+		if (idx >= MAX_DMA_CHANNELS)
+			idx = find_first_bit(&chan_mask, MAX_DMA_CHANNELS);
+	}
+	return 0;
+}
+
+/**
+ * folio_clear_dma - zero a folio via DMA memset
+ * @folio: folio to zero, not yet visible to anyone
+ * @addr_hint: user address expected to be touched first, or 0
+ *
+ * The folio is mapped once against one device and its fills spread
+ * over that device's channels. With cpu_warm the pages around
+ * @addr_hint are cleared on the CPU concurrently, so the first touch
+ * after the fault hits cache.
+ *
+ * Return: 0 on success, negative errno on failure (the caller clears
+ * on the CPU).
+ */
+static int folio_clear_dma(struct folio *folio, unsigned long addr_hint)
+{
+	const size_t size = folio_size(folio);
+	const long nr_pages = folio_nr_pages(folio);
+	const unsigned long base_addr = ALIGN_DOWN(addr_hint, size);
+	unsigned long flags = DMA_CTRL_ACK | DMA_PREP_INTERRUPT;
+	struct dma_work work = {};
+	struct dcbm_group *grp;
+	unsigned long chan_mask;
+	dma_addr_t dma_base;
+	long ws = 0, we = -1, pg;
+	unsigned int i;
+	int ret;
+
+	if (size < READ_ONCE(min_clear_bytes))
+		return -ENODEV;
+
+	chan_mask = dcbm_claim_channels(
+			clamp_t(size_t, size / DCBM_CLEAR_CHUNK_BYTES, 1,
+				nr_channels), folio_nid(folio), &grp);
+	if (!chan_mask)
+		return -EBUSY;
+
+	i = find_first_bit(&chan_mask, MAX_DMA_CHANNELS);
+	if (!dma_has_cap(DMA_MEMSET, channels[i].chan->device->cap_mask)) {
+		ret = -EOPNOTSUPP;
+		goto out_release;
+	}
+
+	work.dev = grp->dev;
+	dma_base = dma_map_page_attrs(work.dev, folio_page(folio, 0), 0, size,
+				      DMA_FROM_DEVICE, 0);
+	if (dma_mapping_error(work.dev, dma_base)) {
+		ret = -EIO;
+		goto out_release;
+	}
+
+	dma_work_init(&work);
+
+	if (READ_ONCE(cache_ctrl))
+		flags |= DMA_PREP_CACHE_CONTROL;
+
+	/*
+	 * Leave the faulting neighbourhood to the CPU: it overlaps with
+	 * the fills and its cachelines stay hot for the first touch.
+	 */
+	if (READ_ONCE(cpu_warm) && addr_hint) {
+		long fault_idx = (addr_hint - base_addr) >> PAGE_SHIFT;
+
+		ws = max(fault_idx - DCBM_WARM_RADIUS, 0L);
+		we = min(fault_idx + DCBM_WARM_RADIUS, nr_pages - 1);
+	}
+
+	ret = 0;
+	if (ws > 0)
+		ret = submit_clear_range(&work, chan_mask, dma_base,
+					 ws * PAGE_SIZE, flags);
+	if (!ret && we < nr_pages - 1)
+		ret = submit_clear_range(&work, chan_mask,
+					 dma_base + (we + 1) * PAGE_SIZE,
+					 (nr_pages - 1 - we) * PAGE_SIZE, flags);
+	for_each_set_bit(i, &chan_mask, nr_channels)
+		dma_async_issue_pending(channels[i].chan);
+
+	if (!ret)
+		for (pg = ws; pg <= we; pg++)
+			clear_user_highpage(folio_page(folio, pg),
+					    base_addr + pg * PAGE_SIZE);
+
+	/*
+	 * Whatever was queued runs out before the folio is unmapped and
+	 * handed back for CPU clearing; see dma_work_wait().
+	 */
+	dma_work_done_submitting(&work);
+	work.submitted = true;
+	ret |= dma_work_wait(&work);
+	dma_unmap_page_attrs(work.dev, dma_base, size, DMA_FROM_DEVICE, 0);
+	if (ret)
+		goto out_release;
+
+	dcbm_release_channels(chan_mask);
+	atomic_long_inc(&folios_cleared);
+	return 0;
+
+out_release:
+	dcbm_release_channels(chan_mask);
+	atomic_long_inc(&clear_failures);
+	pr_warn_ratelimited("dcbm: DMA clear failed (%d), falling back to CPU\n",
+			    ret);
+	return ret;
+}
+
 static const struct mm_offload_provider dma_migrator = {
 	.name = "DCBM",
 	.copy_folios = folios_copy_dma,
+	.clear_folio = folio_clear_dma,
 	.owner = THIS_MODULE,
 };
 
@@ -741,6 +895,48 @@ static const struct kernel_param_ops batches_refused_param_ops = {
 };
 module_param_cb(batches_refused, &batches_refused_param_ops, NULL, 0644);
 MODULE_PARM_DESC(batches_refused, "Batches refused because all channels were busy (write to reset)");
+
+static int folios_cleared_param_set(const char *val, const struct kernel_param *kp)
+{
+	atomic_long_set(&folios_cleared, 0);
+	return 0;
+}
+
+static int folios_cleared_param_get(char *buffer, const struct kernel_param *kp)
+{
+	return sysfs_emit(buffer, "%ld\n", atomic_long_read(&folios_cleared));
+}
+
+static const struct kernel_param_ops folios_cleared_param_ops = {
+	.set = folios_cleared_param_set,
+	.get = folios_cleared_param_get,
+};
+module_param_cb(folios_cleared, &folios_cleared_param_ops, NULL, 0644);
+MODULE_PARM_DESC(folios_cleared, "Folios DMA-cleared (write to reset)");
+
+static int clear_failures_param_set(const char *val, const struct kernel_param *kp)
+{
+	atomic_long_set(&clear_failures, 0);
+	return 0;
+}
+
+static int clear_failures_param_get(char *buffer, const struct kernel_param *kp)
+{
+	return sysfs_emit(buffer, "%ld\n", atomic_long_read(&clear_failures));
+}
+
+static const struct kernel_param_ops clear_failures_param_ops = {
+	.set = clear_failures_param_set,
+	.get = clear_failures_param_get,
+};
+module_param_cb(clear_failures, &clear_failures_param_ops, NULL, 0644);
+MODULE_PARM_DESC(clear_failures, "DMA-clear failure count (write to reset)");
+
+module_param(min_clear_bytes, ulong, 0644);
+MODULE_PARM_DESC(min_clear_bytes, "Smallest folio to clear by DMA (bytes)");
+
+module_param(cpu_warm, bool, 0644);
+MODULE_PARM_DESC(cpu_warm, "Clear the faulting neighbourhood on the CPU while DMA clears the rest");
 
 module_param(cache_ctrl, bool, 0644);
 MODULE_PARM_DESC(cache_ctrl, "Request cache-allocating writes (DMA_PREP_CACHE_CONTROL)");
