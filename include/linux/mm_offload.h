@@ -71,6 +71,7 @@ int migrate_offload_batch_copy(struct list_head *dst_batch,
 		struct list_head *src_batch, unsigned int nr_batch);
 int mm_offload_clear_folio(struct folio *folio, unsigned long addr_hint);
 bool mm_offload_cpus_saturated(void);
+struct folio *prezero_pool_get(int nid);
 
 /*
  * Cheap availability test for hot paths: a static branch, patched only
@@ -106,6 +107,7 @@ static inline int mm_offload_clear_folio(struct folio *folio,
 		unsigned long addr_hint) { return -EOPNOTSUPP; }
 static inline bool mm_offload_clear_available(void) { return false; }
 static inline bool mm_offload_cpus_saturated(void) { return false; }
+static inline struct folio *prezero_pool_get(int nid) { return NULL; }
 #endif
 
 #endif /* _LINUX_MM_OFFLOAD_H */

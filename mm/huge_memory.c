@@ -5,6 +5,7 @@
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
+#include <linux/mm_offload.h>
 #include <linux/mm.h>
 #include <linux/sched.h>
 #include <linux/sched/mm.h>
@@ -1308,9 +1309,19 @@ static struct folio *vma_alloc_anon_folio_pmd(struct vm_area_struct *vma,
 {
 	gfp_t gfp = vma_thp_gfp_mask(vma);
 	const int order = HPAGE_PMD_ORDER;
+	bool prezeroed = false;
 	struct folio *folio;
 
-	folio = vma_alloc_folio(gfp, order, vma, addr & HPAGE_PMD_MASK);
+	/*
+	 * A pre-zeroed pool folio makes the fault a mapping operation
+	 * only. It trades the faulting-neighbourhood cache warmth of
+	 * fault-time zeroing for doing no zeroing here at all.
+	 */
+	folio = prezero_pool_get(numa_node_id());
+	if (folio)
+		prezeroed = true;
+	else
+		folio = vma_alloc_folio(gfp, order, vma, addr & HPAGE_PMD_MASK);
 
 	if (unlikely(!folio)) {
 		count_vm_event(THP_FAULT_FALLBACK);
@@ -1343,7 +1354,7 @@ static struct folio *vma_alloc_anon_folio_pmd(struct vm_area_struct *vma,
 	* make sure that the page corresponding to the faulting address will be
 	* hot in the cache after zeroing.
 	*/
-	if (user_alloc_needs_zeroing())
+	if (!prezeroed && user_alloc_needs_zeroing())
 		folio_zero_user(folio, addr);
 	/*
 	 * The memory barrier inside __folio_mark_uptodate makes sure that
