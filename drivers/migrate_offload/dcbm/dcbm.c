@@ -53,15 +53,20 @@ static struct dcbm_group {
 static unsigned int nr_groups;
 static atomic_t group_cursor;
 
+struct dcbm_copy {
+	dma_addr_t src;
+	dma_addr_t dst;
+	size_t len;
+};
+
 struct dma_work {
 	struct dma_chan *chan;
 	struct device *dev;
 	struct completion done;
 	atomic_t pending;
 	atomic_t error;
-	struct sg_table *src_sgt;
-	struct sg_table *dst_sgt;
-	bool mapped;
+	struct dcbm_copy *copies;
+	unsigned int nr_copies;
 };
 
 /*
@@ -169,91 +174,70 @@ static void dcbm_release_channels(unsigned long mask)
 		mutex_unlock(&channels[i].lock);
 }
 
-static int setup_sg_tables(struct dma_work *work, struct list_head **src_pos,
-			   struct list_head **dst_pos, int nr)
+/*
+ * Map each folio of the slice on its own. A folio is physically
+ * contiguous, so it is one DMA segment, and the source and
+ * destination of a copy pair up by folio rather than by whatever
+ * segments an IOMMU would merge two scatterlists into.
+ */
+static int map_folios(struct dma_work *work, struct list_head **src_pos,
+		      struct list_head **dst_pos, unsigned int nr)
 {
-	struct scatterlist *sg_src, *sg_dst;
-	struct device *dev;
-	int i, ret;
+	struct device *dev = work->dev;
+	unsigned int i;
 
-	work->src_sgt = kmalloc_obj(*work->src_sgt, GFP_KERNEL);
-	if (!work->src_sgt)
+	work->copies = kcalloc(nr, sizeof(*work->copies), GFP_KERNEL);
+	if (!work->copies)
 		return -ENOMEM;
-	work->dst_sgt = kmalloc_obj(*work->dst_sgt, GFP_KERNEL);
-	if (!work->dst_sgt) {
-		ret = -ENOMEM;
-		goto err_free_src;
-	}
 
-	ret = sg_alloc_table(work->src_sgt, nr, GFP_KERNEL);
-	if (ret)
-		goto err_free_dst;
-	ret = sg_alloc_table(work->dst_sgt, nr, GFP_KERNEL);
-	if (ret)
-		goto err_free_src_table;
-
-	sg_src = work->src_sgt->sgl;
-	sg_dst = work->dst_sgt->sgl;
 	for (i = 0; i < nr; i++) {
 		struct folio *src = list_entry(*src_pos, struct folio, lru);
 		struct folio *dst = list_entry(*dst_pos, struct folio, lru);
+		struct dcbm_copy *copy = &work->copies[i];
 
-		sg_set_folio(sg_src, src, folio_size(src), 0);
-		sg_set_folio(sg_dst, dst, folio_size(dst), 0);
+		copy->len = folio_size(src);
+		copy->src = dma_map_page_attrs(dev, folio_page(src, 0), 0,
+					       copy->len, DMA_TO_DEVICE, 0);
+		if (dma_mapping_error(dev, copy->src))
+			goto err;
+		copy->dst = dma_map_page_attrs(dev, folio_page(dst, 0), 0,
+					       copy->len, DMA_FROM_DEVICE, 0);
+		if (dma_mapping_error(dev, copy->dst)) {
+			dma_unmap_page_attrs(dev, copy->src, copy->len,
+					     DMA_TO_DEVICE, 0);
+			goto err;
+		}
+		work->nr_copies++;
 
 		*src_pos = (*src_pos)->next;
 		*dst_pos = (*dst_pos)->next;
-
-		if (i < nr - 1) {
-			sg_src = sg_next(sg_src);
-			sg_dst = sg_next(sg_dst);
-		}
 	}
-
-	dev = work->dev;
-	ret = dma_map_sgtable(dev, work->src_sgt, DMA_TO_DEVICE,
-			      DMA_ATTR_SKIP_CPU_SYNC | DMA_ATTR_NO_KERNEL_MAPPING);
-	if (ret)
-		goto err_free_dst_table;
-	ret = dma_map_sgtable(dev, work->dst_sgt, DMA_FROM_DEVICE,
-			      DMA_ATTR_SKIP_CPU_SYNC | DMA_ATTR_NO_KERNEL_MAPPING);
-	if (ret)
-		goto err_unmap_src;
-
-	/*
-	 * TODO: IOMMU may merge segments unevenly on the two sides, fall back
-	 * bail to CPU copy. In practice, I have not observed merging in tests.
-	 * Handling unequal nents is left for follow-up.
-	 */
-	if (work->src_sgt->nents != work->dst_sgt->nents) {
-		ret = -EINVAL;
-		goto err_unmap_dst;
-	}
-	work->mapped = true;
 	return 0;
-
-err_unmap_dst:
-	dma_unmap_sgtable(dev, work->dst_sgt, DMA_FROM_DEVICE,
-			  DMA_ATTR_SKIP_CPU_SYNC | DMA_ATTR_NO_KERNEL_MAPPING);
-err_unmap_src:
-	dma_unmap_sgtable(dev, work->src_sgt, DMA_TO_DEVICE,
-			  DMA_ATTR_SKIP_CPU_SYNC | DMA_ATTR_NO_KERNEL_MAPPING);
-err_free_dst_table:
-	sg_free_table(work->dst_sgt);
-err_free_src_table:
-	sg_free_table(work->src_sgt);
-err_free_dst:
-	kfree(work->dst_sgt);
-	work->dst_sgt = NULL;
-err_free_src:
-	kfree(work->src_sgt);
-	work->src_sgt = NULL;
-	return ret;
+err:
+	/* The mapped prefix is undone by cleanup_dma_work(). */
+	return -EIO;
 }
 
-static void cleanup_dma_work(struct dma_work *works, int actual_channels)
+static void unmap_folios(struct dma_work *work)
 {
-	struct device *dev;
+	unsigned int i;
+
+	for (i = 0; i < work->nr_copies; i++) {
+		struct dcbm_copy *copy = &work->copies[i];
+
+		dma_unmap_page_attrs(work->dev, copy->dst, copy->len,
+				     DMA_FROM_DEVICE, 0);
+		dma_unmap_page_attrs(work->dev, copy->src, copy->len,
+				     DMA_TO_DEVICE, 0);
+	}
+	work->nr_copies = 0;
+	kfree(work->copies);
+	work->copies = NULL;
+}
+
+static void cleanup_dma_work(struct dma_work *works, int actual_channels,
+			     bool terminate)
+{
 	int i;
 
 	if (!works)
@@ -262,53 +246,29 @@ static void cleanup_dma_work(struct dma_work *works, int actual_channels)
 	for (i = 0; i < actual_channels; i++) {
 		if (!works[i].chan)
 			continue;
-
-		dev = works[i].dev;
-
-		if (works[i].mapped)
+		if (terminate && works[i].copies)
 			dmaengine_terminate_sync(works[i].chan);
-
-		if (dev && works[i].mapped) {
-			if (works[i].src_sgt) {
-				dma_unmap_sgtable(dev, works[i].src_sgt,
-						  DMA_TO_DEVICE,
-						  DMA_ATTR_SKIP_CPU_SYNC |
-						  DMA_ATTR_NO_KERNEL_MAPPING);
-				sg_free_table(works[i].src_sgt);
-				kfree(works[i].src_sgt);
-			}
-			if (works[i].dst_sgt) {
-				dma_unmap_sgtable(dev, works[i].dst_sgt,
-						  DMA_FROM_DEVICE,
-						  DMA_ATTR_SKIP_CPU_SYNC |
-						  DMA_ATTR_NO_KERNEL_MAPPING);
-				sg_free_table(works[i].dst_sgt);
-				kfree(works[i].dst_sgt);
-			}
-		}
+		unmap_folios(&works[i]);
 	}
 	kfree(works);
 }
 
 static int submit_dma_transfers(struct dma_work *work)
 {
-	struct scatterlist *sg_src, *sg_dst;
 	struct dma_async_tx_descriptor *tx;
 	unsigned long flags = DMA_CTRL_ACK | DMA_PREP_INTERRUPT;
 	dma_cookie_t cookie;
-	int i;
+	unsigned int i;
 
 	/* Submission reference, dropped by dma_work_done_submitting(). */
 	atomic_set(&work->pending, 1);
 	atomic_set(&work->error, 0);
 
-	sg_src = work->src_sgt->sgl;
-	sg_dst = work->dst_sgt->sgl;
-	for_each_sgtable_dma_sg(work->src_sgt, sg_src, i) {
-		tx = dmaengine_prep_dma_memcpy(work->chan,
-					       sg_dma_address(sg_dst),
-					       sg_dma_address(sg_src),
-					       sg_dma_len(sg_src), flags);
+	for (i = 0; i < work->nr_copies; i++) {
+		struct dcbm_copy *copy = &work->copies[i];
+
+		tx = dmaengine_prep_dma_memcpy(work->chan, copy->dst, copy->src,
+					       copy->len, flags);
 		if (!tx)
 			return -EIO;
 
@@ -321,7 +281,6 @@ static int submit_dma_transfers(struct dma_work *work)
 			atomic_dec(&work->pending);
 			return -EIO;
 		}
-		sg_dst = sg_next(sg_dst);
 	}
 	return 0;
 }
@@ -377,14 +336,14 @@ static int folios_copy_dma(struct list_head *dst_list,
 		if (folios_per_chan == 0)
 			continue;
 
-		ret = setup_sg_tables(&works[i], &src_pos, &dst_pos,
-				      folios_per_chan);
+		ret = map_folios(&works[i], &src_pos, &dst_pos,
+				 folios_per_chan);
 		if (ret)
 			goto err_cleanup;
 	}
 
 	for (i = 0; i < actual_channels; i++) {
-		if (!works[i].mapped)
+		if (!works[i].copies)
 			continue;
 		ret = submit_dma_transfers(&works[i]);
 		if (ret) {
@@ -396,7 +355,7 @@ static int folios_copy_dma(struct list_head *dst_list,
 	}
 
 	for (i = 0; i < actual_channels; i++) {
-		if (!works[i].mapped)
+		if (!works[i].copies)
 			continue;
 		if (!wait_for_completion_timeout(&works[i].done,
 						 msecs_to_jiffies(10000))) {
@@ -415,7 +374,7 @@ static int folios_copy_dma(struct list_head *dst_list,
 	list_for_each_entry(dst, dst_list, lru)
 		dst->migrate_info |= FOLIO_CONTENT_COPIED;
 
-	cleanup_dma_work(works, actual_channels);
+	cleanup_dma_work(works, actual_channels, false);
 	dcbm_release_channels(chan_mask);
 
 	atomic_long_add(nr_folios, &folios_migrated);
@@ -424,7 +383,7 @@ static int folios_copy_dma(struct list_head *dst_list,
 err_cleanup:
 	pr_warn_ratelimited("dcbm: DMA copy failed (%d), falling back to CPU\n",
 			    ret);
-	cleanup_dma_work(works, actual_channels);
+	cleanup_dma_work(works, actual_channels, true);
 	dcbm_release_channels(chan_mask);
 
 	atomic_long_add(nr_folios, &folios_failures);
