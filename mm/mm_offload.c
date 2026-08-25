@@ -13,8 +13,22 @@
 #include <linux/sysfs.h>
 
 DEFINE_STATIC_KEY_FALSE(mm_offload_copy_folios_enabled);
+DEFINE_STATIC_KEY_FALSE(mm_offload_clear_folio_enabled);
+EXPORT_SYMBOL_GPL(mm_offload_clear_folio_enabled);
 DEFINE_SRCU(mm_offload_srcu);
 DEFINE_STATIC_CALL(mm_offload_copy_folios_fn, migrate_folios_mc_copy);
+
+/*
+ * Default clear target. Only reachable in the narrow window where a
+ * caller saw the static branch enabled while the provider was being
+ * torn down; the caller falls back to CPU clearing.
+ */
+static int mm_offload_clear_folio_null(struct folio *folio,
+				       unsigned long addr_hint)
+{
+	return -ENXIO;
+}
+DEFINE_STATIC_CALL(mm_offload_clear_folio_fn, mm_offload_clear_folio_null);
 
 static DEFINE_MUTEX(provider_mutex);
 static const struct mm_offload_provider *active_provider;
@@ -130,6 +144,30 @@ int migrate_offload_batch_copy(struct list_head *dst_batch,
 }
 
 /**
+ * mm_offload_clear_folio - zero a folio through the registered provider.
+ * @folio: folio to zero.
+ * @addr_hint: user address expected to be touched first, or 0.
+ *
+ * May sleep. The caller must hold a reference on @folio and the folio
+ * must not be visible to any other user (no page table entries, not on
+ * the LRU). On failure the folio contents are unspecified and the
+ * caller must zero it by other means before exposing it.
+ *
+ * Return: 0 when the folio is fully zeroed, negative errno otherwise.
+ */
+int mm_offload_clear_folio(struct folio *folio, unsigned long addr_hint)
+{
+	int idx, rc;
+
+	might_sleep();
+
+	idx = srcu_read_lock(&mm_offload_srcu);
+	rc = static_call(mm_offload_clear_folio_fn)(folio, addr_hint);
+	srcu_read_unlock(&mm_offload_srcu, idx);
+	return rc;
+}
+
+/**
  * mm_offload_set_migrate_reason_mask - update the active provider's migration reason mask.
  * @p: provider (must be the currently active one).
  * @mask: new reason mask.
@@ -171,7 +209,7 @@ int mm_offload_register(const struct mm_offload_provider *p,
 	unsigned long mask;
 	int ret = 0;
 
-	if (!p || !p->copy_folios)
+	if (!p || (!p->copy_folios && !p->clear_folio))
 		return -EINVAL;
 
 	mask = migrate_reason_mask & MIGRATE_OFFLOAD_REASONS_ALLOWED;
@@ -188,10 +226,16 @@ int mm_offload_register(const struct mm_offload_provider *p,
 		goto unlock;
 	}
 
-	WRITE_ONCE(active_reason_mask, mask);
-	static_call_update(mm_offload_copy_folios_fn, p->copy_folios);
 	active_provider = p;
-	static_branch_enable(&mm_offload_copy_folios_enabled);
+	if (p->copy_folios) {
+		WRITE_ONCE(active_reason_mask, mask);
+		static_call_update(mm_offload_copy_folios_fn, p->copy_folios);
+		static_branch_enable(&mm_offload_copy_folios_enabled);
+	}
+	if (p->clear_folio) {
+		static_call_update(mm_offload_clear_folio_fn, p->clear_folio);
+		static_branch_enable(&mm_offload_clear_folio_enabled);
+	}
 
 unlock:
 	mutex_unlock(&provider_mutex);
@@ -229,12 +273,20 @@ int mm_offload_unregister(const struct mm_offload_provider *p)
 	}
 
 	/*
-	 * Disable the static branch first so new migrate_pages_batch() calls
-	 * cannot enter the batch path.
+	 * Disable the static branches first so new callers take the CPU
+	 * paths.
 	 */
-	static_branch_disable(&mm_offload_copy_folios_enabled);
-	WRITE_ONCE(active_reason_mask, 0);
-	static_call_update(mm_offload_copy_folios_fn, migrate_folios_mc_copy);
+	if (p->copy_folios) {
+		static_branch_disable(&mm_offload_copy_folios_enabled);
+		WRITE_ONCE(active_reason_mask, 0);
+		static_call_update(mm_offload_copy_folios_fn,
+				   migrate_folios_mc_copy);
+	}
+	if (p->clear_folio) {
+		static_branch_disable(&mm_offload_clear_folio_enabled);
+		static_call_update(mm_offload_clear_folio_fn,
+				   mm_offload_clear_folio_null);
+	}
 	owner = active_provider->owner;
 	active_provider = NULL;
 	mutex_unlock(&provider_mutex);
