@@ -18,6 +18,7 @@
 #include <linux/mutex.h>
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
+#include <linux/wait.h>
 
 #define MAX_DMA_CHANNELS	16
 /*
@@ -26,6 +27,13 @@
  * this bounds the batch element count it must accept.
  */
 #define DCBM_SG_ELEMS_DEFAULT	32
+/*
+ * Descriptors in flight per channel. A DSA work queue owns a fixed
+ * descriptor pool (its queue depth, 64 in a typical configuration)
+ * and prep returns NULL once it is exhausted, so a slice submits at
+ * most this many descriptors before waiting for completions.
+ */
+#define DCBM_MAX_INFLIGHT_DEFAULT	32
 
 static atomic_long_t folios_migrated;
 static atomic_long_t folios_failures;
@@ -34,6 +42,7 @@ static atomic_long_t batches_refused;
 static bool offloading_enabled;
 static unsigned int nr_dma_channels = 1;
 static unsigned int sg_elems = DCBM_SG_ELEMS_DEFAULT;
+static unsigned int max_inflight = DCBM_MAX_INFLIGHT_DEFAULT;
 static bool cache_ctrl = true;
 static DEFINE_MUTEX(dcbm_mutex);
 
@@ -72,7 +81,7 @@ struct dcbm_copy {
 struct dma_work {
 	struct dma_chan *chan;
 	struct device *dev;
-	struct completion done;
+	wait_queue_head_t waitq;
 	atomic_t pending;
 	atomic_t error;
 	struct dcbm_copy *copies;
@@ -100,14 +109,33 @@ static void dma_completion_callback(void *data,
 	if (!result || result->result != DMA_TRANS_NOERROR)
 		atomic_set(&work->error, -EIO);
 
-	if (atomic_dec_and_test(&work->pending))
-		complete(&work->done);
+	atomic_dec(&work->pending);
+	wake_up(&work->waitq);
+}
+
+static void dma_work_init(struct dma_work *work)
+{
+	init_waitqueue_head(&work->waitq);
+	/* Submission reference, dropped by dma_work_done_submitting(). */
+	atomic_set(&work->pending, 1);
+	atomic_set(&work->error, 0);
 }
 
 static void dma_work_done_submitting(struct dma_work *work)
 {
-	if (atomic_dec_and_test(&work->pending))
-		complete(&work->done);
+	atomic_dec(&work->pending);
+	wake_up(&work->waitq);
+}
+
+/*
+ * Throttle submission to max_inflight descriptors per channel, so a
+ * slice never outruns the channel's descriptor pool.
+ */
+static void dma_work_throttle(struct dma_work *work)
+{
+	unsigned int limit = READ_ONCE(max_inflight) + 1;
+
+	wait_event(work->waitq, atomic_read(&work->pending) < limit);
 }
 
 static unsigned long dcbm_claim_group(struct dcbm_group *grp,
@@ -260,7 +288,7 @@ static int dma_work_wait(struct dma_work *work)
 {
 	if (!work->submitted)
 		return 0;
-	wait_for_completion(&work->done);
+	wait_event(work->waitq, !atomic_read(&work->pending));
 	return atomic_read(&work->error);
 }
 
@@ -331,6 +359,7 @@ static int submit_sg_transfers(struct dma_work *work, unsigned long flags)
 			sg_dma_len(&dst_sg[i]) = copy->len;
 		}
 
+		dma_work_throttle(work);
 		tx = dmaengine_prep_dma_memcpy_sg(work->chan, dst_sg, n,
 						  src_sg, n, flags);
 		if (!tx) {
@@ -362,9 +391,7 @@ static int submit_dma_transfers(struct dma_work *work)
 	if (READ_ONCE(cache_ctrl))
 		flags |= DMA_PREP_CACHE_CONTROL;
 
-	/* Submission reference, dropped by dma_work_done_submitting(). */
-	atomic_set(&work->pending, 1);
-	atomic_set(&work->error, 0);
+	dma_work_init(work);
 
 	if (dma_has_cap(DMA_MEMCPY_SG, work->chan->device->cap_mask))
 		return submit_sg_transfers(work, flags);
@@ -372,6 +399,7 @@ static int submit_dma_transfers(struct dma_work *work)
 	for (i = 0; i < work->nr_copies; i++) {
 		struct dcbm_copy *copy = &work->copies[i];
 
+		dma_work_throttle(work);
 		tx = dmaengine_prep_dma_memcpy(work->chan, copy->dst, copy->src,
 					       copy->len, flags);
 		if (!tx)
@@ -425,7 +453,6 @@ static int folios_copy_dma(struct list_head *dst_list,
 	for_each_set_bit(idx, &chan_mask, nr_channels) {
 		works[actual_channels].chan = channels[idx].chan;
 		works[actual_channels].dev = grp->dev;
-		init_completion(&works[actual_channels].done);
 		actual_channels++;
 	}
 
@@ -717,6 +744,9 @@ MODULE_PARM_DESC(batches_refused, "Batches refused because all channels were bus
 
 module_param(cache_ctrl, bool, 0644);
 MODULE_PARM_DESC(cache_ctrl, "Request cache-allocating writes (DMA_PREP_CACHE_CONTROL)");
+
+module_param(max_inflight, uint, 0644);
+MODULE_PARM_DESC(max_inflight, "Descriptors in flight per channel before waiting for completions");
 
 module_param(sg_elems, uint, 0644);
 MODULE_PARM_DESC(sg_elems, "Folios per scatter-gather transaction on DMA_MEMCPY_SG providers");
