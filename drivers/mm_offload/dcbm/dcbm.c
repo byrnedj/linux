@@ -14,7 +14,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/dmaengine.h>
 #include <linux/migrate.h>
-#include <linux/migrate_copy_offload.h>
+#include <linux/mm_offload.h>
 #include <linux/mutex.h>
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
@@ -563,9 +563,9 @@ static int dcbm_get_channels(void)
 	return nr_channels ? 0 : -ENODEV;
 }
 
-static const struct migrator dma_migrator = {
+static const struct mm_offload_provider dma_migrator = {
 	.name = "DCBM",
-	.offload_copy = folios_copy_dma,
+	.copy_folios = folios_copy_dma,
 	.owner = THIS_MODULE,
 };
 
@@ -592,7 +592,7 @@ static int offloading_param_set(const char *val, const struct kernel_param *kp)
 			mutex_unlock(&dcbm_mutex);
 			return ret;
 		}
-		ret = migrate_offload_register(&dma_migrator,
+		ret = mm_offload_register(&dma_migrator,
 					       READ_ONCE(dcbm_reason_mask));
 		if (ret) {
 			dcbm_put_channels();
@@ -601,7 +601,7 @@ static int offloading_param_set(const char *val, const struct kernel_param *kp)
 		}
 		WRITE_ONCE(offloading_enabled, true);
 	} else {
-		migrate_offload_unregister(&dma_migrator);
+		mm_offload_unregister(&dma_migrator);
 		/* No batch is in flight past unregister; channels are idle. */
 		dcbm_put_channels();
 		WRITE_ONCE(offloading_enabled, false);
@@ -662,21 +662,21 @@ static int reason_mask_param_set(const char *val, const struct kernel_param *kp)
 	unsigned long mask;
 	int ret;
 
-	ret = migrate_offload_reason_mask_parse(val, &mask);
+	ret = mm_offload_reason_mask_parse(val, &mask);
 	if (ret)
 		return ret;
 
 	mutex_lock(&dcbm_mutex);
 	WRITE_ONCE(dcbm_reason_mask, mask);
 	if (offloading_enabled)
-		migrate_offload_set_reason_mask(&dma_migrator, mask);
+		mm_offload_set_migrate_reason_mask(&dma_migrator, mask);
 	mutex_unlock(&dcbm_mutex);
 	return 0;
 }
 
 static int reason_mask_param_get(char *buffer, const struct kernel_param *kp)
 {
-	return migrate_offload_reason_mask_format(buffer, READ_ONCE(dcbm_reason_mask));
+	return mm_offload_reason_mask_format(buffer, READ_ONCE(dcbm_reason_mask));
 }
 
 static const struct kernel_param_ops reason_mask_param_ops = {
@@ -761,7 +761,7 @@ static void __exit dcbm_exit(void)
 {
 	mutex_lock(&dcbm_mutex);
 	if (offloading_enabled) {
-		migrate_offload_unregister(&dma_migrator);
+		mm_offload_unregister(&dma_migrator);
 		dcbm_put_channels();
 		offloading_enabled = false;
 	}

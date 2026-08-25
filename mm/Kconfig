@@ -701,8 +701,8 @@ config DEVICE_MIGRATION
 	def_bool MIGRATION && ZONE_DEVICE
 
 # Page-migration batch-copy offload infrastructure.
-# Selected by migrator drivers (e.g. CONFIG_DCBM_DMA).
-config MIGRATION_COPY_OFFLOAD
+# Selected by offload provider drivers (e.g. CONFIG_DCBM_DMA).
+config MM_OFFLOAD
 	bool
 	depends on MIGRATION && 64BIT
 
