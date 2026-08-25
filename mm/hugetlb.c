@@ -46,6 +46,7 @@
 #include <linux/io.h>
 #include <linux/node.h>
 #include <linux/page_owner.h>
+#include <linux/mm_offload.h>
 #include "internal.h"
 #include "hugetlb_vmemmap.h"
 #include "hugetlb_cma.h"
@@ -1697,6 +1698,8 @@ void free_huge_folio(struct folio *folio)
 	VM_BUG_ON_FOLIO(folio_mapcount(folio), folio);
 
 	hugetlb_set_folio_subpool(folio, NULL);
+	/* Contents are stale once the folio was mapped; it must be re-zeroed. */
+	folio_clear_hugetlb_prezeroed(folio);
 	if (folio_test_anon(folio))
 		__ClearPageAnonExclusive(&folio->page);
 	folio->mapping = NULL;
@@ -1860,14 +1863,28 @@ static struct folio *only_alloc_fresh_hugetlb_folio(struct hstate *h,
  * Note that returned folio is 'frozen':  ref count of head page and all tail
  * pages is zero, and the accounting must be done in the caller.
  */
+/*
+ * Zero a fresh hugetlb folio ahead of its first fault, so the fault
+ * becomes a mapping operation only. Runs in task context before the
+ * folio is visible in the pool; on any failure the folio simply
+ * stays un-prezeroed and the fault zeroes it as usual.
+ */
+static void hugetlb_prezero_folio(struct folio *folio)
+{
+	if (mm_offload_clear_available() && !mm_offload_clear_folio(folio, 0))
+		folio_set_hugetlb_prezeroed(folio);
+}
+
 static struct folio *alloc_fresh_hugetlb_folio(struct hstate *h,
 		gfp_t gfp_mask, int nid, nodemask_t *nmask)
 {
 	struct folio *folio;
 
 	folio = only_alloc_fresh_hugetlb_folio(h, gfp_mask, nid, nmask, NULL);
-	if (folio)
+	if (folio) {
 		hugetlb_vmemmap_optimize_folio(h, folio);
+		hugetlb_prezero_folio(folio);
+	}
 	return folio;
 }
 
@@ -1879,6 +1896,9 @@ void prep_and_add_allocated_folios(struct hstate *h,
 
 	/* Send list for bulk vmemmap optimization processing */
 	hugetlb_vmemmap_optimize_folios(h, folio_list);
+
+	list_for_each_entry_safe(folio, tmp_f, folio_list, lru)
+		hugetlb_prezero_folio(folio);
 
 	/* Add all new pool pages to free lists in one lock cycle */
 	spin_lock_irqsave(&hugetlb_lock, flags);
@@ -5782,7 +5802,10 @@ static vm_fault_t hugetlb_no_page(struct address_space *mapping,
 				ret = 0;
 			goto out;
 		}
-		folio_zero_user(folio, vmf->real_address);
+		if (folio_test_hugetlb_prezeroed(folio))
+			folio_clear_hugetlb_prezeroed(folio);
+		else
+			folio_zero_user(folio, vmf->real_address);
 		__folio_mark_uptodate(folio);
 		new_folio = true;
 
