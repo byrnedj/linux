@@ -413,8 +413,6 @@ static inline unsigned int evl_size(struct idxd_device *idxd)
 struct idxd_batch {
 	struct dsa_hw_desc *descs;
 	dma_addr_t dma_descs;
-	struct dsa_completion_record *crs;
-	dma_addr_t dma_crs;
 	u32 num;
 	u32 max;
 };

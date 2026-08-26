@@ -44,7 +44,7 @@ static int alloc_desc_batch(struct idxd_wq *wq, struct idxd_desc *desc)
 	struct idxd_device *idxd = wq->idxd;
 	struct device *dev = &idxd->pdev->dev;
 	struct idxd_batch *batch;
-	unsigned int size, cr_size, num;
+	unsigned int size, num;
 
 	batch = kzalloc_node(sizeof(*batch), GFP_KERNEL, dev_to_node(dev));
 	if (!batch)
@@ -53,32 +53,23 @@ static int alloc_desc_batch(struct idxd_wq *wq, struct idxd_desc *desc)
 	num = wq->max_batch_size;
 	size = num * sizeof(struct dsa_hw_desc);
 	batch->descs = dma_alloc_coherent(dev, size, &batch->dma_descs, GFP_KERNEL);
-	if (!batch->descs)
-		goto descs_err;
-
-	cr_size = num * idxd->data->compl_size;
-	batch->crs = dma_alloc_coherent(dev, cr_size, &batch->dma_crs, GFP_KERNEL);
-	if (!batch->crs)
-		goto crs_err;
+	if (!batch->descs) {
+		kfree(batch);
+		dev_warn(dev, "Unable to allocate memory, consider lowering max batch size.\n");
+		return -ENOMEM;
+	}
 
 	batch->max = num;
 	desc->batch = batch;
 
 	return 0;
-
-crs_err:
-	dma_free_coherent(dev, size, batch->descs, batch->dma_descs);
-descs_err:
-	kfree(batch);
-	dev_warn(dev, "Unable to allocate memory, consider lowering max batch size.\n");
-	return -ENOMEM;
 }
 
 static void free_desc_batch(struct idxd_wq *wq, struct idxd_desc *desc)
 {
 	struct idxd_device *idxd = wq->idxd;
 	struct device *dev = &idxd->pdev->dev;
-	unsigned int size, cr_size, num;
+	unsigned int size, num;
 	struct idxd_batch *batch;
 
 	batch = desc->batch;
@@ -92,9 +83,7 @@ static void free_desc_batch(struct idxd_wq *wq, struct idxd_desc *desc)
 	 */
 	num = batch->max;
 	size = num * sizeof(struct dsa_hw_desc);
-	cr_size = num * idxd->data->compl_size;
 	dma_free_coherent(dev, size, batch->descs, batch->dma_descs);
-	dma_free_coherent(dev, cr_size, batch->crs, batch->dma_crs);
 	kfree(batch);
 }
 

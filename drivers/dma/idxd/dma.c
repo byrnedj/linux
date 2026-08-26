@@ -73,8 +73,19 @@ static void op_flag_setup(unsigned long flags, u32 *desc_flags)
 	*desc_flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
 	if (flags & DMA_PREP_INTERRUPT)
 		*desc_flags |= IDXD_OP_FLAG_RCI;
-	if (flags & DMA_PREP_CACHE_CONTROL)
-		*desc_flags |= IDXD_OP_FLAG_CC;
+}
+
+/*
+ * Cache-Control is valid only on data-mover descriptors and only when
+ * GENCAP reports Cache Control Support for memory destinations. On a
+ * device without the capability the flag encoding is reserved and the
+ * descriptor fails with DSA_COMP_INVALID_FLAGS, so honour the advisory
+ * prep flag by dropping it there.
+ */
+static inline u32 idxd_cc_flag(struct idxd_wq *wq, unsigned long flags)
+{
+	return (flags & DMA_PREP_CACHE_CONTROL) &&
+	       wq->idxd->hw.gen_cap.cache_control_mem ? IDXD_OP_FLAG_CC : 0;
 }
 
 static inline void idxd_prep_desc_common(struct idxd_wq *wq,
@@ -133,6 +144,7 @@ idxd_dma_submit_memcpy(struct dma_chan *c, dma_addr_t dma_dest,
 		return NULL;
 
 	op_flag_setup(flags, &desc_flags);
+	desc_flags |= idxd_cc_flag(wq, flags);
 	desc = idxd_alloc_desc(wq, IDXD_OP_NONBLOCK);
 	if (IS_ERR(desc))
 		return NULL;
@@ -244,8 +256,7 @@ idxd_dma_prep_memcpy_sg(struct dma_chan *chan,
 		memset(batch->descs + i, 0, sizeof(struct dsa_hw_desc));
 		idxd_prep_desc_common(wq, batch->descs + i, DSA_OPCODE_MEMMOVE,
 				dma_src, dma_dst, len, 0,
-				(flags & DMA_PREP_CACHE_CONTROL) ?
-					IDXD_OP_FLAG_CC : 0);
+				idxd_cc_flag(wq, flags));
 		batch->num++;
 
 		dst_nents -= fetch_sg_and_pos(&dst_sg, &dst_avail, len);
@@ -258,20 +269,45 @@ idxd_dma_prep_memcpy_sg(struct dma_chan *chan,
 		}
 	}
 
-	op_flag_setup(flags, &desc_flags);
 	/*
-	 * Cache-Control is a data-mover flag and is set on the MEMMOVE
-	 * sub-descriptors above when DMA_PREP_CACHE_CONTROL was requested.
-	 * Since the BATCH descriptor itself moves no data, CC is invalid
-	 * on it and DSA fails the batch with DSA_COMP_INVALID_FLAGS
-	 * (0x11). Therefore we strip the flag from the dispatch
-	 * descriptor only.
+	 * The element count can exceed min(dst_nents, src_nents) when
+	 * boundaries interleave, so the admission check does not bound
+	 * it. Submitting a capacity-exhausted batch would complete
+	 * successfully while covering only a prefix of the transfer.
+	 * Refuse instead and let the caller fall back.
 	 */
-	desc_flags &= ~IDXD_OP_FLAG_CC;
-	idxd_prep_desc_common(wq, desc->hw, DSA_OPCODE_BATCH,
-			batch->dma_descs, 0, batch->num,
-			desc->compl_dma, desc_flags);
+	if (dst_nents && src_nents &&
+	    min_t(size_t, dst_avail, src_avail)) {
+		idxd_free_desc(wq, desc);
+		return NULL;
+	}
 
+	op_flag_setup(flags, &desc_flags);
+	if (batch->num == 1) {
+		/*
+		 * A one element batch is an invalid Descriptor Count on
+		 * hardware without Batch1 support, and GENCAP has no bit
+		 * to probe for it. Dispatch the single element as a plain
+		 * MEMMOVE instead. Cache-Control is valid there, so it
+		 * rides along.
+		 */
+		idxd_prep_desc_common(wq, desc->hw, DSA_OPCODE_MEMMOVE,
+				batch->descs[0].src_addr,
+				batch->descs[0].dst_addr,
+				batch->descs[0].xfer_size,
+				desc->compl_dma,
+				desc_flags | idxd_cc_flag(wq, flags));
+	} else {
+		/*
+		 * The BATCH descriptor itself moves no data, so it never
+		 * carries Cache-Control; the elements above do.
+		 */
+		idxd_prep_desc_common(wq, desc->hw, DSA_OPCODE_BATCH,
+				batch->dma_descs, 0, batch->num,
+				desc->compl_dma, desc_flags);
+	}
+
+	desc->txd.flags = flags;
 	return &desc->txd;
 }
 
@@ -448,7 +484,8 @@ int idxd_register_dma_device(struct idxd_device *idxd)
 		dma->device_prep_dma_memcpy = idxd_dma_submit_memcpy;
 	}
 
-	if (idxd->hw.opcap.bits[0] & IDXD_OPCAP_BATCH) {
+	if ((idxd->hw.opcap.bits[0] & IDXD_OPCAP_BATCH) &&
+	    (idxd->hw.opcap.bits[0] & IDXD_OPCAP_MEMMOVE)) {
 		dma_cap_set(DMA_MEMCPY_SG, dma->cap_mask);
 		dma->device_prep_dma_memcpy_sg = idxd_dma_prep_memcpy_sg;
 	}
