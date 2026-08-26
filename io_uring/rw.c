@@ -1021,17 +1021,6 @@ static int __io_read(struct io_kiocb *req, struct io_br_sel *sel,
 		}
 	}
 
-	/* Arm the DMA copy offload for this read.  The request is
-	 * stashed in kiocb->private for the DMA path.
-	 */
-	if (force_nonblock && !IS_ERR_OR_NULL(req->ctx->dma.chan)) {
-		io_uring_dma_prep(req);
-		req->dma.dst_user_addr = rw->addr;
-		kiocb->private = req;
-	} else {
-		kiocb->private = NULL;
-	}
-
 	ret = io_iter_do_read(rw, &io->iter);
 
 	/*
