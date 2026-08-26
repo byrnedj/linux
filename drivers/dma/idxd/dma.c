@@ -200,6 +200,9 @@ idxd_dma_prep_memcpy_sg(struct dma_chan *chan,
 	if (unlikely(dst_nents == 0 || src_nents == 0))
 		return NULL;
 
+	if (wq->state != IDXD_WQ_ENABLED)
+		return NULL;
+
 	if (min(dst_nents, src_nents) > wq->max_batch_size)
 		return NULL;
 
@@ -223,7 +226,13 @@ idxd_dma_prep_memcpy_sg(struct dma_chan *chan,
 	 * max_batch_size or a scatter list is consumed.
 	 */
 	batch = desc->batch;
-	for (i = 0; i < wq->max_batch_size; i++) {
+	/*
+	 * Bound the fill on the alloc-time capacity. wq->max_batch_size
+	 * can be reset to the default by device disable or HALT recovery
+	 * while a prep is in flight, and a larger live value would let
+	 * the loop write past the coherent descriptor array.
+	 */
+	for (i = 0; i < batch->max; i++) {
 		dma_dst = sg_dma_address(dst_sg) + sg_dma_len(dst_sg) -
 			dst_avail;
 		dma_src = sg_dma_address(src_sg) + sg_dma_len(src_sg) -

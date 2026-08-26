@@ -206,7 +206,8 @@ int idxd_wq_alloc_resources(struct idxd_wq *wq)
 		if (idxd->data->type == IDXD_TYPE_DSA) {
 			desc->completion = &wq->compls[i];
 			/* Pre-allocate the batch for this descriptor. */
-			if (alloc_desc_batch(wq, desc))
+			rc = alloc_desc_batch(wq, desc);
+			if (rc)
 				goto fail_descs_init;
 		} else if (idxd->data->type == IDXD_TYPE_IAX) {
 			desc->iax_completion = &wq->iax_compls[i];
