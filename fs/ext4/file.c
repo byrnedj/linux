@@ -990,7 +990,8 @@ const struct file_operations ext4_file_operations = {
 	.fallocate	= ext4_fallocate,
 	.fop_flags	= FOP_MMAP_SYNC | FOP_BUFFER_RASYNC |
 			  FOP_DIO_PARALLEL_WRITE |
-			  FOP_DONTCACHE,
+			  FOP_DONTCACHE |
+			  FOP_DMA_READ | FOP_DMA_WRITE,
 	.setlease	= generic_setlease,
 };
 

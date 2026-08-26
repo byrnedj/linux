@@ -973,11 +973,14 @@ static int __io_read(struct io_kiocb *req, struct io_br_sel *sel,
 			io_dma_fm_record(IO_DMA_FM_NOT_BVEC);
 		} else if (kiocb->ki_flags & IOCB_DIRECT) {
 			io_dma_fm_record(IO_DMA_FM_DIRECT);
-		} else if (shmem_mapping(req->file->f_mapping)) {
-			/* filemap_get_pages() yields no data folios for
-			 * shmem and tmpfs files, so the DMA path would
-			 * read zeroes while reporting success. We take
-			 * the normal buffered path instead.
+		} else if (!(req->file->f_op->fop_flags & FOP_DMA_READ)) {
+			/* The offload reads the page cache directly and
+			 * skips ->read_iter, which loses NFS revalidation,
+			 * network-fs protocol work, and shmem's swap
+			 * handling, where filemap_get_pages() yields no
+			 * data folios at all. Filesystems opt in when
+			 * their buffered read is plain filemap_read()
+			 * semantics.
 			 */
 			io_dma_fm_record(IO_DMA_FM_SHMEM);
 		} else {
@@ -1281,8 +1284,15 @@ int io_write(struct io_kiocb *req, unsigned int issue_flags)
 			io_dma_fmw_record(IO_DMA_FMW_NOT_BVEC);
 		} else if (kiocb->ki_flags & IOCB_DIRECT) {
 			io_dma_fmw_record(IO_DMA_FMW_DIRECT);
-		} else if (!aops->write_begin || !aops->write_end) {
-			/* iomap filesystems (XFS) take the normal path */
+		} else if (!(req->file->f_op->fop_flags & FOP_DMA_WRITE) ||
+			   !aops->write_begin || !aops->write_end) {
+			/* The offload drives write_begin and write_end
+			 * directly and skips ->write_iter, which loses the
+			 * per-write protocol work of network filesystems
+			 * and the extra checks of others. Filesystems opt
+			 * in; iomap filesystems (XFS) have no write_begin
+			 * and take the normal path regardless.
+			 */
 			io_dma_fmw_record(IO_DMA_FMW_NO_AOPS);
 		} else {
 			/* The same reissue rule as the read path applies.
