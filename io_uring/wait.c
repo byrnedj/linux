@@ -187,8 +187,21 @@ static inline int io_cqring_wait_schedule(struct io_ring_ctx *ctx,
 	 * which executes that task_work. The kworker completer remains the
 	 * backstop when the budget expires.
 	 */
+	/*
+	 * The poll takes spinlocks and does unmap work, which sleeps on
+	 * PREEMPT_RT, so it must not run with the task state set for the
+	 * coming schedule(). Run it in TASK_RUNNING and re-arm the state
+	 * afterwards, rechecking wakeup conditions that may have fired
+	 * while it ran.
+	 */
+	__set_current_state(TASK_RUNNING);
 	if (io_dma_cq_wait_poll(ctx, iowq))
 		return 1;
+	set_current_state(TASK_INTERRUPTIBLE);
+	if (io_should_wake(iowq) || io_has_work(ctx)) {
+		__set_current_state(TASK_RUNNING);
+		return 1;
+	}
 
 	return __io_cqring_wait_schedule(ctx, iowq, ext_arg, start_time);
 }
