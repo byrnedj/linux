@@ -162,6 +162,14 @@ static struct io_pfn_cache *io_pfn_cache_get(struct device *dev)
 			return io_pfn_caches[i];
 		}
 		if (!io_pfn_cache_devs[i]) {
+			/*
+			 * Pin the device for the registry's machine
+			 * lifetime. Slots are never released, so this
+			 * reference is deliberately never dropped; it
+			 * turns the flush-before-hot-remove discipline
+			 * into an enforced invariant.
+			 */
+			get_device(dev);
 			io_pfn_caches[i] = c;
 			/* pairs with the lockless load above */
 			smp_store_release(&io_pfn_cache_devs[i], dev);
@@ -661,7 +669,7 @@ static bool io_dma_budget_refuse_wr(struct dma_chan *chan)
 		return false;
 	if (atomic64_read(&d->inflight) >= budget ||
 	    atomic64_read(&d->inflight_wr) >=
-			div_u64(budget * READ_ONCE(io_dma_budget_wr_pct), 100)) {
+			div_u64(budget * min(READ_ONCE(io_dma_budget_wr_pct), 100U), 100)) {
 		atomic64_inc(&d->rej_wr);
 		return true;
 	}
