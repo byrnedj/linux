@@ -738,6 +738,18 @@ static void io_dma_qstat_complete(struct dma_chan *chan, u32 len, u64 submit_ns,
 			div_u64(ktime_get_ns() - submit_ns, NSEC_PER_USEC))]);
 }
 
+/*
+ * Retire the qstat and devload accounting for a task that ring teardown
+ * abandons without a hardware completion. Without this, the machine
+ * global in-flight counters drift upward on every hung-hardware drain
+ * and the per-device budget eventually refuses all DMA.
+ */
+void io_dma_qstat_task_abandon(struct io_ring_ctx *ctx, struct io_dma_task *dma)
+{
+	if (!IS_ERR_OR_NULL(ctx->dma.chan))
+		io_dma_qstat_complete(ctx->dma.chan, dma->len, 0, false);
+}
+
 static int io_dma_chan_qstat_show(struct seq_file *m, void *v)
 {
 	int i, b;
