@@ -2675,7 +2675,6 @@ static __cold void io_ring_exit_work(struct work_struct *work)
 			io_dma_dump_stuck(ctx);
 			/* there is little hope left, don't run it too often */
 			interval = HZ * 60;
-			break;
 		}
 		/*
 		 * This is really an uninterruptible wait, as it has to be
