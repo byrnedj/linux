@@ -1074,14 +1074,33 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 	u32 total_len = 0;
 	int i;
 
+	/* All fallible allocations come before the prep. A prepped but
+	 * never submitted descriptor cannot be returned to the driver
+	 * pool, so abandoning one here would orphan an idxd descriptor.
+	 */
+	heap_entries = kmalloc_array(nr_entries, sizeof(*heap_entries),
+				     GFP_NOWAIT | __GFP_NOWARN);
+	if (!heap_entries)
+		return -ENOMEM;
+	memcpy(heap_entries, entries, nr_entries * sizeof(*heap_entries));
+
+	dma = io_dma_task_alloc(req->ctx);
+	if (!dma) {
+		kfree(heap_entries);
+		return -ENOMEM;
+	}
+
 	/* Allocate the src and dst scatterlists together. We initialize
 	 * the SG tables so that sg_next() and sg_is_last() work correctly
 	 * and then populate the DMA addresses from the entries array.
 	 */
 	sgls = kmalloc_array(nr_entries * 2, sizeof(*sgls),
 			     GFP_NOWAIT | __GFP_NOWARN);
-	if (!sgls)
+	if (!sgls) {
+		io_dma_task_free(req->ctx, dma);
+		kfree(heap_entries);
 		return -ENOMEM;
+	}
 	src_sgl = sgls;
 	dst_sgl = sgls + nr_entries;
 
@@ -1100,6 +1119,8 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 					   io_dma_prep_flags());
 	if (!tx) {
 		kfree(sgls);
+		io_dma_task_free(req->ctx, dma);
+		kfree(heap_entries);
 		return -EAGAIN;
 	}
 
@@ -1107,18 +1128,6 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 	 * The driver copies what it needs into batch descriptors.
 	 */
 	kfree(sgls);
-
-	heap_entries = kmalloc_array(nr_entries, sizeof(*heap_entries),
-				     GFP_NOWAIT | __GFP_NOWARN);
-	if (!heap_entries)
-		return -ENOMEM;
-	memcpy(heap_entries, entries, nr_entries * sizeof(*heap_entries));
-
-	dma = io_dma_task_alloc(req->ctx);
-	if (!dma) {
-		kfree(heap_entries);
-		return -ENOMEM;
-	}
 
 	dma->req = req;
 	dma->next = NULL;
