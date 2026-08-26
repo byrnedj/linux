@@ -517,18 +517,6 @@ static int idxd_register_dma_channel(struct idxd_wq *wq)
 	return 0;
 }
 
-static void idxd_unregister_dma_channel(struct idxd_wq *wq)
-{
-	struct idxd_dma_chan *idxd_chan = wq->idxd_chan;
-	struct dma_chan *chan = &idxd_chan->chan;
-	struct idxd_dma_dev *idxd_dma = wq->idxd->idxd_dma;
-
-	dma_async_device_channel_unregister(&idxd_dma->dma, chan);
-	list_del(&chan->device_node);
-	kfree(wq->idxd_chan);
-	wq->idxd_chan = NULL;
-	put_device(wq_confdev(wq));
-}
 
 static int idxd_dmaengine_drv_probe(struct idxd_dev *idxd_dev)
 {
@@ -581,16 +569,22 @@ static void idxd_dmaengine_drv_remove(struct idxd_dev *idxd_dev)
 
 	mutex_lock(&wq->wq_lock);
 	__idxd_wq_quiesce(wq);
-	if (wq->idxd_chan && wq->idxd_chan->chan.client_count) {
+	if (wq->idxd_chan &&
+	    dma_async_device_channel_unregister_if_unused(
+			&wq->idxd->idxd_dma->dma, &wq->idxd_chan->chan)) {
 		/*
 		 * Live clients such as io_uring rings hold pointers into
 		 * the channel and poll wq->descs. Freeing any of that
 		 * state here is a use-after-free. This can happen when a
 		 * device HALT's FLR recovery unbinds the driver under
-		 * load. Therefore we leak the wq's dmaengine state
-		 * instead. Submissions already fail cleanly through the
-		 * device and wq state checks and clients fall back to
-		 * CPU copies.
+		 * load. The reference check and the channel unregister
+		 * run atomically under dma_list_mutex, so a client
+		 * acquiring the channel concurrently either makes this
+		 * unregister fail or finds the channel already gone.
+		 * On failure we leak the wq's dmaengine state instead.
+		 * Submissions already fail cleanly through the killed
+		 * wq_active percpu ref and clients fall back to CPU
+		 * copies.
 		 */
 		dev_warn(&wq->idxd->pdev->dev,
 			 "wq %d unbound with live DMA clients; leaking channel state\n",
@@ -598,7 +592,11 @@ static void idxd_dmaengine_drv_remove(struct idxd_dev *idxd_dev)
 		mutex_unlock(&wq->wq_lock);
 		return;
 	}
-	idxd_unregister_dma_channel(wq);
+	if (wq->idxd_chan) {
+		kfree(wq->idxd_chan);
+		wq->idxd_chan = NULL;
+		put_device(wq_confdev(wq));
+	}
 	idxd_drv_disable_wq(wq);
 	mutex_unlock(&wq->wq_lock);
 }

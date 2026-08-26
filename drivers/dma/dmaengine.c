@@ -1164,6 +1164,48 @@ void dma_async_device_channel_unregister(struct dma_device *device,
 EXPORT_SYMBOL_GPL(dma_async_device_channel_unregister);
 
 /**
+ * dma_async_device_channel_unregister_if_unused - unregister a channel
+ *	only when no client holds a reference
+ * @device: the dmaengine device
+ * @chan: the channel
+ *
+ * Clients take references through dma_chan_get(), which runs under
+ * dma_list_mutex. The reference check, the removal from the device's
+ * channel list, and the visibility teardown all happen under one hold
+ * of that mutex, so a concurrent channel request either completes
+ * first, which makes this function return -EBUSY, or finds the channel
+ * gone. This closes the window where a driver checks client_count and
+ * then frees channel state while a new client acquires it.
+ *
+ * Return: 0 when the channel was unregistered, -EBUSY when a client
+ * holds it.
+ */
+int dma_async_device_channel_unregister_if_unused(struct dma_device *device,
+						  struct dma_chan *chan)
+{
+	if (chan->local == NULL)
+		return 0;
+
+	mutex_lock(&dma_list_mutex);
+	if (chan->client_count) {
+		mutex_unlock(&dma_list_mutex);
+		return -EBUSY;
+	}
+	device->chancnt--;
+	chan->dev->chan = NULL;
+	list_del(&chan->device_node);
+	mutex_unlock(&dma_list_mutex);
+
+	ida_free(&device->chan_ida, chan->chan_id);
+	device_unregister(&chan->dev->device);
+	free_percpu(chan->local);
+	chan->local = NULL;
+	dma_channel_rebalance();
+	return 0;
+}
+EXPORT_SYMBOL_GPL(dma_async_device_channel_unregister_if_unused);
+
+/**
  * dma_async_device_register - registers DMA devices found
  * @device:	pointer to &struct dma_device
  *
