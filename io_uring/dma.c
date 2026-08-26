@@ -1756,6 +1756,21 @@ ssize_t io_dma_filemap_write(struct io_kiocb *req, struct kiocb *iocb,
 				err = status;
 			break;
 		}
+		/*
+		 * A write_begin that leaves a journal handle open (ext4
+		 * without delalloc, or delalloc falling back under low
+		 * free space) expects its matching write_end before the
+		 * next write_begin. Batching would nest handles with
+		 * h_ref only and no credits, and a wedge would leak the
+		 * references and stall the journal. Hand such
+		 * filesystems back to the CPU path.
+		 */
+		if (unlikely(!nr_fol && current->journal_info)) {
+			aops->write_end(iocb, mapping, pos, bytes, 0,
+					folio, fsdata);
+			err = -EAGAIN;
+			goto out_unlock;
+		}
 		offset = offset_in_folio(folio, pos);
 		/*
 		 * Cover the locked folio to its end or to the write's end.
@@ -1925,27 +1940,36 @@ collect_done:
 	}
 
 	/* Commit in ascending order with the dirty, unlock, and i_size
-	 * updates.
+	 * updates. Every collected folio must pass through write_end even
+	 * after a failure, with a zero claim, or the tail folios stay
+	 * locked and referenced forever.
 	 */
 	{
 		ssize_t committed = 0;
+		bool commit_failed = false;
 
 		for (i = 0; i < nr_fol; i++) {
-			size_t claim = min_t(size_t, fol[i].len,
-					     written - committed);
+			size_t claim = commit_failed ? 0 :
+				min_t(size_t, fol[i].len,
+				      written - committed);
 			int done;
 
 			done = aops->write_end(iocb, mapping, fol[i].pos,
 					       fol[i].len, claim,
 					       fol[i].folio, fol[i].fsdata);
+			if (commit_failed)
+				continue;
 			if (unlikely(done < 0)) {
 				if (!committed)
 					err = done;
-				break;
+				commit_failed = true;
+				continue;
 			}
 			committed += done;
-			if ((size_t)done < fol[i].len)
-				break;
+			if ((size_t)done < fol[i].len) {
+				commit_failed = true;
+				continue;
+			}
 			balance_dirty_pages_ratelimited(mapping);
 		}
 		written = committed;
