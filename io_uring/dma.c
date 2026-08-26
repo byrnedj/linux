@@ -1259,10 +1259,13 @@ static ssize_t io_dma_flush_batch(struct io_kiocb *req,
 		for (i = 0; i < nr_entries; i++) {
 			ret = io_dma_submit_single_entry(req, chan, &entries[i]);
 			if (ret < 0) {
-				/* Unmap remaining entries */
+				/* A failed submit never consumes the entry's
+				 * source mapping, so release this entry and
+				 * every remaining one.
+				 */
 				io_dma_unmap_batch_entries(req, dev,
-							  entries + i + 1,
-							  nr_entries - i - 1);
+							  entries + i,
+							  nr_entries - i);
 				return total > 0 ? total : ret;
 			}
 			total += ret;
