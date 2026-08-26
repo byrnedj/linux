@@ -240,13 +240,20 @@ static int __io_sq_thread(struct io_ring_ctx *ctx, struct io_sq_data *sqd,
 			revert_creds(creds);
 	}
 
-	mutex_lock(&ctx->uring_lock);
+	/*
+	 * Only rings with a DMA channel and pollable tasks need the
+	 * drain. Taking uring_lock unconditionally made every idle
+	 * non-DMA SQPOLL ring pay a mutex round trip per loop.
+	 */
+	if (!IS_ERR_OR_NULL(ctx->dma.chan) && io_dma_pending(ctx)) {
+		mutex_lock(&ctx->uring_lock);
 
-	ret2 = __io_dma_poll(ctx);
-	if (ret == 0 && ret2 > 0)
-		ret = ret2;
+		ret2 = __io_dma_poll(ctx);
+		if (ret == 0 && ret2 > 0)
+			ret = ret2;
 
-	mutex_unlock(&ctx->uring_lock);
+		mutex_unlock(&ctx->uring_lock);
+	}
 
 	return ret;
 }

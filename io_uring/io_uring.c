@@ -129,6 +129,12 @@ static struct workqueue_struct *iou_wq __ro_after_init;
 
 static int __read_mostly sysctl_io_uring_disabled;
 static int __read_mostly sysctl_io_uring_group = -1;
+/*
+ * DMA channels are machine-wide hardware resources, so ring creation
+ * with IORING_SETUP_DMA requires CAP_SYS_ADMIN unless the
+ * administrator opens it up host-wide with this sysctl.
+ */
+static unsigned int __read_mostly io_dma_allow_unprivileged;
 
 #ifdef CONFIG_SYSCTL
 static const struct ctl_table kernel_io_uring_disabled_table[] = {
@@ -152,6 +158,15 @@ static const struct ctl_table kernel_io_uring_disabled_table[] = {
 		.procname	= "io_uring_dma_cache_control",
 		.data		= &io_dma_cache_control,
 		.maxlen		= sizeof(io_dma_cache_control),
+		.mode		= 0644,
+		.proc_handler	= proc_douintvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
+	{
+		.procname	= "io_uring_dma_allow_unprivileged",
+		.data		= &io_dma_allow_unprivileged,
+		.maxlen		= sizeof(io_dma_allow_unprivileged),
 		.mode		= 0644,
 		.proc_handler	= proc_douintvec_minmax,
 		.extra1		= SYSCTL_ZERO,
@@ -1460,6 +1475,7 @@ int io_poll_issue(struct io_kiocb *req, io_tw_token_t tw)
 
 	ret = __io_issue_sqe(req, issue_flags, &io_issue_defs[req->opcode]);
 
+	WARN_ON_ONCE(ret == IOU_ISSUE_SKIP_COMPLETE);
 	return ret;
 }
 
@@ -2215,6 +2231,7 @@ static void io_release_dma_chan(struct io_ring_ctx *ctx)
 					break;
 
 				cpu_relax();
+				cond_resched();
 			} while (ret == DMA_IN_PROGRESS);
 
 			if (ret == DMA_IN_PROGRESS)
@@ -2410,6 +2427,14 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 
 	dma_cap_zero(mask);
 	dma_cap_set(DMA_MEMCPY, mask);
+	/*
+	 * The batch path is the whole point of the offload, and the
+	 * sgl-lifetime and coherence assumptions in the submit path are
+	 * documented against providers that implement MEMCPY_SG. A
+	 * MEMCPY-only provider would turn every batch flush into map and
+	 * unmap overhead plus a CPU fallback.
+	 */
+	dma_cap_set(DMA_MEMCPY_SG, mask);
 
 	/*
 	 * Init the submit/poll machinery before acquisition: a failed
@@ -3379,6 +3404,20 @@ static __cold int io_uring_create(struct io_ctx_config *config)
 	 * loudly here instead.
 	 */
 	if (p->flags & IORING_SETUP_DMA) {
+		/*
+		 * Channels are machine-wide hardware resources and the
+		 * pool prefers a fresh channel per ring, so an
+		 * unprivileged task could otherwise drain every DSA WQ
+		 * and starve other dmaengine clients.
+		 */
+		ret = -EPERM;
+		if (!READ_ONCE(io_dma_allow_unprivileged) &&
+		    !capable(CAP_SYS_ADMIN))
+			goto err;
+		/* The DMA offload serves buffered I/O only. */
+		ret = -EINVAL;
+		if (p->flags & IORING_SETUP_IOPOLL)
+			goto err;
 		ret = io_allocate_dma_chan(ctx, p);
 		if (ret)
 			goto err;
