@@ -1013,10 +1013,23 @@ void io_dma_poll_workfn(struct work_struct *w)
 	/* io_dma_channel is embedded in io_ring_ctx as 'dma' */
 	struct io_ring_ctx *ctx = container_of(d, struct io_ring_ctx, dma);
 
-	/* Drain until the list is empty */
+	unsigned int passes = 0;
+
+	/* Drain until the list is empty, but stay cancelable. A descriptor
+	 * stuck DMA_IN_PROGRESS on halted hardware would otherwise spin
+	 * this worker forever and deadlock the cancel_work_sync() in ring
+	 * teardown. Bound the inline passes and requeue instead, so the
+	 * detection latency is unchanged while cancellation can win
+	 * between requeues.
+	 */
 	do {
 		__io_dma_poll(ctx);
 		cpu_relax();
+		if (++passes >= 1024) {
+			if (io_dma_pending(ctx))
+				queue_work(system_unbound_wq, &d->poll_work);
+			return;
+		}
 	} while (io_dma_pending(ctx));
 }
 
