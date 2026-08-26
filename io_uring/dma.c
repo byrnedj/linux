@@ -1443,22 +1443,19 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 			while (copied < bytes) {
 				struct io_pfn_map *pm = NULL;
 				dma_addr_t dst_dma, src_dma;
-				size_t dst_folio_remain;
+				size_t dst_seg_remain;
 				size_t chunk;
 
 				dst_dma = io_reg_buf_dma_addr(imu,
-						dst_user_addr + dst_offset);
+						dst_user_addr + dst_offset,
+						&dst_seg_remain);
 				if (!dst_dma) {
 					error = -EFAULT;
 					goto flush_and_put;
 				}
 
-				dst_folio_remain = (1UL << imu->folio_shift) -
-					((dst_user_addr + dst_offset) &
-					 ((1UL << imu->folio_shift) - 1));
-
 				chunk = min_t(size_t, bytes - copied,
-					      dst_folio_remain);
+					      dst_seg_remain);
 				/* Split at source map-quantum boundaries so
 				 * that one cache segment covers each entry
 				 * and no transient map exceeds the rcache
@@ -1807,19 +1804,19 @@ ssize_t io_dma_filemap_write(struct io_kiocb *req, struct kiocb *iocb,
 		/* Split at the source registered-buffer folio boundaries. */
 		for (sub = 0; sub < bytes; ) {
 			u64 uaddr = src_user_addr + written + sub;
-			size_t src_remain = (1UL << imu->folio_shift) -
-				(uaddr & ((1UL << imu->folio_shift) - 1));
-			size_t len = min3(bytes - sub, src_remain, max_chunk);
+			size_t src_seg_remain, len;
 			struct dma_async_tx_descriptor *tx;
 			dma_addr_t src_dma, dst;
 			dma_cookie_t ck;
 
-			src_dma = io_reg_buf_dma_addr(imu, uaddr);
+			src_dma = io_reg_buf_dma_addr(imu, uaddr,
+						      &src_seg_remain);
 			dst = dst_dma + sub;
 			if (unlikely(!src_dma)) {
 				redo = true;	/* The CPU-redo pass covers the chunk. */
 				break;
 			}
+			len = min3(bytes - sub, src_seg_remain, max_chunk);
 
 			tx = dmaengine_prep_dma_memcpy(chan, dst, src_dma, len,
 						       io_dma_prep_flags());

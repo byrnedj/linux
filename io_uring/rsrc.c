@@ -1262,7 +1262,19 @@ inline struct io_rsrc_node *io_find_buf_node(struct io_kiocb *req,
 	return NULL;
 }
 
-dma_addr_t io_reg_buf_dma_addr(struct io_mapped_ubuf *imu, u64 buf_addr)
+/*
+ * Resolve a registered-buffer user address to its device address and,
+ * when @seg_remain is non-NULL, report how many bytes remain in the
+ * per-folio mapping that backs it. Callers must clamp their chunks to
+ * that value. The segment layout follows the linear buffer offset,
+ * which for a large-folio buffer whose user mapping is not folio
+ * aligned (for example after mremap of a THP region) does not agree
+ * with the user virtual address phase, so deriving the remainder from
+ * the raw address would let a chunk cross the end of one mapping into
+ * an unrelated IOVA range.
+ */
+dma_addr_t io_reg_buf_dma_addr(struct io_mapped_ubuf *imu, u64 buf_addr,
+			       size_t *seg_remain)
 {
 	size_t offset, folio_mask;
 	unsigned int seg_idx;
@@ -1278,12 +1290,17 @@ dma_addr_t io_reg_buf_dma_addr(struct io_mapped_ubuf *imu, u64 buf_addr)
 	folio_mask = (1UL << imu->folio_shift) - 1;
 
 	/* This is the same offset calculation as io_import_fixed(). */
-	if (offset < bvec->bv_len)
+	if (offset < bvec->bv_len) {
+		if (seg_remain)
+			*seg_remain = bvec->bv_len - offset;
 		return imu->dma_addrs[0] + bvec->bv_offset + offset;
+	}
 
 	offset -= bvec->bv_len;
 	seg_idx = 1 + (offset >> imu->folio_shift);
 	offset &= folio_mask;
+	if (seg_remain)
+		*seg_remain = (folio_mask + 1) - offset;
 	return imu->dma_addrs[seg_idx] + offset;
 }
 
