@@ -8,6 +8,7 @@
 #include <linux/migrate_mode.h>
 
 struct folio;
+struct page;
 struct list_head;
 struct module;
 
@@ -54,11 +55,20 @@ struct mm_offload_provider {
 	int (*copy_folios)(struct list_head *dst_list, struct list_head *src_list,
 			unsigned int folio_cnt);
 	int (*clear_folio)(struct folio *folio, unsigned long addr_hint);
+	/*
+	 * Copy @nr_pages pages of user memory at @src into the physically
+	 * contiguous, not yet mapped page run starting at @dst (UFFDIO_COPY).
+	 * With !@allow_pagefault the provider must not fault the source in
+	 * and returns -EFAULT if any of it is absent (nothing copied).
+	 */
+	int (*copy_user_pages)(struct page *dst, unsigned long nr_pages,
+			       const void __user *src, bool allow_pagefault);
 	struct module *owner;
 };
 
 #ifdef CONFIG_MM_OFFLOAD
 DECLARE_STATIC_KEY_FALSE(mm_offload_clear_folio_enabled);
+DECLARE_STATIC_KEY_FALSE(mm_offload_copy_user_enabled);
 int mm_offload_register(const struct mm_offload_provider *p,
 		unsigned long migrate_reason_mask);
 int mm_offload_unregister(const struct mm_offload_provider *p);
@@ -70,6 +80,8 @@ bool migrate_should_offload(int reason);
 int migrate_offload_batch_copy(struct list_head *dst_batch,
 		struct list_head *src_batch, unsigned int nr_batch);
 int mm_offload_clear_folio(struct folio *folio, unsigned long addr_hint);
+int mm_offload_copy_user_pages(struct page *dst, unsigned long nr_pages,
+			       const void __user *src, bool allow_pagefault);
 bool mm_offload_cpus_saturated(void);
 struct folio *prezero_pool_get(int nid);
 
@@ -80,6 +92,10 @@ struct folio *prezero_pool_get(int nid);
 static inline bool mm_offload_clear_available(void)
 {
 	return static_branch_unlikely(&mm_offload_clear_folio_enabled);
+}
+static inline bool mm_offload_copy_user_available(void)
+{
+	return static_branch_unlikely(&mm_offload_copy_user_enabled);
 }
 #else
 static inline int mm_offload_register(const struct mm_offload_provider *p,
@@ -106,6 +122,10 @@ static inline int migrate_offload_batch_copy(struct list_head *dst_batch,
 static inline int mm_offload_clear_folio(struct folio *folio,
 		unsigned long addr_hint) { return -EOPNOTSUPP; }
 static inline bool mm_offload_clear_available(void) { return false; }
+static inline int mm_offload_copy_user_pages(struct page *dst,
+		unsigned long nr_pages, const void __user *src,
+		bool allow_pagefault) { return -EOPNOTSUPP; }
+static inline bool mm_offload_copy_user_available(void) { return false; }
 static inline bool mm_offload_cpus_saturated(void) { return false; }
 static inline struct folio *prezero_pool_get(int nid) { return NULL; }
 #endif

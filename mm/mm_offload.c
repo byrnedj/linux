@@ -16,6 +16,8 @@
 DEFINE_STATIC_KEY_FALSE(mm_offload_copy_folios_enabled);
 DEFINE_STATIC_KEY_FALSE(mm_offload_clear_folio_enabled);
 EXPORT_SYMBOL_GPL(mm_offload_clear_folio_enabled);
+DEFINE_STATIC_KEY_FALSE(mm_offload_copy_user_enabled);
+EXPORT_SYMBOL_GPL(mm_offload_copy_user_enabled);
 DEFINE_SRCU(mm_offload_srcu);
 DEFINE_STATIC_CALL(mm_offload_copy_folios_fn, migrate_folios_mc_copy);
 
@@ -31,8 +33,22 @@ static int mm_offload_clear_folio_null(struct folio *folio,
 }
 DEFINE_STATIC_CALL(mm_offload_clear_folio_fn, mm_offload_clear_folio_null);
 
+static int mm_offload_copy_user_null(struct page *dst, unsigned long nr_pages,
+				     const void __user *src, bool allow_pagefault)
+{
+	return -ENXIO;
+}
+DEFINE_STATIC_CALL(mm_offload_copy_user_fn, mm_offload_copy_user_null);
+
 static DEFINE_MUTEX(provider_mutex);
-static const struct mm_offload_provider *active_provider;
+/*
+ * Each op is owned independently, so a migration/clear provider and a
+ * user-copy provider (different engines, different admission policy)
+ * can coexist; a provider may not claim an op another one holds.
+ */
+static const struct mm_offload_provider *copy_folios_provider;
+static const struct mm_offload_provider *clear_folio_provider;
+static const struct mm_offload_provider *copy_user_provider;
 
 /* Operations currently inside the provider, i.e. potentially asleep. */
 static atomic_t ops_in_flight;
@@ -174,6 +190,35 @@ int mm_offload_clear_folio(struct folio *folio, unsigned long addr_hint)
 }
 
 /**
+ * mm_offload_copy_user_pages - fill unmapped pages from user memory.
+ * @dst: first page of a physically contiguous, not yet mapped run.
+ * @nr_pages: length of the run.
+ * @src: user source address (current->mm).
+ * @allow_pagefault: may the provider fault the source in?
+ *
+ * May sleep. Return: 0 when every byte was copied; -EFAULT when
+ * !@allow_pagefault and the source was not fully present (nothing was
+ * copied, caller retries with faults allowed); other negative errno
+ * when the provider declined or failed, in which case the destination
+ * is unspecified and the caller copies on the CPU.
+ */
+int mm_offload_copy_user_pages(struct page *dst, unsigned long nr_pages,
+			       const void __user *src, bool allow_pagefault)
+{
+	int idx, rc;
+
+	might_sleep();
+
+	atomic_inc(&ops_in_flight);
+	idx = srcu_read_lock(&mm_offload_srcu);
+	rc = static_call(mm_offload_copy_user_fn)(dst, nr_pages, src,
+						  allow_pagefault);
+	srcu_read_unlock(&mm_offload_srcu, idx);
+	atomic_dec(&ops_in_flight);
+	return rc;
+}
+
+/**
  * mm_offload_cpus_saturated - is every online CPU busy right now?
  *
  * Offloading only pays when the cycles it frees can run other work.
@@ -236,7 +281,7 @@ int mm_offload_set_migrate_reason_mask(const struct mm_offload_provider *p, unsi
 	mask &= MIGRATE_OFFLOAD_REASONS_ALLOWED;
 
 	mutex_lock(&provider_mutex);
-	if (active_provider != p) {
+	if (copy_folios_provider != p) {
 		mutex_unlock(&provider_mutex);
 		return -EINVAL;
 	}
@@ -263,13 +308,15 @@ int mm_offload_register(const struct mm_offload_provider *p,
 	unsigned long mask;
 	int ret = 0;
 
-	if (!p || (!p->copy_folios && !p->clear_folio))
+	if (!p || (!p->copy_folios && !p->clear_folio && !p->copy_user_pages))
 		return -EINVAL;
 
 	mask = migrate_reason_mask & MIGRATE_OFFLOAD_REASONS_ALLOWED;
 
 	mutex_lock(&provider_mutex);
-	if (active_provider) {
+	if ((p->copy_folios && copy_folios_provider) ||
+	    (p->clear_folio && clear_folio_provider) ||
+	    (p->copy_user_pages && copy_user_provider)) {
 		ret = -EBUSY;
 		goto unlock;
 	}
@@ -280,15 +327,21 @@ int mm_offload_register(const struct mm_offload_provider *p,
 		goto unlock;
 	}
 
-	active_provider = p;
 	if (p->copy_folios) {
+		copy_folios_provider = p;
 		WRITE_ONCE(active_reason_mask, mask);
 		static_call_update(mm_offload_copy_folios_fn, p->copy_folios);
 		static_branch_enable(&mm_offload_copy_folios_enabled);
 	}
 	if (p->clear_folio) {
+		clear_folio_provider = p;
 		static_call_update(mm_offload_clear_folio_fn, p->clear_folio);
 		static_branch_enable(&mm_offload_clear_folio_enabled);
+	}
+	if (p->copy_user_pages) {
+		copy_user_provider = p;
+		static_call_update(mm_offload_copy_user_fn, p->copy_user_pages);
+		static_branch_enable(&mm_offload_copy_user_enabled);
 	}
 
 unlock:
@@ -321,7 +374,9 @@ int mm_offload_unregister(const struct mm_offload_provider *p)
 		return -EINVAL;
 
 	mutex_lock(&provider_mutex);
-	if (active_provider != p) {
+	if ((p->copy_folios && copy_folios_provider != p) ||
+	    (p->clear_folio && clear_folio_provider != p) ||
+	    (p->copy_user_pages && copy_user_provider != p)) {
 		mutex_unlock(&provider_mutex);
 		return -EINVAL;
 	}
@@ -331,18 +386,25 @@ int mm_offload_unregister(const struct mm_offload_provider *p)
 	 * paths.
 	 */
 	if (p->copy_folios) {
+		copy_folios_provider = NULL;
 		static_branch_disable(&mm_offload_copy_folios_enabled);
 		WRITE_ONCE(active_reason_mask, 0);
 		static_call_update(mm_offload_copy_folios_fn,
 				   migrate_folios_mc_copy);
 	}
 	if (p->clear_folio) {
+		clear_folio_provider = NULL;
 		static_branch_disable(&mm_offload_clear_folio_enabled);
 		static_call_update(mm_offload_clear_folio_fn,
 				   mm_offload_clear_folio_null);
 	}
-	owner = active_provider->owner;
-	active_provider = NULL;
+	if (p->copy_user_pages) {
+		copy_user_provider = NULL;
+		static_branch_disable(&mm_offload_copy_user_enabled);
+		static_call_update(mm_offload_copy_user_fn,
+				   mm_offload_copy_user_null);
+	}
+	owner = p->owner;
 	mutex_unlock(&provider_mutex);
 
 	/* Wait for all in-flight callers to finish before module_put(). */

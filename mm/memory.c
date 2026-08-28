@@ -7503,6 +7503,24 @@ long copy_folio_from_user(struct folio *dst_folio,
 	unsigned long ret_val = nr_pages * PAGE_SIZE;
 	struct page *subpage;
 
+	/*
+	 * Let a copy offload provider (e.g. a DMA engine) fill the folio.
+	 * With faults disallowed the provider only uses source pages that
+	 * are present and reports -EFAULT otherwise, in which case nothing
+	 * was copied and the caller retries outside its locks. Any other
+	 * failure falls through to the CPU copy.
+	 */
+	if (mm_offload_copy_user_available()) {
+		int rc = mm_offload_copy_user_pages(folio_page(dst_folio, 0),
+						    nr_pages, usr_src,
+						    allow_pagefault);
+
+		if (!rc)
+			return 0;
+		if (rc == -EFAULT && !allow_pagefault)
+			return ret_val;
+	}
+
 	for (i = 0; i < nr_pages; i++) {
 		subpage = folio_page(dst_folio, i);
 		kaddr = kmap_local_page(subpage);

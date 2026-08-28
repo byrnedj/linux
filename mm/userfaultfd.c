@@ -11,6 +11,7 @@
  */
 
 #include <linux/mm.h>
+#include <linux/mm_offload.h>
 #include <linux/sched/signal.h>
 #include <linux/pagemap.h>
 #include <linux/rmap.h>
@@ -959,6 +960,240 @@ static __always_inline ssize_t mfill_atomic_pte(struct mfill_state *state)
 	return -EOPNOTSUPP;
 }
 
+/*
+ * Batched anonymous UFFDIO_COPY through the copy offload provider.
+ *
+ * The per-page path allocates one order-0 folio and does one
+ * copy_from_user() per page. A DMA engine wants a large destination:
+ * allocate up to 2M worth of pages as ONE contiguous chunk, split it
+ * into independent order-0 pages (so they map, age and free exactly
+ * like the pages the per-page path would have used), copy the whole
+ * batch with a single provider request, then install the PTEs one by
+ * one through the existing install path.
+ */
+#define MFILL_BATCH_MAX_PAGES	(SZ_2M >> PAGE_SHIFT)
+#define MFILL_BATCH_MIN_PAGES	16
+
+static bool mfill_batch_applicable(struct mfill_state *state)
+{
+	if (!uffd_flags_mode_is(state->flags, MFILL_ATOMIC_COPY))
+		return false;
+	/* Private mappings only: anonymous order-0 folios, no page cache. */
+	if (state->vma->vm_flags & VM_SHARED)
+		return false;
+	return true;
+}
+
+static int mfill_batch_copy_cpu(struct page *page, unsigned long nr,
+				unsigned long src, bool allow_pagefault)
+{
+	unsigned long i;
+
+	for (i = 0; i < nr; i++) {
+		void *kaddr = kmap_local_page(page + i);
+		unsigned long rc;
+
+		if (!allow_pagefault)
+			pagefault_disable();
+		rc = copy_from_user(kaddr, (const void __user *)(src + i * PAGE_SIZE),
+				    PAGE_SIZE);
+		if (!allow_pagefault)
+			pagefault_enable();
+		kunmap_local(kaddr);
+		if (rc)
+			return -EFAULT;
+		flush_dcache_page(page + i);
+		if (allow_pagefault)
+			cond_resched();
+	}
+	return 0;
+}
+
+/*
+ * Copy the batch with the locks dropped so the source may be faulted
+ * in, then re-take them. Mirrors mfill_copy_folio_retry().
+ */
+static int mfill_batch_copy_retry(struct mfill_state *state, struct page *page,
+				  unsigned long nr, unsigned long src)
+{
+	struct mfill_retry_state retry_state = { 0 };
+	struct mfill_retry_state *for_free __free(retry_put) = &retry_state;
+	int err;
+
+	mfill_retry_state_save(&retry_state, state->vma);
+	mfill_put_vma(state);
+
+	err = mm_offload_copy_user_pages(page, nr, (const void __user *)src, true);
+	if (err)
+		err = mfill_batch_copy_cpu(page, nr, src, true);
+	if (err)
+		return err;
+
+	err = mfill_get_vma(state);
+	if (err)
+		return err;
+	if (mfill_retry_state_changed(&retry_state, state->vma))
+		return -EAGAIN;
+	return 0;
+}
+
+/*
+ * mTHP destination: when the VMA's THP settings allow a large anonymous
+ * folio below PMD size at this (aligned) address, allocate one and map it
+ * with a single rmap/PTE-batch operation instead of N order-0 pages.
+ */
+static struct folio *mfill_batch_alloc_large(struct mfill_state *state,
+					     unsigned long remaining)
+{
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+	struct vm_area_struct *vma = state->vma;
+	unsigned long orders;
+	struct folio *folio;
+	gfp_t gfp;
+	int order;
+
+	orders = thp_vma_allowable_orders(vma, vma->vm_flags, TVA_PAGEFAULT,
+					  BIT(PMD_ORDER) - 1);
+	orders = thp_vma_suitable_orders(vma, state->dst_addr, orders);
+	if (!orders)
+		return NULL;
+
+	gfp = vma_thp_gfp_mask(vma);
+	for (order = highest_order(orders); orders;
+	     order = next_order(&orders, order)) {
+		if ((1UL << order) > remaining)
+			continue;
+		folio = vma_alloc_folio(gfp, order, vma, state->dst_addr);
+		if (!folio)
+			continue;
+		if (mem_cgroup_charge(folio, vma->vm_mm, gfp)) {
+			folio_put(folio);
+			continue;
+		}
+		folio_throttle_swaprate(folio, gfp);
+		return folio;
+	}
+#endif
+	return NULL;
+}
+
+/* Map a filled large folio at state->dst_addr; all PTEs must be none. */
+static int mfill_install_large_folio(struct mfill_state *state,
+				     struct folio *folio)
+{
+	struct mm_struct *mm = state->vma->vm_mm;
+	unsigned int nr = folio_nr_pages(folio), i;
+	spinlock_t *ptl;
+	pte_t *pte;
+	int ret;
+
+	pte = pte_offset_map_lock(mm, state->pmd, state->dst_addr, &ptl);
+	if (!pte)
+		return -EAGAIN;
+	ret = -EEXIST;
+	for (i = 0; i < nr; i++) {
+		pte_t p = ptep_get(pte + i);
+
+		if (!pte_none(p) && !pte_is_uffd_marker(p))
+			goto out_unlock;
+	}
+	__folio_mark_uptodate(folio);
+	map_anon_folio_pte_nopf(folio, pte, state->vma, state->dst_addr,
+				state->flags & MFILL_ATOMIC_WP);
+	add_mm_counter(mm, MM_ANONPAGES, nr);
+	ret = 0;
+out_unlock:
+	pte_unmap_unlock(pte, ptl);
+	return ret;
+}
+
+static ssize_t mfill_atomic_copy_batch(struct mfill_state *state,
+				       unsigned long remaining)
+{
+	struct mm_struct *mm = state->vma->vm_mm;
+	unsigned long nr = min_t(unsigned long, remaining, MFILL_BATCH_MAX_PAGES);
+	unsigned long src = state->src_addr;
+	unsigned long i, copied = 0;
+	struct folio *large;
+	unsigned int order;
+	struct page *page;
+	int err;
+
+	if (nr < MFILL_BATCH_MIN_PAGES)
+		return -EOPNOTSUPP;
+
+	large = mfill_batch_alloc_large(state, nr);
+	if (large) {
+		page = folio_page(large, 0);
+		nr = folio_nr_pages(large);
+	} else {
+		order = get_order(nr << PAGE_SHIFT);
+		page = alloc_pages(GFP_HIGHUSER_MOVABLE | __GFP_NOWARN |
+				   __GFP_NORETRY, order);
+		if (!page)
+			return -EOPNOTSUPP;
+		split_page(page, order);
+		for (i = nr; i < (1UL << order); i++)
+			__free_page(page + i);
+		for (i = 0; i < nr; i++) {
+			if (mem_cgroup_charge(page_folio(page + i), mm,
+					      GFP_KERNEL)) {
+				err = -ENOMEM;
+				goto free;
+			}
+		}
+	}
+
+	err = mm_offload_copy_user_pages(page, nr, (const void __user *)src, false);
+	if (err && err != -EFAULT)
+		err = mfill_batch_copy_cpu(page, nr, src, false);
+	if (err == -EFAULT)
+		err = mfill_batch_copy_retry(state, page, nr, src);
+	if (err)
+		goto free;
+
+	if (large) {
+		err = mfill_establish_pmd(state);
+		if (!err)
+			err = mfill_install_large_folio(state, large);
+		if (err)
+			goto free;
+		state->dst_addr += nr << PAGE_SHIFT;
+		state->src_addr += nr << PAGE_SHIFT;
+		cond_resched();
+		return nr << PAGE_SHIFT;
+	}
+
+	for (i = 0; i < nr; i++) {
+		struct folio *folio = page_folio(page + i);
+
+		err = mfill_establish_pmd(state);
+		if (err)
+			break;
+		__folio_mark_uptodate(folio);
+		err = mfill_atomic_install_pte(state->pmd, state->vma,
+					       state->dst_addr, page + i,
+					       state->flags);
+		if (err)
+			break;
+		state->dst_addr += PAGE_SIZE;
+		state->src_addr += PAGE_SIZE;
+		copied += PAGE_SIZE;
+	}
+	for (; i < nr; i++)
+		folio_put(page_folio(page + i));
+	cond_resched();
+	return copied ? copied : err;
+
+free:
+	if (large)
+		folio_put(large);
+	else
+		for (i = 0; i < nr; i++)
+			folio_put(page_folio(page + i));
+	return err;
+}
+
 static __always_inline ssize_t mfill_atomic(struct userfaultfd_ctx *ctx,
 					    unsigned long dst_start,
 					    unsigned long src_start,
@@ -1000,6 +1235,30 @@ static __always_inline ssize_t mfill_atomic(struct userfaultfd_ctx *ctx,
 
 	while (state.src_addr < src_start + len) {
 		VM_WARN_ON_ONCE(state.dst_addr >= dst_start + len);
+
+		/*
+		 * Anonymous COPY with a copy offload provider: populate a
+		 * batch of pages with one DMA request instead of one CPU
+		 * copy per page. Falls back to the per-page path when the
+		 * batch cannot be formed.
+		 */
+		if (mm_offload_copy_user_available() &&
+		    mfill_batch_applicable(&state)) {
+			ssize_t done = mfill_atomic_copy_batch(&state,
+					(src_start + len - state.src_addr) >> PAGE_SHIFT);
+			if (done > 0) {
+				copied += done;
+				if (fatal_signal_pending(current)) {
+					err = -EINTR;
+					break;
+				}
+				continue;
+			}
+			if (done < 0 && done != -EOPNOTSUPP) {
+				err = done;
+				break;
+			}
+		}
 
 		err = mfill_establish_pmd(&state);
 		if (err)
