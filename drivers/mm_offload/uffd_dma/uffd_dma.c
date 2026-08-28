@@ -9,11 +9,10 @@
  * order-0 pages carved from one allocation by mm/userfaultfd.c), the
  * source is user memory pinned for the duration of the copy.
  *
- * Channel handling follows dcbm: channels are acquired once when
- * offloading is enabled, grouped by DMA device, and shared by
- * concurrent copies through per-channel trylocks; an all-busy engine
- * refuses the copy so the caller falls back to the CPU rather than
- * queueing.
+ * Channels come from the mm_offload_dma pool shared with the other
+ * providers (grouped by DMA device, per-channel trylocks); an all-busy
+ * engine refuses the copy so the caller falls back to the CPU rather
+ * than queueing.
  */
 
 #include <linux/atomic.h>
@@ -26,6 +25,7 @@
 #include <linux/ktime.h>
 #include <linux/mm.h>
 #include <linux/mm_offload.h>
+#include <linux/mm_offload_dma.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/scatterlist.h>
@@ -34,7 +34,6 @@
 #include <linux/sysfs.h>
 #include <linux/uaccess.h>
 
-#define UFFD_DMA_MAX_CHANNELS	16
 #define UFFD_DMA_TIMEOUT_MS	10000
 /* One descriptor per this many bytes when spreading over channels */
 #define UFFD_DMA_CHUNK_BYTES	SZ_2M
@@ -64,20 +63,6 @@ static bool util_gate;
 
 static DEFINE_MUTEX(uffd_dma_mutex);
 
-static struct uffd_dma_chan {
-	struct dma_chan *chan;
-	struct mutex lock;
-} channels[UFFD_DMA_MAX_CHANNELS];
-static unsigned int nr_channels;
-
-static struct uffd_dma_group {
-	struct device *dev;
-	int node;
-	unsigned int first;
-	unsigned int nr;
-} groups[UFFD_DMA_MAX_CHANNELS];
-static unsigned int nr_groups;
-static atomic_t group_cursor;
 static struct kobject *uffd_dma_kobj;
 
 struct uffd_dma_req {
@@ -96,68 +81,6 @@ static void uffd_dma_callback(void *data, const struct dmaengine_result *result)
 		complete(&req->done);
 }
 
-/* ---- channel claiming (pgzero_dma pattern) ---- */
-
-static unsigned long uffd_dma_claim_group(struct uffd_dma_group *grp,
-					  unsigned int want)
-{
-	unsigned long mask = 0;
-	unsigned int i, got = 0;
-
-	for (i = 0; i < grp->nr && got < want; i++) {
-		unsigned int idx = grp->first + i;
-
-		if (mutex_trylock(&channels[idx].lock)) {
-			mask |= BIT(idx);
-			got++;
-		}
-	}
-	return mask;
-}
-
-static unsigned long uffd_dma_claim_pass(int nid, bool match_node,
-					 unsigned int want,
-					 struct uffd_dma_group **grpp)
-{
-	unsigned int sel[UFFD_DMA_MAX_CHANNELS];
-	unsigned int n = 0, g, i;
-
-	for (g = 0; g < nr_groups; g++)
-		if ((groups[g].node == nid) == match_node)
-			sel[n++] = g;
-	if (!n)
-		return 0;
-
-	g = (unsigned int)atomic_inc_return(&group_cursor) % n;
-	for (i = 0; i < n; i++) {
-		struct uffd_dma_group *grp = &groups[sel[(g + i) % n]];
-		unsigned long mask = uffd_dma_claim_group(grp, want);
-
-		if (mask) {
-			*grpp = grp;
-			return mask;
-		}
-	}
-	return 0;
-}
-
-static unsigned long uffd_dma_claim_channels(unsigned int want, int nid,
-					     struct uffd_dma_group **grpp)
-{
-	unsigned long mask = uffd_dma_claim_pass(nid, true, want, grpp);
-
-	if (!mask)
-		mask = uffd_dma_claim_pass(nid, false, want, grpp);
-	return mask;
-}
-
-static void uffd_dma_release_channels(unsigned long mask)
-{
-	unsigned int i;
-
-	for_each_set_bit(i, &mask, nr_channels)
-		mutex_unlock(&channels[i].lock);
-}
 
 /* ---- source pinning ---- */
 
@@ -242,7 +165,7 @@ static int uffd_dma_submit_one(struct uffd_dma_req *req,
 	struct dma_async_tx_descriptor *tx;
 	dma_cookie_t cookie;
 
-	tx = dmaengine_prep_dma_memcpy(channels[cur->idx].chan, dst, src, len,
+	tx = dmaengine_prep_dma_memcpy(mm_offload_dma_chan(cur->idx), dst, src, len,
 				       cur->flags);
 	if (!tx)
 		return -EIO;
@@ -254,10 +177,10 @@ static int uffd_dma_submit_one(struct uffd_dma_req *req,
 		atomic_dec(&req->pending);
 		return -EIO;
 	}
-	cur->idx = find_next_bit(&cur->chan_mask, UFFD_DMA_MAX_CHANNELS,
+	cur->idx = find_next_bit(&cur->chan_mask, MM_OFFLOAD_DMA_MAX_CHANNELS,
 				 cur->idx + 1);
-	if (cur->idx >= UFFD_DMA_MAX_CHANNELS)
-		cur->idx = find_first_bit(&cur->chan_mask, UFFD_DMA_MAX_CHANNELS);
+	if (cur->idx >= MM_OFFLOAD_DMA_MAX_CHANNELS)
+		cur->idx = find_first_bit(&cur->chan_mask, MM_OFFLOAD_DMA_MAX_CHANNELS);
 	return 0;
 }
 
@@ -336,7 +259,7 @@ static int uffd_dma_copy_pages(struct page *dst, unsigned long nr_pages,
 {
 	const size_t size = nr_pages << PAGE_SHIFT;
 	unsigned long src = (unsigned long)usrc;
-	struct uffd_dma_group *grp;
+	struct mm_offload_dma_group *grp;
 	struct uffd_dma_cursor cur;
 	struct uffd_dma_req req;
 	struct page **pages;
@@ -359,14 +282,15 @@ static int uffd_dma_copy_pages(struct page *dst, unsigned long nr_pages,
 		return -EBUSY;
 	}
 
-	cur.chan_mask = uffd_dma_claim_channels(
-			clamp_t(size_t, size / UFFD_DMA_CHUNK_BYTES, 1, nr_channels),
+	cur.chan_mask = mm_offload_dma_claim(
+			clamp_t(size_t, size / UFFD_DMA_CHUNK_BYTES, 1,
+				READ_ONCE(nr_dma_chan)),
 			page_to_nid(dst), &grp);
 	if (!cur.chan_mask) {
 		atomic_long_inc(&copies_refused);
 		return -EBUSY;
 	}
-	cur.idx = find_first_bit(&cur.chan_mask, UFFD_DMA_MAX_CHANNELS);
+	cur.idx = find_first_bit(&cur.chan_mask, MM_OFFLOAD_DMA_MAX_CHANNELS);
 	cur.flags = DMA_PREP_INTERRUPT | DMA_CTRL_ACK;
 	if (READ_ONCE(cache_ctrl))
 		cur.flags |= DMA_PREP_CACHE_CONTROL;
@@ -433,8 +357,8 @@ static int uffd_dma_copy_pages(struct page *dst, unsigned long nr_pages,
 			ret = uffd_dma_submit(&req, &cur, &sgt, dst_dma, dma_len);
 		if (ret)
 			goto out_terminate;
-		for_each_set_bit(i, &cur.chan_mask, nr_channels)
-			dma_async_issue_pending(channels[i].chan);
+		for_each_set_bit(i, &cur.chan_mask, MM_OFFLOAD_DMA_MAX_CHANNELS)
+			dma_async_issue_pending(mm_offload_dma_chan(i));
 	}
 
 	for (i = cpu_off >> PAGE_SHIFT; i < nr_pages; i++) {
@@ -471,7 +395,7 @@ static int uffd_dma_copy_pages(struct page *dst, unsigned long nr_pages,
 	}
 	uffd_dma_unpin_src(pages, nr_pages, pinned);
 	kvfree(pages);
-	uffd_dma_release_channels(cur.chan_mask);
+	mm_offload_dma_release(cur.chan_mask);
 	atomic_long_add(ktime_us_delta(ktime_get(), t1), &unmap_us_total);
 
 	if (ret) {
@@ -490,8 +414,8 @@ static int uffd_dma_copy_pages(struct page *dst, unsigned long nr_pages,
 	return 0;
 
 out_terminate:
-	for_each_set_bit(i, &cur.chan_mask, nr_channels)
-		dmaengine_terminate_sync(channels[i].chan);
+	for_each_set_bit(i, &cur.chan_mask, MM_OFFLOAD_DMA_MAX_CHANNELS)
+		dmaengine_terminate_sync(mm_offload_dma_chan(i));
 	dma_unmap_page_attrs(dev, dst_dma, size, DMA_FROM_DEVICE, 0);
 out_unmap_src:
 	if (contig) {
@@ -506,7 +430,7 @@ out_unpin:
 out_free:
 	kvfree(pages);
 out_release:
-	uffd_dma_release_channels(cur.chan_mask);
+	mm_offload_dma_release(cur.chan_mask);
 	if (ret != -EFAULT) {
 		atomic_long_inc(&copies_failed);
 		pr_warn_ratelimited("uffd_dma: copy setup failed (%d), falling back to CPU\n",
@@ -521,46 +445,6 @@ static const struct mm_offload_provider uffd_dma_copier = {
 	.owner = THIS_MODULE,
 };
 
-/* ---- channel acquisition ---- */
-
-static void uffd_dma_put_channels(void)
-{
-	while (nr_channels) {
-		nr_channels--;
-		dma_release_channel(channels[nr_channels].chan);
-		channels[nr_channels].chan = NULL;
-	}
-	nr_groups = 0;
-}
-
-static int uffd_dma_get_channels(void)
-{
-	struct device *dev;
-	dma_cap_mask_t mask;
-
-	dma_cap_zero(mask);
-	dma_cap_set(DMA_MEMCPY, mask);
-
-	while (nr_channels < nr_dma_chan) {
-		struct dma_chan *chan = dma_request_chan_by_mask(&mask);
-
-		if (IS_ERR(chan))
-			break;
-		dev = dmaengine_get_dma_device(chan);
-		if (!nr_groups || groups[nr_groups - 1].dev != dev) {
-			groups[nr_groups].dev = dev;
-			groups[nr_groups].node = dev_to_node(dev);
-			groups[nr_groups].first = nr_channels;
-			groups[nr_groups].nr = 0;
-			nr_groups++;
-		}
-		groups[nr_groups - 1].nr++;
-		channels[nr_channels].chan = chan;
-		mutex_init(&channels[nr_channels].lock);
-		nr_channels++;
-	}
-	return nr_channels ? 0 : -ENODEV;
-}
 
 /* ---- sysfs ---- */
 
@@ -585,18 +469,18 @@ static ssize_t offloading_store(struct kobject *kobj,
 	if (enable == offloading_enabled)
 		goto out;
 	if (enable) {
-		ret = uffd_dma_get_channels();
+		ret = mm_offload_dma_pool_get(READ_ONCE(nr_dma_chan));
 		if (ret)
 			goto err;
 		ret = mm_offload_register(&uffd_dma_copier, 0);
 		if (ret) {
-			uffd_dma_put_channels();
+			mm_offload_dma_pool_put();
 			goto err;
 		}
 		offloading_enabled = true;
 	} else {
 		mm_offload_unregister(&uffd_dma_copier);
-		uffd_dma_put_channels();
+		mm_offload_dma_pool_put();
 		offloading_enabled = false;
 	}
 out:
@@ -671,7 +555,7 @@ static ssize_t name##_store(struct kobject *kobj, struct kobj_attribute *attr,	\
 }										\
 static struct kobj_attribute name##_attr = __ATTR_RW(name)
 
-UFFD_DMA_UINT_ATTR(nr_dma_chan, 1, UFFD_DMA_MAX_CHANNELS, true);
+UFFD_DMA_UINT_ATTR(nr_dma_chan, 1, MM_OFFLOAD_DMA_MAX_CHANNELS, true);
 UFFD_DMA_UINT_ATTR(cpu_pct, 0, 100, false);
 UFFD_DMA_UINT_ATTR(wait_mode, 0, 1, false);
 UFFD_DMA_UINT_ATTR(spin_us, 0, 100000, false);
@@ -759,7 +643,7 @@ static void __exit uffd_dma_exit(void)
 	mutex_lock(&uffd_dma_mutex);
 	if (offloading_enabled) {
 		mm_offload_unregister(&uffd_dma_copier);
-		uffd_dma_put_channels();
+		mm_offload_dma_pool_put();
 		offloading_enabled = false;
 	}
 	mutex_unlock(&uffd_dma_mutex);
