@@ -2311,14 +2311,29 @@ static struct dma_chan *io_dma_request_spread(dma_cap_mask_t *mask, int node)
 {
 	static atomic_t io_dma_chan_rr;
 	unsigned int rr = atomic_inc_return(&io_dma_chan_rr);
+	struct io_dma_chan_filter count = { .node = node, .target_dev = -1 };
 	struct dma_chan *chan;
-	int i;
+	int ndevs, i;
 
-	/* Round-robin across DSA devices */
-	for (i = 0; i < IO_DMA_MAX_DEVS; i++) {
+	/*
+	 * Count the matching devices before rotating. The rotation must
+	 * run modulo the real device count: taken modulo a fixed maximum,
+	 * every ordinal past the real count fails to match and the retry
+	 * loop wraps to ordinal zero, which aimed three quarters of all
+	 * acquisitions at the first device and stacked every ring of a
+	 * workload onto it. The counting request never matches, so it
+	 * only tallies device transitions.
+	 */
+	dma_request_channel(*mask, io_dma_chan_filter_fn, &count);
+	ndevs = count.seen_devs;
+	if (!ndevs)
+		return NULL;
+
+	/* Round-robin across the devices that actually matched. */
+	for (i = 0; i < ndevs; i++) {
 		struct io_dma_chan_filter f = {
 			.node = node,
-			.target_dev = (rr + i) % IO_DMA_MAX_DEVS,
+			.target_dev = (int)((rr + i) % ndevs),
 		};
 
 		chan = dma_request_channel(*mask, io_dma_chan_filter_fn, &f);
