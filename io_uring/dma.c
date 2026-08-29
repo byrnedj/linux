@@ -44,7 +44,7 @@ static inline unsigned long io_dma_prep_flags(void)
  * Destinations are already persistent since registered buffers map
  * once at registration.  This gives sources the same discipline,
  * lazily.  The first chunk touching a folio maps its
- * io_dma_map_quantum() sized segment DMA_TO_DEVICE and caches the
+ * io_dma_map_quantum() sized segment DMA_BIDIRECTIONAL and caches the
  * segment-head PFN to dma_addr translation in a per-device xarray.
  * Later chunks on that segment are pure arithmetic.  dma_unmap runs
  * only on the bytes-capped CLOCK eviction and on explicit flush.
@@ -68,7 +68,10 @@ static inline unsigned long io_dma_prep_flags(void)
 
 struct io_pfn_map {
 	unsigned long		pfn;		/* segment-head PFN, the cache key */
-	dma_addr_t		dma_base;	/* segment DMA_TO_DEVICE mapping */
+	dma_addr_t		dma_base;	/* segment mapping, bidirectional
+						 * so reads (src) and writes
+						 * (dst) share entries
+						 */
 	unsigned int		size;		/* mapped bytes (<= cache quantum) */
 	atomic_t		refs;		/* cache bias + in-flight users */
 	bool			referenced;	/* CLOCK second-chance bit */
@@ -205,8 +208,26 @@ static void io_pfn_map_put(struct io_pfn_map *pm)
 {
 	if (!atomic_dec_and_test(&pm->refs))
 		return;
-	dma_unmap_page(pm->dev, pm->dma_base, pm->size, DMA_TO_DEVICE);
+	dma_unmap_page(pm->dev, pm->dma_base, pm->size, DMA_BIDIRECTIONAL);
 	kfree_rcu(pm, rcu);
+}
+
+/*
+ * Displace an entry from the cache so its mapping dies with its last
+ * reference. The wedge path uses this on cached write destinations,
+ * where the standing mapping is device-writable and must not outlive
+ * the failed write; the unmap happens on the final put, immediately
+ * unless a concurrent I/O still holds the segment.
+ */
+static void io_pfn_map_displace(struct io_pfn_cache *c, struct io_pfn_map *pm)
+{
+	if (!c || !pm)
+		return;
+	if (xa_cmpxchg(&c->xa, pm->pfn, pm, NULL,
+		       GFP_NOWAIT | __GFP_NOWARN) == pm) {
+		atomic64_sub(pm->size, &c->covered);
+		io_pfn_map_put(pm);	/* the cache bias */
+	}
 }
 
 /*
@@ -395,7 +416,7 @@ miss:
 	if (!pm)
 		goto fail;
 	base = dma_map_page(c->dev, folio_page(folio, 0), seg_base,
-			    seg_len, DMA_TO_DEVICE);
+			    seg_len, DMA_BIDIRECTIONAL);
 	if (dma_mapping_error(c->dev, base)) {
 		kfree(pm);
 		goto fail;
@@ -414,7 +435,7 @@ miss:
 		/* We lost an insert race or the xarray node allocation
 		 * failed.
 		 */
-		dma_unmap_page(c->dev, base, pm->size, DMA_TO_DEVICE);
+		dma_unmap_page(c->dev, base, pm->size, DMA_BIDIRECTIONAL);
 		kfree(pm);
 		if (!xa_is_err(old) && atomic_inc_not_zero(&old->refs)) {
 			rcu_read_unlock();
@@ -553,6 +574,10 @@ static unsigned int io_dma_fmw_spin_us __read_mostly = 60;
  * fails the write. Tunable via debugfs io_uring_dma/fmw_wait_ms.
  */
 static unsigned int io_dma_fmw_wait_ms __read_mostly = 5000;
+/* DEBUG experiment: force singles to test batch-serialization theory */
+static unsigned int io_dma_batch_min __read_mostly = 8;
+/* DEBUG experiment: flush threshold, caps entries per batch descriptor */
+static unsigned int io_dma_batch_max __read_mostly = IO_DMA_BATCH_MAX;
 
 /*
  * Per-transaction DMA latency tracking, binned by transfer size. A
@@ -1131,6 +1156,8 @@ void io_dma_debugfs_init(void)
 	debugfs_create_u32("cq_poll_us", 0644, dir, &io_dma_cq_poll_us);
 	debugfs_create_u32("fmw_spin_us", 0644, dir, &io_dma_fmw_spin_us);
 	debugfs_create_u32("fmw_wait_ms", 0644, dir, &io_dma_fmw_wait_ms);
+	debugfs_create_u32("batch_min", 0644, dir, &io_dma_batch_min);
+	debugfs_create_u32("batch_max", 0644, dir, &io_dma_batch_max);
 	debugfs_create_u32("stats", 0644, dir, &io_dma_stats_enabled);
 	debugfs_create_file("latency", 0444, dir, NULL, &io_dma_lat_fops);
 	debugfs_create_file("latency_reset", 0200, dir, NULL,
@@ -1391,7 +1418,7 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 	return total_len;
 }
 
-#define IO_DMA_BATCH_MIN	8
+#define IO_DMA_BATCH_MIN	READ_ONCE(io_dma_batch_min)
 
 /*
  * Submit a single DMA descriptor for one batch entry.
@@ -1709,7 +1736,9 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 				batch_bytes += chunk;
 
 				/* Flush the batch if it is full. */
-				if (nr_entries == IO_DMA_BATCH_MAX) {
+				if (nr_entries >= min_t(unsigned int,
+						READ_ONCE(io_dma_batch_max),
+						IO_DMA_BATCH_MAX)) {
 					ssize_t ret;
 
 					ret = io_dma_flush_batch(req, dev, chan,
@@ -1820,8 +1849,19 @@ struct io_dma_fmw_folio {
 	void *fsdata;
 	loff_t pos;
 	unsigned int len;
-	dma_addr_t dst_dma;	/* 0 means nothing to unmap */
-	unsigned int map_len;
+};
+
+/* One destination mapping piece, bounded by the map quantum so cached
+ * segments serve it. A folio chunk larger than the quantum spans
+ * several pieces; the release and the wedge fence walk this array
+ * rather than per-chunk mappings.
+ */
+struct io_dma_fmw_dst {
+	dma_addr_t dma;
+	unsigned int len;
+	unsigned int off;		/* offset in its folio */
+	struct folio *folio;
+	struct io_pfn_map *pm;		/* NULL = plain per-piece mapping */
 };
 
 /* One in-flight write descriptor, carrying what qstat accounting needs. */
@@ -1919,7 +1959,9 @@ static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
 				struct io_dma_fmw_folio *fol,
 				unsigned int max_fol,
 				struct io_dma_fmw_ck *cookies,
-				unsigned int max_cookies)
+				unsigned int max_cookies,
+				struct io_dma_fmw_dst *dsts,
+				unsigned int max_dst)
 {
 	struct io_ring_ctx *ctx = req->ctx;
 	struct file *file = iocb->ki_filp;
@@ -1933,6 +1975,11 @@ static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
 	 */
 	size_t max_chunk = min_t(size_t, mapping_max_folio_size(mapping),
 				 io_dma_map_quantum(dev));
+	struct io_pfn_cache *pfn_cache =
+		io_pfn_cache_usable() ? io_pfn_cache_get(dev) : NULL;
+	struct io_dma_fmw_dst *cur_dst = NULL;
+	size_t cur_dst_remain = 0;
+	unsigned int nr_dst = 0;
 	unsigned int nr_fol = 0, nr_cookies = 0, i;
 	unsigned int prep_fails = 0;
 	bool redo = false;
@@ -1947,7 +1994,6 @@ static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
 				     max_chunk - (pos & (max_chunk - 1)),
 				     room - collected);
 		size_t offset, sub;
-		dma_addr_t dst_dma;
 		struct folio *folio;
 		void *fsdata;
 		int status;
@@ -2008,7 +2054,6 @@ static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
 			 * beats paying a drain-wait per chunk while dozens
 			 * of other rings hold the pools empty.
 			 */
-			dst_dma = 0;
 			redo = true;
 			goto record;
 		}
@@ -2019,35 +2064,73 @@ static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
 			 * re-checked per chunk so that a draining queue
 			 * readmits mid-write.
 			 */
-			dst_dma = 0;
 			redo = true;
 			goto record;
 		}
-		dst_dma = dma_map_page(dev, folio_page(folio, 0),
-				       offset, bytes, DMA_FROM_DEVICE);
-		if (dma_mapping_error(dev, dst_dma)) {
-			/* Commit this chunk via the CPU-redo pass instead. */
-			dst_dma = 0;
-			redo = true;
-			goto record;
-		}
-
-		/* Split at the source registered-buffer folio boundaries. */
+		/* Split at source registered-buffer folio boundaries and
+		 * at map-quantum boundaries of the destination folio. The
+		 * dst folios are the same page-cache folios reads source
+		 * from and cache entries are bidirectional, so quantum
+		 * sized dst pieces let the cache serve the write side.
+		 * A folio chunk mapped whole would exceed the IOVA
+		 * rcache class under a strict IOMMU and pay the
+		 * allocator slow path on every chunk, which is most of
+		 * the write path's gap to passthrough.
+		 */
 		for (sub = 0; sub < bytes; ) {
 			u64 uaddr = src_user_addr + base + collected + sub;
-			size_t src_seg_remain, len;
+			size_t src_seg_remain, len, dst_remain;
 			struct dma_async_tx_descriptor *tx;
 			dma_addr_t src_dma, dst;
+			struct io_dma_fmw_dst *dp;
 			dma_cookie_t ck;
 
 			src_dma = io_reg_buf_dma_addr(imu, uaddr,
 						      &src_seg_remain);
-			dst = dst_dma + sub;
 			if (unlikely(!src_dma)) {
 				redo = true;	/* The CPU-redo pass covers the chunk. */
 				break;
 			}
-			len = min3(bytes - sub, src_seg_remain, max_chunk);
+
+			/* Acquire the dst piece covering offset + sub. */
+			if (!cur_dst || !cur_dst_remain) {
+				size_t doff = offset + sub;
+				size_t plen = min_t(size_t, bytes - sub,
+						max_chunk -
+						(doff & (max_chunk - 1)));
+				struct io_pfn_map *pm = NULL;
+				dma_addr_t d;
+
+				if (nr_dst == max_dst) {
+					redo = true;
+					break;
+				}
+				pm = pfn_cache ?
+					io_pfn_map_lookup(pfn_cache, folio,
+							  doff, plen,
+							  folio_size(folio),
+							  &d) : NULL;
+				if (!pm) {
+					d = dma_map_page(dev,
+							 folio_page(folio, 0),
+							 doff, plen,
+							 DMA_FROM_DEVICE);
+					if (dma_mapping_error(dev, d)) {
+						redo = true;
+						break;
+					}
+				}
+				dsts[nr_dst] = (struct io_dma_fmw_dst){
+					.dma = d, .len = plen, .off = doff,
+					.folio = folio, .pm = pm,
+				};
+				cur_dst = &dsts[nr_dst++];
+				cur_dst_remain = plen;
+			}
+			dst = cur_dst->dma +
+			      (cur_dst->len - cur_dst_remain);
+			dst_remain = cur_dst_remain;
+			len = min3(bytes - sub, src_seg_remain, dst_remain);
 
 			tx = dmaengine_prep_dma_memcpy(chan, dst, src_dma, len,
 						       io_dma_prep_flags());
@@ -2097,11 +2180,14 @@ static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
 				}
 			}
 			sub += len;
+			cur_dst_remain -= len;
 		}
+		cur_dst = NULL;
+		cur_dst_remain = 0;
 record:
 		fol[nr_fol++] = (struct io_dma_fmw_folio){
 			.folio = folio, .fsdata = fsdata, .pos = pos,
-			.len = bytes, .dst_dma = dst_dma, .map_len = bytes,
+			.len = bytes,
 		};
 		collected += bytes;
 	}
@@ -2117,10 +2203,22 @@ collect_done:
 	 * domain they land in the folios leaked below, which stay locked
 	 * and referenced. Either way they never reach reclaimed memory.
 	 */
-	for (i = 0; i < nr_fol; i++)
-		if (fol[i].dst_dma)
-			dma_unmap_page(dev, fol[i].dst_dma, fol[i].map_len,
+	for (i = 0; i < nr_dst; i++) {
+		if (dsts[i].pm) {
+			/* On a wedge the cached mapping must not stay
+			 * device-writable, so displace it; the unmap
+			 * happens when the last reference drops, which
+			 * is this put unless a concurrent I/O holds the
+			 * same segment.
+			 */
+			if (unlikely(wedged))
+				io_pfn_map_displace(pfn_cache, dsts[i].pm);
+			io_pfn_map_put(dsts[i].pm);
+		} else {
+			dma_unmap_page(dev, dsts[i].dma, dsts[i].len,
 				       DMA_FROM_DEVICE);
+		}
+	}
 
 	if (unlikely(wedged)) {
 		/* The folio contents are unknown and a stray write may
@@ -2207,7 +2305,8 @@ ssize_t io_dma_filemap_write(struct io_kiocb *req, struct kiocb *iocb,
 	struct inode *inode = file->f_mapping->host;
 	struct io_dma_fmw_folio *fol = NULL;
 	struct io_dma_fmw_ck *cookies = NULL;
-	unsigned int max_fol, max_cookies;
+	struct io_dma_fmw_dst *dsts = NULL;
+	unsigned int max_fol, max_cookies, max_dst;
 	ssize_t want, written = 0, err = 0;
 
 	/* At or below this size the per-folio write_begin and write_end
@@ -2237,9 +2336,14 @@ ssize_t io_dma_filemap_write(struct io_kiocb *req, struct kiocb *iocb,
 	 */
 	max_cookies = max_fol + DIV_ROUND_UP(want, 1UL << imu->folio_shift) + 8;
 	max_cookies = min_t(unsigned int, max_cookies, 4 * max_fol + 8);
+	/* One dst piece per map-quantum crossing per folio chunk. */
+	max_dst = max_fol * (1 + DIV_ROUND_UP(
+			mapping_max_folio_size(file->f_mapping),
+			io_dma_map_quantum(req->ctx->dma.chan->device->dev)));
 	fol = kvmalloc_array(max_fol, sizeof(*fol), GFP_KERNEL);
 	cookies = kvmalloc_array(max_cookies, sizeof(*cookies), GFP_KERNEL);
-	if (!fol || !cookies) {
+	dsts = kvmalloc_array(max_dst, sizeof(*dsts), GFP_KERNEL);
+	if (!fol || !cookies || !dsts) {
 		err = -EAGAIN;	/* Fall back to the normal write path. */
 		goto out_unlock;
 	}
@@ -2252,7 +2356,8 @@ ssize_t io_dma_filemap_write(struct io_kiocb *req, struct kiocb *iocb,
 	while (written < want) {
 		ssize_t done = io_dma_fmw_group(req, iocb, from, src_user_addr,
 						written, want - written, fol,
-						max_fol, cookies, max_cookies);
+						max_fol, cookies, max_cookies,
+						dsts, max_dst);
 
 		if (done <= 0) {
 			/* A zero-progress group falls back to the normal
@@ -2272,6 +2377,7 @@ out_unlock:
 	inode_unlock(inode);
 	kvfree(fol);
 	kvfree(cookies);
+	kvfree(dsts);
 	if (written > 0) {
 		if (written < want)
 			io_dma_fmw_record(IO_DMA_FMW_SHORT);
