@@ -639,6 +639,7 @@ enum {
 	IO_DMA_FM_EFAULT,
 	IO_DMA_FM_OTHER,
 	IO_DMA_FM_CPU_TAIL,
+	IO_DMA_FM_SLOT_WAIT,
 	IO_DMA_FM_NR,
 };
 void io_dma_fm_record(unsigned int reason);

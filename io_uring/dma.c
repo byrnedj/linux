@@ -7,6 +7,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/spinlock.h>
 #include <linux/xarray.h>
+#include <linux/hash.h>
 #include <linux/pagemap.h>
 #include <linux/folio_batch.h>
 #include <linux/swap.h>
@@ -576,6 +577,17 @@ static unsigned int io_dma_fmw_spin_us __read_mostly = 60;
 static unsigned int io_dma_fmw_wait_ms __read_mostly = 5000;
 /* DEBUG experiment: force singles to test batch-serialization theory */
 static unsigned int io_dma_batch_min __read_mostly = 8;
+/*
+ * Bounded wait for a descriptor slot on a failed read prep, in
+ * microseconds; 0 restores the old shatter-into-CPU-tails behavior.
+ * The budget should cover one descriptor service time under load.
+ * Default off: measured on saturated 16-job reads, waiting for slots
+ * more than halved throughput, because the CPU tails it eliminates
+ * are a hybrid copy mode that adds CPU bandwidth on top of the
+ * slot-limited device. The knob remains for latency-sensitive or
+ * CPU-scarce experiments.
+ */
+static unsigned int io_dma_slot_wait_us __read_mostly;
 /* DEBUG experiment: flush threshold, caps entries per batch descriptor */
 static unsigned int io_dma_batch_max __read_mostly = IO_DMA_BATCH_MAX;
 
@@ -624,7 +636,7 @@ static struct io_dma_lat_stats io_dma_lat_dma;	/* DSA transactions (per task) */
  */
 static const char * const io_dma_fm_names[IO_DMA_FM_NR] = {
 	"engaged", "shmem", "not_bvec", "direct", "no_dma_addrs",
-	"eagain", "enomem", "efault", "other", "cpu_tail",
+	"eagain", "enomem", "efault", "other", "cpu_tail", "slot_wait",
 };
 static atomic64_t io_dma_fm[IO_DMA_FM_NR];
 
@@ -860,6 +872,55 @@ static u32 io_dma_budget_wr_pct = 75;
  * CPU-redo pass.  This is checked per chunk so that a draining queue
  * readmits mid-write.
  */
+/*
+ * Memo for the registry lookups. The submit and complete hooks run per
+ * descriptor and the two linear scans behind them showed up as several
+ * percent of submit-path CPU. The memo is validated against the
+ * authoritative fields, so a torn or stale entry can never return the
+ * wrong slot, only fall back to the scans.
+ */
+struct io_dma_stat_memo {
+	struct dma_chan		*chan;
+	struct io_dma_dev_stat	*d;
+	struct io_dma_chan_qstat *q;
+};
+/*
+ * Per CPU, not hashed and shared: a global memo array written on every
+ * miss by every submitting CPU was a cacheline storm that cost more
+ * than the scans it saved. Each CPU tends to feed one ring and so one
+ * channel, so a single private entry hits almost always and a miss
+ * only rewrites a line this CPU owns.
+ */
+static DEFINE_PER_CPU(struct io_dma_stat_memo, io_dma_stat_memo_pcpu);
+
+static void io_dma_stat_lookup(struct dma_chan *chan,
+			       struct io_dma_dev_stat **dp,
+			       struct io_dma_chan_qstat **qp)
+{
+	struct io_dma_stat_memo *m = get_cpu_ptr(&io_dma_stat_memo_pcpu);
+	struct io_dma_dev_stat *d = m->d;
+	struct io_dma_chan_qstat *q = m->q;
+
+	if (m->chan == chan && d && q &&
+	    READ_ONCE(d->key) == chan->device &&
+	    READ_ONCE(q->chan) == chan && !READ_ONCE(q->released)) {
+		put_cpu_ptr(&io_dma_stat_memo_pcpu);
+		*dp = d;
+		*qp = q;
+		return;
+	}
+	d = io_dma_dev_stat_get(chan);
+	q = d ? io_dma_qstat_get(d, chan) : NULL;
+	if (d && q) {
+		m->d = d;
+		m->q = q;
+		m->chan = chan;
+	}
+	put_cpu_ptr(&io_dma_stat_memo_pcpu);
+	*dp = d;
+	*qp = q;
+}
+
 static bool io_dma_budget_refuse_wr(struct dma_chan *chan)
 {
 	u64 budget = READ_ONCE(io_dma_budget_descs);
@@ -867,7 +928,11 @@ static bool io_dma_budget_refuse_wr(struct dma_chan *chan)
 
 	if (!budget)
 		return false;
-	d = io_dma_dev_stat_get(chan);
+	{
+		struct io_dma_chan_qstat *q;
+
+		io_dma_stat_lookup(chan, &d, &q);
+	}
 	if (!d)
 		return false;
 	if (atomic64_read(&d->inflight) >= budget ||
@@ -891,7 +956,11 @@ static bool io_dma_budget_refuse_rd(struct dma_chan *chan)
 
 	if (!budget)
 		return false;
-	d = io_dma_dev_stat_get(chan);
+	{
+		struct io_dma_chan_qstat *q;
+
+		io_dma_stat_lookup(chan, &d, &q);
+	}
 	if (!d)
 		return false;
 	if (atomic64_read(&d->inflight) > budget) {
@@ -903,16 +972,16 @@ static bool io_dma_budget_refuse_rd(struct dma_chan *chan)
 
 static void io_dma_qstat_submit(struct dma_chan *chan, u32 len, bool wr)
 {
-	struct io_dma_dev_stat *d = io_dma_dev_stat_get(chan);
+	struct io_dma_dev_stat *d;
 	struct io_dma_chan_qstat *q;
 	u64 now, hwm;
 
+	io_dma_stat_lookup(chan, &d, &q);
 	if (!d)
 		return;
 	atomic64_inc(&d->inflight);
 	if (wr)
 		atomic64_inc(&d->inflight_wr);
-	q = io_dma_qstat_get(d, chan);
 	if (!q)
 		return;
 	atomic64_inc(&q->seen_kb[io_dma_qstat_bucket(
@@ -933,15 +1002,15 @@ static void io_dma_qstat_submit(struct dma_chan *chan, u32 len, bool wr)
 static void io_dma_qstat_complete(struct dma_chan *chan, u32 len, u64 submit_ns,
 				  bool wr)
 {
-	struct io_dma_dev_stat *d = io_dma_dev_stat_get(chan);
+	struct io_dma_dev_stat *d;
 	struct io_dma_chan_qstat *q;
 
+	io_dma_stat_lookup(chan, &d, &q);
 	if (!d)
 		return;
 	atomic64_dec(&d->inflight);
 	if (wr)
 		atomic64_dec(&d->inflight_wr);
-	q = io_dma_qstat_get(d, chan);
 	if (!q)
 		return;
 	atomic64_sub(len, &q->inflight);
@@ -1158,6 +1227,7 @@ void io_dma_debugfs_init(void)
 	debugfs_create_u32("fmw_wait_ms", 0644, dir, &io_dma_fmw_wait_ms);
 	debugfs_create_u32("batch_min", 0644, dir, &io_dma_batch_min);
 	debugfs_create_u32("batch_max", 0644, dir, &io_dma_batch_max);
+	debugfs_create_u32("slot_wait_us", 0644, dir, &io_dma_slot_wait_us);
 	debugfs_create_u32("stats", 0644, dir, &io_dma_stats_enabled);
 	debugfs_create_file("latency", 0444, dir, NULL, &io_dma_lat_fops);
 	debugfs_create_file("latency_reset", 0200, dir, NULL,
@@ -1317,7 +1387,8 @@ void io_uring_dma_prep(struct io_kiocb *req)
 static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 				   struct device *dev, struct dma_chan *chan,
 				   struct io_dma_batch_entry *entries,
-				   unsigned int nr_entries, u32 off)
+				   unsigned int nr_entries, u32 off,
+				   bool can_wait)
 {
 	struct dma_async_tx_descriptor *tx;
 	struct io_dma_batch_entry *heap_entries;
@@ -1369,6 +1440,26 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 	tx = dmaengine_prep_dma_memcpy_sg(chan, dst_sgl, nr_entries,
 					   src_sgl, nr_entries,
 					   io_dma_prep_flags());
+	if (!tx) {
+		/* Same bounded wait-for-slot as the single path. */
+		u64 us = READ_ONCE(io_dma_slot_wait_us);
+		u64 end;
+
+		if (!can_wait)
+			us /= 8;
+		end = ktime_get_ns() + us * NSEC_PER_USEC;
+		while (!tx && us && ktime_get_ns() < end) {
+			__io_dma_poll(req->ctx);
+			if (can_wait)
+				cond_resched();
+			tx = dmaengine_prep_dma_memcpy_sg(chan, dst_sgl,
+							  nr_entries, src_sgl,
+							  nr_entries,
+							  io_dma_prep_flags());
+		}
+		if (tx)
+			io_dma_fm_record(IO_DMA_FM_SLOT_WAIT);
+	}
 	if (!tx) {
 		kfree(sgls);
 		io_dma_task_free(req->ctx, dma);
@@ -1428,7 +1519,7 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 static ssize_t io_dma_submit_single_entry(struct io_kiocb *req,
 					  struct dma_chan *chan,
 					  struct io_dma_batch_entry *entry,
-					  u32 off)
+					  u32 off, bool can_wait)
 {
 	struct dma_async_tx_descriptor *tx;
 	struct io_dma_task *dma;
@@ -1443,6 +1534,36 @@ static ssize_t io_dma_submit_single_entry(struct io_kiocb *req,
 	 */
 	tx = dmaengine_prep_dma_memcpy(chan, entry->dst_dma, entry->src_dma,
 				       entry->src_len, io_dma_prep_flags());
+	if (!tx) {
+		/*
+		 * The channel pool is exhausted. The old behavior took a
+		 * short claim and the CPU copied the tail, which at
+		 * saturation turned a quarter to half of all large reads
+		 * partly back into memcpy. Polling completions retires
+		 * finished descriptors and frees their slots, so a
+		 * bounded wait converts those CPU tails into a little
+		 * submission latency. The nowait pass, where most warm
+		 * reads complete, gets an eighth of the budget; the
+		 * poll loop never sleeps, so spinning there is legal.
+		 */
+		u64 us = READ_ONCE(io_dma_slot_wait_us);
+		u64 end;
+
+		if (!can_wait)
+			us /= 8;
+		end = ktime_get_ns() + us * NSEC_PER_USEC;
+		while (!tx && us && ktime_get_ns() < end) {
+			__io_dma_poll(req->ctx);
+			if (can_wait)
+				cond_resched();
+			tx = dmaengine_prep_dma_memcpy(chan, entry->dst_dma,
+						       entry->src_dma,
+						       entry->src_len,
+						       io_dma_prep_flags());
+		}
+		if (tx)
+			io_dma_fm_record(IO_DMA_FM_SLOT_WAIT);
+	}
 	if (!tx) {
 		io_dma_task_free(req->ctx, dma);
 		return -EAGAIN;
@@ -1523,7 +1644,8 @@ static void io_dma_unmap_batch_entries(struct io_kiocb *req,
 static ssize_t io_dma_flush_batch(struct io_kiocb *req,
 				  struct device *dev, struct dma_chan *chan,
 				  struct io_dma_batch_entry *entries,
-				  unsigned int nr_entries, u32 off)
+				  unsigned int nr_entries, u32 off,
+				  bool can_wait)
 {
 	ssize_t total = 0;
 	unsigned int i;
@@ -1535,7 +1657,7 @@ static ssize_t io_dma_flush_batch(struct io_kiocb *req,
 	if (nr_entries < IO_DMA_BATCH_MIN) {
 		for (i = 0; i < nr_entries; i++) {
 			ret = io_dma_submit_single_entry(req, chan, &entries[i],
-							 off + total);
+							 off + total, can_wait);
 			if (ret < 0) {
 				/* A failed submit never consumes the entry's
 				 * source mapping, so release this entry and
@@ -1551,7 +1673,8 @@ static ssize_t io_dma_flush_batch(struct io_kiocb *req,
 		return total;
 	}
 
-	ret = io_dma_submit_batch(req, dev, chan, entries, nr_entries, off);
+	ret = io_dma_submit_batch(req, dev, chan, entries, nr_entries, off,
+				  can_wait);
 	if (ret < 0)
 		io_dma_unmap_batch_entries(req, dev, entries, nr_entries);
 	return ret;
@@ -1583,6 +1706,7 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 	struct dma_chan *chan = ctx->dma.chan;
 	struct io_pfn_cache *pfn_cache =
 		io_pfn_cache_usable() ? io_pfn_cache_get(dev) : NULL;
+	bool can_wait = !(iocb->ki_flags & IOCB_NOWAIT);
 	size_t map_quantum = io_dma_map_quantum(dev);
 	struct folio_batch fbatch;
 	struct io_dma_batch_entry *entries;
@@ -1743,7 +1867,8 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 
 					ret = io_dma_flush_batch(req, dev, chan,
 						entries, nr_entries,
-						dst_offset - batch_bytes);
+						dst_offset - batch_bytes,
+						can_wait);
 					nr_entries = 0;
 					if (ret < 0) {
 						error = ret;
@@ -1781,7 +1906,7 @@ flush_and_put:
 
 			ret = io_dma_flush_batch(req, dev, chan,
 				entries, nr_entries,
-				dst_offset - batch_bytes);
+				dst_offset - batch_bytes, can_wait);
 			nr_entries = 0;
 			if (ret < 0) {
 				if (!error)
@@ -2082,7 +2207,6 @@ static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
 			size_t src_seg_remain, len, dst_remain;
 			struct dma_async_tx_descriptor *tx;
 			dma_addr_t src_dma, dst;
-			struct io_dma_fmw_dst *dp;
 			dma_cookie_t ck;
 
 			src_dma = io_reg_buf_dma_addr(imu, uaddr,
