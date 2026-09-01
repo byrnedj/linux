@@ -316,8 +316,19 @@ enum {
 
 struct iou_ctx {};
 
+#define IO_DMA_RING_CHANS	4
+
 struct io_dma_channel {
-	struct dma_chan		*chan;
+	struct dma_chan		*chan;		/* primary; equals chans[0].
+						 * The write path, the gates,
+						 * and teardown key on it.
+						 */
+	struct dma_chan		*chans[IO_DMA_RING_CHANS];
+	unsigned int		nr_chans;
+	unsigned int		stripe_rr;	/* next stripe channel; only
+						 * the submitter under
+						 * uring_lock advances it
+						 */
 
 	struct work_struct	poll_work;
 	atomic_t		poll_armed;
@@ -400,6 +411,11 @@ struct io_dma_task {
 	struct io_kiocb		*req;
 	struct llist_node	llnode;		/* ctx submit_list linkage */
 	dma_cookie_t		cookie;
+	struct dma_chan		*chan;		/* submission channel; the
+						 * poller and the completion
+						 * accounting follow the task,
+						 * not the ring's primary
+						 */
 	u64			submit_ns;	/* ktime at hw submit, for latency stats */
 	dma_addr_t		src_dma;	/* DMA-mapped source address */
 	dma_addr_t		dst_dma;	/* pre-mapped dest DMA address */

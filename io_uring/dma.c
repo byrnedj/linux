@@ -588,6 +588,12 @@ static unsigned int io_dma_batch_min __read_mostly = 8;
  * CPU-scarce experiments.
  */
 static unsigned int io_dma_slot_wait_us __read_mostly;
+/*
+ * Channels acquired per ring for read striping. One channel reaches one
+ * device, four engines of sixteen; a single-stream op striped across
+ * distinct devices reaches them all. Read at ring creation.
+ */
+unsigned int io_dma_stripe_chans __read_mostly = IO_DMA_RING_CHANS;
 /* DEBUG experiment: flush threshold, caps entries per batch descriptor */
 static unsigned int io_dma_batch_max __read_mostly = IO_DMA_BATCH_MAX;
 
@@ -1028,8 +1034,8 @@ static void io_dma_qstat_complete(struct dma_chan *chan, u32 len, u64 submit_ns,
  */
 void io_dma_qstat_task_abandon(struct io_ring_ctx *ctx, struct io_dma_task *dma)
 {
-	if (!IS_ERR_OR_NULL(ctx->dma.chan))
-		io_dma_qstat_complete(ctx->dma.chan, dma->len, 0, false);
+	if (dma->chan)
+		io_dma_qstat_complete(dma->chan, dma->len, 0, false);
 }
 
 static int io_dma_chan_qstat_show(struct seq_file *m, void *v)
@@ -1228,6 +1234,7 @@ void io_dma_debugfs_init(void)
 	debugfs_create_u32("batch_min", 0644, dir, &io_dma_batch_min);
 	debugfs_create_u32("batch_max", 0644, dir, &io_dma_batch_max);
 	debugfs_create_u32("slot_wait_us", 0644, dir, &io_dma_slot_wait_us);
+	debugfs_create_u32("stripe_chans", 0644, dir, &io_dma_stripe_chans);
 	debugfs_create_u32("stats", 0644, dir, &io_dma_stats_enabled);
 	debugfs_create_file("latency", 0444, dir, NULL, &io_dma_lat_fops);
 	debugfs_create_file("latency_reset", 0200, dir, NULL,
@@ -1476,6 +1483,7 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 	dma->next = NULL;
 	dma->len = total_len;
 	dma->off = off;
+	dma->chan = chan;
 	dma->is_batch = true;
 	dma->batch_nr = nr_entries;
 	dma->batch_entries = heap_entries;
@@ -1573,6 +1581,7 @@ static ssize_t io_dma_submit_single_entry(struct io_kiocb *req,
 
 	dma->req = req;
 	dma->next = NULL;
+	dma->chan = chan;
 	dma->src_dma = entry->src_dma;
 	dma->dst_dma = entry->dst_dma;
 	dma->len = entry->src_len;
@@ -1702,8 +1711,20 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 	struct address_space *mapping = filp->f_mapping;
 	struct inode *inode = mapping->host;
 	struct io_mapped_ubuf *imu = req->buf_node->buf;
-	struct device *dev = ctx->dma.chan->device->dev;
-	struct dma_chan *chan = ctx->dma.chan;
+	/*
+	 * Stripe state. One channel reaches one device, four engines of
+	 * sixteen, so a single stream's batches rotate across the ring's
+	 * channels: each flush targets the current stripe channel and
+	 * advances the rotation. Everything device-scoped, meaning the
+	 * registered-buffer addresses, the PFN cache instance, and the
+	 * flush target, follows the current stripe. Rotation state lives
+	 * on the ctx; submissions are serialized by uring_lock.
+	 */
+	unsigned int nr_chans = ctx->dma.nr_chans ? ctx->dma.nr_chans : 1;
+	unsigned int stripe = ctx->dma.stripe_rr % nr_chans;
+	struct dma_chan *chan = ctx->dma.nr_chans ?
+		ctx->dma.chans[stripe] : ctx->dma.chan;
+	struct device *dev = chan->device->dev;
 	struct io_pfn_cache *pfn_cache =
 		io_pfn_cache_usable() ? io_pfn_cache_get(dev) : NULL;
 	bool can_wait = !(iocb->ki_flags & IOCB_NOWAIT);
@@ -1816,7 +1837,7 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 
 				dst_dma = io_reg_buf_dma_addr(imu,
 						dst_user_addr + dst_offset,
-						&dst_seg_remain);
+						&dst_seg_remain, dev);
 				if (!dst_dma) {
 					error = -EFAULT;
 					goto flush_and_put;
@@ -1875,6 +1896,25 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 						goto put_folios;
 					}
 					/*
+					 * Rotate the stripe so the next
+					 * batch lands on the next channel
+					 * and its device. The reload keeps
+					 * every device-scoped hand, the
+					 * dst addresses and the PFN cache,
+					 * consistent with the new target.
+					 */
+					if (nr_chans > 1 &&
+					    ret == (ssize_t)batch_bytes) {
+						stripe = (stripe + 1) %
+							 nr_chans;
+						chan = ctx->dma.chans[stripe];
+						dev = chan->device->dev;
+						pfn_cache =
+						    io_pfn_cache_usable() ?
+						    io_pfn_cache_get(dev) :
+						    NULL;
+					}
+					/*
 					 * Count only what the flush actually
 					 * submitted and stop on a short
 					 * flush. The claim must stay a
@@ -1927,8 +1967,19 @@ put_folios:
 
 	file_accessed(filp);
 
-	if (req->dma.dma_refcnt > 0)
-		dma_async_issue_pending(chan);
+	if (req->dma.dma_refcnt > 0) {
+		unsigned int c;
+
+		/* Descriptors reach hardware at submit time; this is the
+		 * belt over every channel a stripe may have touched.
+		 */
+		for (c = 0; c < nr_chans; c++)
+			dma_async_issue_pending(ctx->dma.nr_chans ?
+						ctx->dma.chans[c] :
+						ctx->dma.chan);
+	}
+	/* Persist the rotation so successive ops keep spreading. */
+	ctx->dma.stripe_rr = stripe + 1;
 
 	kfree(entries);
 
@@ -2210,7 +2261,8 @@ static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
 			dma_cookie_t ck;
 
 			src_dma = io_reg_buf_dma_addr(imu, uaddr,
-						      &src_seg_remain);
+						      &src_seg_remain,
+						      dev);
 			if (unlikely(!src_dma)) {
 				redo = true;	/* The CPU-redo pass covers the chunk. */
 				break;
@@ -2590,7 +2642,7 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
 		req->dma.min_fail_off = min(req->dma.min_fail_off, dma->off);
 	}
 
-	io_dma_qstat_complete(req->ctx->dma.chan, task_len,
+	io_dma_qstat_complete(dma->chan, task_len,
 			      dma->submit_ns, false);
 
 	/* Free the task before touching the refcnt. task_len was saved above. */
@@ -2846,7 +2898,7 @@ int __io_dma_poll(struct io_ring_ctx *ctx)
 			 * whole walk made submitters fight the poller for
 			 * it.
 			 */
-			ret = dmaengine_async_is_tx_complete(ctx->dma.chan,
+			ret = dmaengine_async_is_tx_complete(dma->chan,
 							     dma->cookie);
 			if (ret == DMA_IN_PROGRESS) {
 				/*
@@ -2875,7 +2927,8 @@ int __io_dma_poll(struct io_ring_ctx *ctx)
 			 * covers only the refcount handshake with the
 			 * submitter's ref-take.
 			 */
-			io_dma_task_release_res(ctx, dev, dma);
+			io_dma_task_release_res(ctx,
+					dma->chan->device->dev, dma);
 			spin_lock_irqsave(&ctx->dma.lock, flags);
 			__io_dma_task_complete(dev, dma, ret);
 			spin_unlock_irqrestore(&ctx->dma.lock, flags);

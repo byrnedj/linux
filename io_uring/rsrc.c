@@ -221,14 +221,19 @@ static void io_buffer_unmap(struct io_ring_ctx *ctx, struct io_mapped_ubuf *imu)
 	}
 
 	/* Unmap the DMA addresses if they were mapped. */
-	if (imu->dma_addrs) {
-		int i;
+	if (imu->dma_nr_devs) {
+		unsigned int d, i;
 
-		for (i = 0; i < imu->nr_bvecs; i++)
-			dma_unmap_page(imu->dma_dev, imu->dma_addrs[i],
-				       1UL << imu->folio_shift,
-				       DMA_BIDIRECTIONAL);
-		kvfree(imu->dma_addrs);
+		for (d = 0; d < imu->dma_nr_devs; d++) {
+			for (i = 0; i < imu->nr_bvecs; i++)
+				dma_unmap_page(imu->dma_devs[d],
+					       imu->dma_addrs_dev[d][i],
+					       1UL << imu->folio_shift,
+					       DMA_BIDIRECTIONAL);
+			kvfree(imu->dma_addrs_dev[d]);
+			imu->dma_addrs_dev[d] = NULL;
+		}
+		imu->dma_nr_devs = 0;
 		imu->dma_addrs = NULL;
 	}
 
@@ -913,6 +918,9 @@ static struct io_rsrc_node *io_sqe_buffer_register(struct io_ring_ctx *ctx,
 		goto done;
 	imu->dma_addrs = NULL;
 	imu->dma_dev = NULL;
+	imu->dma_nr_devs = 0;
+	memset(imu->dma_addrs_dev, 0, sizeof(imu->dma_addrs_dev));
+	memset(imu->dma_devs, 0, sizeof(imu->dma_devs));
 
 	imu->nr_bvecs = nr_pages;
 	ret = io_buffer_account_pin(ctx, pages, nr_pages);
@@ -948,40 +956,71 @@ static struct io_rsrc_node *io_sqe_buffer_register(struct io_ring_ctx *ctx,
 		size -= vec_len;
 	}
 
-	/* DMA-map each bvec page if a DMA channel is available. */
+	/* DMA-map each bvec page against every distinct device among the
+	 * ring's channels. Striped reads target several devices, and
+	 * under a strict IOMMU each needs its own mapping. Slot 0 is
+	 * the primary device; a failure on a secondary device drops
+	 * that device from the set rather than failing registration,
+	 * and striping simply will not use it.
+	 */
 	if (!IS_ERR_OR_NULL(ctx->dma.chan)) {
-		struct device *dev = ctx->dma.chan->device->dev;
+		unsigned int c, d;
 
-		imu->dma_addrs = kvmalloc_array(nr_pages, sizeof(dma_addr_t),
-						GFP_KERNEL);
-		if (!imu->dma_addrs) {
-			ret = -ENOMEM;
-			goto done;
-		}
-		imu->dma_dev = dev;
-		for (i = 0; i < nr_pages; i++) {
-			/* The mapping is bidirectional. A filemap-read
-			 * DMA writes into the buffer and a filemap-write
-			 * DMA reads from it. A FROM_DEVICE-only IOMMU
-			 * entry would fault device reads because there is
-			 * no read permission in the IOVA entry.
-			 */
-			imu->dma_addrs[i] = dma_map_page(dev,
-					imu->bvec[i].bv_page, 0,
-					1UL << imu->folio_shift,
-					DMA_BIDIRECTIONAL);
-			if (dma_mapping_error(dev, imu->dma_addrs[i])) {
-				while (i-- > 0)
-					dma_unmap_page(dev, imu->dma_addrs[i],
-						       1UL << imu->folio_shift,
-						       DMA_BIDIRECTIONAL);
-				kvfree(imu->dma_addrs);
-				imu->dma_addrs = NULL;
-				imu->dma_dev = NULL;
-				ret = -ENOMEM;
-				goto done;
+		imu->dma_nr_devs = 0;
+		for (c = 0; c < max_t(unsigned int, ctx->dma.nr_chans, 1); c++) {
+			struct device *dev;
+			dma_addr_t *addrs;
+
+			dev = (ctx->dma.nr_chans ? ctx->dma.chans[c]
+						 : ctx->dma.chan)->device->dev;
+			for (d = 0; d < imu->dma_nr_devs; d++)
+				if (imu->dma_devs[d] == dev)
+					break;
+			if (d < imu->dma_nr_devs)
+				continue;	/* device already mapped */
+			if (imu->dma_nr_devs == IO_REG_BUF_DEVS)
+				break;
+
+			addrs = kvmalloc_array(nr_pages, sizeof(dma_addr_t),
+					       GFP_KERNEL);
+			if (!addrs) {
+				if (!imu->dma_nr_devs) {
+					ret = -ENOMEM;
+					goto done;
+				}
+				break;
 			}
+			for (i = 0; i < nr_pages; i++) {
+				/* Bidirectional: read DMA writes into the
+				 * buffer, write DMA reads from it.
+				 */
+				addrs[i] = dma_map_page(dev,
+						imu->bvec[i].bv_page, 0,
+						1UL << imu->folio_shift,
+						DMA_BIDIRECTIONAL);
+				if (dma_mapping_error(dev, addrs[i])) {
+					while (i-- > 0)
+						dma_unmap_page(dev, addrs[i],
+							1UL << imu->folio_shift,
+							DMA_BIDIRECTIONAL);
+					kvfree(addrs);
+					addrs = NULL;
+					break;
+				}
+			}
+			if (!addrs) {
+				if (!imu->dma_nr_devs) {
+					ret = -ENOMEM;
+					goto done;
+				}
+				break;
+			}
+			imu->dma_addrs_dev[imu->dma_nr_devs] = addrs;
+			imu->dma_devs[imu->dma_nr_devs] = dev;
+			imu->dma_nr_devs++;
 		}
+		imu->dma_addrs = imu->dma_addrs_dev[0];
+		imu->dma_dev = imu->dma_devs[0];
 	}
 done:
 	if (ret) {
@@ -1274,13 +1313,25 @@ inline struct io_rsrc_node *io_find_buf_node(struct io_kiocb *req,
  * an unrelated IOVA range.
  */
 dma_addr_t io_reg_buf_dma_addr(struct io_mapped_ubuf *imu, u64 buf_addr,
-			       size_t *seg_remain)
+			       size_t *seg_remain, struct device *dev)
 {
 	size_t offset, folio_mask;
-	unsigned int seg_idx;
+	unsigned int seg_idx, d;
+	const dma_addr_t *dma_addrs = NULL;
 	const struct bio_vec *bvec;
 
-	if (!imu || !imu->dma_addrs)
+	if (!imu || !imu->dma_nr_devs)
+		return 0;
+	/* Pick the mapping for the target device; striped reads use
+	 * several. At most four entries, so the scan is cheap.
+	 */
+	for (d = 0; d < imu->dma_nr_devs; d++) {
+		if (imu->dma_devs[d] == dev) {
+			dma_addrs = imu->dma_addrs_dev[d];
+			break;
+		}
+	}
+	if (!dma_addrs)
 		return 0;
 	if (buf_addr < imu->ubuf || buf_addr >= imu->ubuf + imu->len)
 		return 0;
@@ -1293,7 +1344,7 @@ dma_addr_t io_reg_buf_dma_addr(struct io_mapped_ubuf *imu, u64 buf_addr,
 	if (offset < bvec->bv_len) {
 		if (seg_remain)
 			*seg_remain = bvec->bv_len - offset;
-		return imu->dma_addrs[0] + bvec->bv_offset + offset;
+		return dma_addrs[0] + bvec->bv_offset + offset;
 	}
 
 	offset -= bvec->bv_len;
@@ -1301,7 +1352,7 @@ dma_addr_t io_reg_buf_dma_addr(struct io_mapped_ubuf *imu, u64 buf_addr,
 	offset &= folio_mask;
 	if (seg_remain)
 		*seg_remain = (folio_mask + 1) - offset;
-	return imu->dma_addrs[seg_idx] + offset;
+	return dma_addrs[seg_idx] + offset;
 }
 
 int io_import_reg_buf(struct io_kiocb *req, struct iov_iter *iter,

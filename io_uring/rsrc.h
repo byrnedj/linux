@@ -42,8 +42,20 @@ struct io_mapped_ubuf {
 	u8		dir;
 	void		(*release)(void *);
 	void		*priv;
-	dma_addr_t	*dma_addrs;	/* DMA addr per bvec, or NULL */
-	struct device	*dma_dev;	/* device used for DMA mapping */
+	/* DMA mappings per device. Under a strict IOMMU each device has
+	 * its own IOVA space, so striping one ring's reads across the
+	 * channels of several devices needs one mapping array per
+	 * device. Slot 0 is the ring's primary device.
+	 */
+#define IO_REG_BUF_DEVS	4
+	dma_addr_t	*dma_addrs_dev[IO_REG_BUF_DEVS];
+	struct device	*dma_devs[IO_REG_BUF_DEVS];
+	unsigned int	dma_nr_devs;
+	dma_addr_t	*dma_addrs;	/* alias of dma_addrs_dev[0]; the
+					 * single-device paths and the
+					 * gates key on it
+					 */
+	struct device	*dma_dev;	/* alias of dma_devs[0] */
 	struct bio_vec	bvec[] __counted_by(nr_bvecs);
 };
 
@@ -76,7 +88,7 @@ int io_prep_reg_iovec(struct io_kiocb *req, struct iou_vec *iv,
 			const struct iovec __user *uvec, size_t uvec_segs);
 
 dma_addr_t io_reg_buf_dma_addr(struct io_mapped_ubuf *imu, u64 buf_addr,
-			       size_t *seg_remain);
+			       size_t *seg_remain, struct device *dev);
 
 int io_register_clone_buffers(struct io_ring_ctx *ctx, void __user *arg);
 int io_sqe_buffers_unregister(struct io_ring_ctx *ctx);

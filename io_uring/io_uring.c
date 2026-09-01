@@ -2255,7 +2255,8 @@ static void io_release_dma_chan(struct io_ring_ctx *ctx)
 			 * hung-hardware path, which is preferable.
 			 */
 			io_dma_qstat_task_abandon(ctx, dma);
-			io_dma_task_release_res(ctx, dev, dma);
+			io_dma_task_release_res(ctx,
+					dma->chan->device->dev, dma);
 			kmem_cache_free(dma_cachep, dma);
 			dma = next;
 			cond_resched();
@@ -2275,12 +2276,18 @@ static void io_release_dma_chan(struct io_ring_ctx *ctx)
 	}
 
 	if (ctx->dma.chan && !IS_ERR(ctx->dma.chan)) {
+		unsigned int c;
+
 		pr_info("io_uring DMA: releasing channel %s requester=%s[%d] tgid=%d ctx=%p\n",
 			dma_chan_name(ctx->dma.chan), current->comm,
 			task_pid_nr(current), task_tgid_nr(current), ctx);
 		io_dma_shared_put(ctx->dma.chan);
+		/* chans[0] is the primary released above. */
+		for (c = 1; c < ctx->dma.nr_chans; c++)
+			io_dma_shared_put(ctx->dma.chans[c]);
 	}
 	ctx->dma.chan = NULL;
+	ctx->dma.nr_chans = 0;
 }
 
 #define IO_DMA_MAX_DEVS	16
@@ -2492,6 +2499,29 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 		 dev_to_node(ctx->dma.chan->device->dev), node,
 		 io_dma_shared_cnt,
 		 current->comm, task_pid_nr(current), task_tgid_nr(current), ctx);
+
+	/* Stripe channels. Reads of a single stream on one channel reach
+	 * only that channel's device, four engines of sixteen; extra
+	 * channels, landed on distinct devices by the acquisition
+	 * rotation, let one op's batches spread across devices. The
+	 * primary stays chans[0], and shortfall just narrows the stripe.
+	 */
+	ctx->dma.chans[0] = ctx->dma.chan;
+	ctx->dma.nr_chans = 1;
+	ctx->dma.stripe_rr = 0;
+	{
+		unsigned int want = READ_ONCE(io_dma_stripe_chans);
+
+		if (want > IO_DMA_RING_CHANS)
+			want = IO_DMA_RING_CHANS;
+		while (ctx->dma.nr_chans < want) {
+			struct dma_chan *c = io_dma_shared_get(&mask, node);
+
+			if (IS_ERR_OR_NULL(c))
+				break;
+			ctx->dma.chans[ctx->dma.nr_chans++] = c;
+		}
+	}
 
 	io_dma_init_freelist(ctx, p);
 

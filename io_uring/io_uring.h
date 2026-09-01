@@ -653,6 +653,7 @@ enum {
 };
 void io_dma_fm_record(unsigned int reason);
 void io_dma_qstat_forget(struct dma_chan *chan);
+extern unsigned int io_dma_stripe_chans;
 int kiocb_done(struct io_kiocb *req, ssize_t ret, struct io_br_sel *sel, unsigned int issue_flags);
 void io_submit_flush_completions(struct io_ring_ctx *ctx);
 
