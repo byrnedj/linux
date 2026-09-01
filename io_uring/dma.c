@@ -2594,6 +2594,7 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
 			      dma->submit_ns, false);
 
 	/* Free the task before touching the refcnt. task_len was saved above. */
+	atomic_dec(&req->ctx->dma.tasks_pending);
 	io_dma_task_free(req->ctx, dma);
 	req->dma.dma_refcnt--;
 
@@ -2718,10 +2719,14 @@ int io_dma_submit_queued_tasks(struct io_kiocb *req)
 			while (t) {
 				/* We read ->next before publishing because
 				 * a published task can complete and be
-				 * freed immediately.
+				 * freed immediately. The pending count
+				 * rises before the task is visible, so no
+				 * observer can see the task without the
+				 * count.
 				 */
 				struct io_dma_task *nxt = t->next;
 
+				atomic_inc(&ctx->dma.tasks_pending);
 				llist_add(&t->llnode, &ctx->dma.submit_list);
 				t = nxt;
 			}

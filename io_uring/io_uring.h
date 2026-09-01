@@ -605,7 +605,16 @@ void io_dma_task_release_res(struct io_ring_ctx *ctx, struct device *dev,
  */
 static inline bool io_dma_pending(struct io_ring_ctx *ctx)
 {
-	return !llist_empty(&ctx->dma.submit_list) ||
+	/*
+	 * The task count is authoritative. The lists alone have a splice
+	 * window in which both read empty while a poller holds spliced
+	 * tasks in local variables; a waiter sampling that instant would
+	 * park with work outstanding and, with the poll worker also
+	 * exiting on the same misread, nothing would ever reap the tasks
+	 * and the waiter would sleep forever.
+	 */
+	return atomic_read(&ctx->dma.tasks_pending) != 0 ||
+	       !llist_empty(&ctx->dma.submit_list) ||
 	       READ_ONCE(ctx->dma.poll_list) != NULL;
 }
 bool io_dma_cq_wait_poll(struct io_ring_ctx *ctx, struct io_wait_queue *iowq);
