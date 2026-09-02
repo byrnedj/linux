@@ -417,7 +417,18 @@ static void io_pfn_cache_evict(struct io_pfn_cache *c, u64 cap)
 						gh != c->ghost_hits_snap;
 
 					if (ghosting && ratio < 50 &&
-					    ratio <= c->prev_ratio + 2) {
+					    ratio <= c->prev_ratio + 2 &&
+					    eff >= io_pfn_cache_ceiling(cap)) {
+						/*
+						 * Gate only once growth is
+						 * exhausted: below the
+						 * ceiling a low, flat ratio
+						 * is what mid-fill looks
+						 * like for a set that will
+						 * fit, and growth resolves
+						 * it. At the ceiling it
+						 * cannot.
+						 */
 						/*
 						 * Ghost hits keep demanding
 						 * growth but the hit ratio
