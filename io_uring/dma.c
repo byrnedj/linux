@@ -99,6 +99,7 @@ struct io_pfn_cache {
 	atomic64_t		evictions;
 	atomic64_t		age_evictions;	/* retired for idleness */
 	atomic64_t		ref_skips;	/* sweep passed an in-flight entry */
+
 };
 
 #define IO_PFN_CACHE_DEVS	16
@@ -594,6 +595,39 @@ static unsigned int io_dma_slot_wait_us __read_mostly;
  * distinct devices reaches them all. Read at ring creation.
  */
 unsigned int io_dma_stripe_chans __read_mostly = IO_DMA_RING_CHANS;
+/*
+ * Bounded outstanding: past this many unreaped descriptors on one ring,
+ * a nowait-pass read defers to io-wq instead of engaging, so excess
+ * submissions wait rather than deepening the poll list and the
+ * detection latency with it. Throughput against queue depth is not
+ * monotonic; the peak sits near two thousand descriptors machine-wide,
+ * and an application driving past it loses close to a third. 0 is off.
+ */
+unsigned int io_dma_ring_max_descs __read_mostly;
+
+/*
+ * The outstanding-task cap. A nowait-pass submission over the cap
+ * defers to io-wq. The io-wq pass may sleep, so instead of engaging
+ * over the cap it waits for the reaper to drain below it; the wait is
+ * time-bounded so a missed wakeup degrades to a timed engage, never a
+ * wedge. Returns true when the caller should defer with -EAGAIN.
+ */
+bool io_dma_cap_defer(struct io_ring_ctx *ctx, bool nonblock)
+{
+	unsigned int cap = READ_ONCE(io_dma_ring_max_descs);
+
+	if (!cap)
+		return false;
+	if (atomic_read(&ctx->dma.tasks_pending) < cap)
+		return false;
+	if (nonblock)
+		return true;
+	wait_event_timeout(ctx->dma.inflight_wq,
+			   atomic_read(&ctx->dma.tasks_pending) < cap,
+			   msecs_to_jiffies(20));
+	return false;
+}
+
 /* DEBUG experiment: flush threshold, caps entries per batch descriptor */
 static unsigned int io_dma_batch_max __read_mostly = IO_DMA_BATCH_MAX;
 
@@ -643,6 +677,7 @@ static struct io_dma_lat_stats io_dma_lat_dma;	/* DSA transactions (per task) */
 static const char * const io_dma_fm_names[IO_DMA_FM_NR] = {
 	"engaged", "shmem", "not_bvec", "direct", "no_dma_addrs",
 	"eagain", "enomem", "efault", "other", "cpu_tail", "slot_wait",
+	"deferred",
 };
 static atomic64_t io_dma_fm[IO_DMA_FM_NR];
 
@@ -1235,6 +1270,7 @@ void io_dma_debugfs_init(void)
 	debugfs_create_u32("batch_max", 0644, dir, &io_dma_batch_max);
 	debugfs_create_u32("slot_wait_us", 0644, dir, &io_dma_slot_wait_us);
 	debugfs_create_u32("stripe_chans", 0644, dir, &io_dma_stripe_chans);
+	debugfs_create_u32("ring_max_descs", 0644, dir, &io_dma_ring_max_descs);
 	debugfs_create_u32("stats", 0644, dir, &io_dma_stats_enabled);
 	debugfs_create_file("latency", 0444, dir, NULL, &io_dma_lat_fops);
 	debugfs_create_file("latency_reset", 0200, dir, NULL,
@@ -2647,6 +2683,16 @@ static void __io_dma_task_complete(struct device *dev, struct io_dma_task *dma,
 
 	/* Free the task before touching the refcnt. task_len was saved above. */
 	atomic_dec(&req->ctx->dma.tasks_pending);
+	if (READ_ONCE(io_dma_ring_max_descs)) {
+		/*
+		 * Order the dec against the waitqueue_active() read; the
+		 * waiter's prepare_to_wait() barrier pairs with it. Plain
+		 * atomic_dec() has no return and so no implicit ordering.
+		 */
+		smp_mb__after_atomic();
+		if (waitqueue_active(&req->ctx->dma.inflight_wq))
+			wake_up(&req->ctx->dma.inflight_wq);
+	}
 	io_dma_task_free(req->ctx, dma);
 	req->dma.dma_refcnt--;
 

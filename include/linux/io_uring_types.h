@@ -349,6 +349,12 @@ struct io_dma_channel {
 	atomic_t		diag_refs_dropped;
 	spinlock_t		lock;
 
+	/* Blocking submitters over the outstanding-task cap sleep here
+	 * until the reaper drains below it. Bounded by a timeout on the
+	 * waiter side, so a lost wakeup degrades to a timed engage.
+	 */
+	wait_queue_head_t	inflight_wq;
+
 	/* Pending pollable tasks are split for a lock-free producer and
 	 * consumer.  Submitters publish to submit_list, an llist that
 	 * needs no lock.  The ->lock hold they still take for the

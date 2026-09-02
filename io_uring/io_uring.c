@@ -2475,6 +2475,7 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 	atomic_set(&ctx->dma.poll_armed, 0);
 	atomic_set(&ctx->dma.diag_refs_taken, 0);
 	atomic_set(&ctx->dma.diag_refs_dropped, 0);
+	init_waitqueue_head(&ctx->dma.inflight_wq);
 
 	/* Prefer a channel whose DSA device sits on the caller's NUMA
 	 * node.  A cross-socket engine pays UPI hops on every descriptor
