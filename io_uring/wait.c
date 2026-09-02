@@ -202,6 +202,27 @@ static inline int io_cqring_wait_schedule(struct io_ring_ctx *ctx,
 		__set_current_state(TASK_RUNNING);
 		return 1;
 	}
+	/*
+	 * A producer that stalls between publishing its work and claiming
+	 * the wake can claim an arm from a later wait cycle than the one
+	 * its work belongs to: this task may already have drained that
+	 * work while disarmed and re-armed for the next sleep. The claimed
+	 * wake then lands via wake_up_state() while this task is still
+	 * TASK_RUNNING (for example inside the DMA completion poll above,
+	 * which runs armed) and is a no-op, the arm is gone, and every
+	 * later producer reads a non-positive ->cq_wait_nr and skips the
+	 * wake: this task would sleep unwakeable under a non-empty work
+	 * list. If the arm this task set at the top of the wait loop is no
+	 * longer intact, a claim has fired; re-run the loop, which drains
+	 * anything pending and re-arms, instead of sleeping. From here to
+	 * schedule() the state stays TASK_INTERRUPTIBLE, so any later
+	 * claim delivers its wake successfully.
+	 */
+	if ((ctx->flags & IORING_SETUP_DEFER_TASKRUN) &&
+	    atomic_read(&ctx->cq_wait_nr) <= 0) {
+		__set_current_state(TASK_RUNNING);
+		return 1;
+	}
 
 	return __io_cqring_wait_schedule(ctx, iowq, ext_arg, start_time);
 }
