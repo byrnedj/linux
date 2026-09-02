@@ -2515,11 +2515,35 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 
 		if (want > IO_DMA_RING_CHANS)
 			want = IO_DMA_RING_CHANS;
-		while (ctx->dma.nr_chans < want) {
+		unsigned int tries = 2 * IO_DMA_RING_CHANS;
+
+		while (ctx->dma.nr_chans < want && tries--) {
 			struct dma_chan *c = io_dma_shared_get(&mask, node);
+			unsigned int k;
+			bool dup = false;
 
 			if (IS_ERR_OR_NULL(c))
 				break;
+			/*
+			 * Keep the stripe set on distinct devices. Two
+			 * channels of one device add no engine-group
+			 * bandwidth, and a ring whose set diverges from
+			 * its peers' device sets re-duplicates the
+			 * position-deterministic caches. Put duplicates
+			 * back; the pool rotation advances, so retries
+			 * reach the other devices.
+			 */
+			for (k = 0; k < ctx->dma.nr_chans; k++) {
+				if (ctx->dma.chans[k]->device->dev ==
+				    c->device->dev) {
+					dup = true;
+					break;
+				}
+			}
+			if (dup) {
+				io_dma_shared_put(c);
+				continue;
+			}
 			ctx->dma.chans[ctx->dma.nr_chans++] = c;
 		}
 	}
@@ -2546,6 +2570,12 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 		}
 		ctx->dma.chan = ctx->dma.chans[0];
 	}
+	pr_info("io_uring DMA: ring %p stripe set (%u): %s %s %s %s\n",
+		ctx, ctx->dma.nr_chans,
+		dma_chan_name(ctx->dma.chans[0]),
+		ctx->dma.nr_chans > 1 ? dma_chan_name(ctx->dma.chans[1]) : "-",
+		ctx->dma.nr_chans > 2 ? dma_chan_name(ctx->dma.chans[2]) : "-",
+		ctx->dma.nr_chans > 3 ? dma_chan_name(ctx->dma.chans[3]) : "-");
 
 	io_dma_init_freelist(ctx, p);
 

@@ -2111,9 +2111,19 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 		if (pc && io_pfn_cache_target(pc, hard))
 			det_stripe = true;
 	}
+	/*
+	 * Hash the granule index rather than using it raw: block-aligned
+	 * op starts otherwise resonate with the stripe modulus, opening
+	 * every op on index zero. With rings agreeing on index zero's
+	 * device, that device saturates, its batches flush short, the
+	 * claims end before the rotation to the next granule ever runs,
+	 * and the whole workload converges on one device with CPU tails.
+	 * The hash keeps the mapping deterministic, so the dedup holds,
+	 * while decorrelating it from any alignment.
+	 */
 	if (det_stripe)
-		stripe = ((u64)iocb->ki_pos >> IO_DMA_STRIPE_SHIFT) %
-			 nr_chans;
+		stripe = hash_64((u64)iocb->ki_pos >> IO_DMA_STRIPE_SHIFT,
+				 32) % nr_chans;
 	else
 		stripe = ctx->dma.stripe_rr % nr_chans;
 	chan = ctx->dma.nr_chans ? ctx->dma.chans[stripe] : ctx->dma.chan;
@@ -2309,11 +2319,11 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 					if (nr_chans > 1 &&
 					    ret == (ssize_t)batch_bytes) {
 						if (det_stripe)
-							stripe =
-							  ((u64)(start_pos +
+							stripe = hash_64(
+							  (u64)(start_pos +
 							  copied) >>
-							  IO_DMA_STRIPE_SHIFT)
-							  % nr_chans;
+							  IO_DMA_STRIPE_SHIFT,
+							  32) % nr_chans;
 						else
 							stripe = (stripe + 1) %
 								 nr_chans;
