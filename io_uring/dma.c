@@ -1498,7 +1498,7 @@ static ssize_t io_dma_submit_batch(struct io_kiocb *req,
 		io_dma_task_free(req->ctx, dma);
 		return -EAGAIN;	/* The WQ may be full. Fall back to CPU copy. */
 	}
-	io_dma_qstat_submit(req->ctx->dma.chan, dma->len, false);
+	io_dma_qstat_submit(chan, dma->len, false);
 
 	/* Take folio references for the duration of the DMA. */
 	for (i = 0; i < nr_entries; i++)
@@ -1603,7 +1603,7 @@ static ssize_t io_dma_submit_single_entry(struct io_kiocb *req,
 		io_dma_task_free(req->ctx, dma);
 		return -EAGAIN;	/* The WQ may be full. Fall back to CPU copy. */
 	}
-	io_dma_qstat_submit(req->ctx->dma.chan, dma->len, false);
+	io_dma_qstat_submit(chan, dma->len, false);
 
 	req->dma.dma_refcnt++;
 
