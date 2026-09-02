@@ -2032,15 +2032,24 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 	struct io_mapped_ubuf *imu = req->buf_node->buf;
 	/*
 	 * Stripe state. One channel reaches one device, four engines of
-	 * sixteen, so a single stream's batches rotate across the ring's
-	 * channels: each flush targets the current stripe channel and
-	 * advances the rotation. Everything device-scoped, meaning the
-	 * registered-buffer addresses, the PFN cache instance, and the
-	 * flush target, follows the current stripe. Rotation state lives
-	 * on the ctx; submissions are serialized by uring_lock.
+	 * sixteen, so a single stream's batches stripe across the ring's
+	 * channels. The stripe is deterministic in the file position, at
+	 * a 1MB granule, rather than round-robin: every pass over a
+	 * region then lands its batches on the same devices, so each
+	 * device's PFN cache holds only its own share of the working set
+	 * instead of every device converging on a full duplicate copy.
+	 * Round-robin cost four times the standing mappings for the same
+	 * data, which is what pushed moderate working sets over the IOVA
+	 * rcache depletion cliff. Sequential streams and parallel jobs
+	 * spread over the granule exactly as they did over the rotation.
+	 * Everything device-scoped, meaning the registered-buffer
+	 * addresses, the PFN cache instance, and the flush target,
+	 * follows the current stripe.
 	 */
+#define IO_DMA_STRIPE_SHIFT	20
 	unsigned int nr_chans = ctx->dma.nr_chans ? ctx->dma.nr_chans : 1;
-	unsigned int stripe = ctx->dma.stripe_rr % nr_chans;
+	unsigned int stripe = ((u64)iocb->ki_pos >> IO_DMA_STRIPE_SHIFT) %
+			      nr_chans;
 	struct dma_chan *chan = ctx->dma.nr_chans ?
 		ctx->dma.chans[stripe] : ctx->dma.chan;
 	struct device *dev = chan->device->dev;
@@ -2215,17 +2224,19 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 						goto put_folios;
 					}
 					/*
-					 * Rotate the stripe so the next
-					 * batch lands on the next channel
-					 * and its device. The reload keeps
-					 * every device-scoped hand, the
-					 * dst addresses and the PFN cache,
-					 * consistent with the new target.
+					 * Re-derive the stripe for the next
+					 * batch from its file position. The
+					 * reload keeps every device-scoped
+					 * hand, the dst addresses and the
+					 * PFN cache, consistent with the
+					 * new target.
 					 */
 					if (nr_chans > 1 &&
 					    ret == (ssize_t)batch_bytes) {
-						stripe = (stripe + 1) %
-							 nr_chans;
+						stripe = ((u64)(start_pos +
+							copied) >>
+							IO_DMA_STRIPE_SHIFT) %
+							nr_chans;
 						chan = ctx->dma.chans[stripe];
 						dev = chan->device->dev;
 						pfn_cache =
@@ -2297,9 +2308,6 @@ put_folios:
 						ctx->dma.chans[c] :
 						ctx->dma.chan);
 	}
-	/* Persist the rotation so successive ops keep spreading. */
-	ctx->dma.stripe_rr = stripe + 1;
-
 	kfree(entries);
 
 	/*
