@@ -183,13 +183,33 @@ static atomic_t io_pfn_cache_nr;
 #define IO_PFN_ADAPT_DECAY_SHIFT 3
 #define IO_PFN_ADAPT_TICK	(2 * HZ)
 
-/* Per-cache adaptive ceiling: the machine budget's fair share. */
+/*
+ * Per-cache adaptive ceiling: the machine budget's fair share among
+ * the caches currently holding mappings. Registration is forever, but
+ * a device that a past workload touched and this one does not must
+ * not dilute the budget: with rings acquiring channels from a shared
+ * pool, the registry accretes devices over time, and dividing by the
+ * all-time count starved every active cache. An empty cache counts
+ * itself the moment it inserts, and the per-tick recount converges as
+ * traffic shifts.
+ */
 static u64 io_pfn_cache_ceiling(u64 hard)
 {
 	u64 budget = (u64)READ_ONCE(io_dma_pfn_cache_auto_budget_mb) << 20;
-	unsigned int n = atomic_read(&io_pfn_cache_nr);
+	unsigned int i, n = 0;
 
-	return min(hard, budget) / (n ? n : 1);
+	for (i = 0; i < IO_PFN_CACHE_DEVS; i++) {
+		struct io_pfn_cache *pc;
+
+		if (!READ_ONCE(io_pfn_cache_devs[i]))
+			break;
+		pc = io_pfn_caches[i];
+		if (pc && atomic64_read(&pc->covered) > 0)
+			n++;
+	}
+	if (!n)
+		n = 1;
+	return min(hard, budget) / n;
 }
 
 static u64 io_pfn_cache_floor(u64 ceil)
