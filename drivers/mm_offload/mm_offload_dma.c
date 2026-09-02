@@ -22,6 +22,7 @@ static unsigned int pool_users;
 
 static struct {
 	struct dma_chan *chan;
+	struct device *dev;
 	struct mutex lock;
 } channels[MM_OFFLOAD_DMA_MAX_CHANNELS];
 static unsigned int nr_channels;
@@ -41,6 +42,12 @@ struct dma_chan *mm_offload_dma_chan(unsigned int idx)
 	return channels[idx].chan;
 }
 EXPORT_SYMBOL_GPL(mm_offload_dma_chan);
+
+struct device *mm_offload_dma_chan_dev(unsigned int idx)
+{
+	return channels[idx].dev;
+}
+EXPORT_SYMBOL_GPL(mm_offload_dma_chan_dev);
 
 /* Called with pool_mutex held. */
 static void pool_grow(unsigned int nr_want)
@@ -63,6 +70,7 @@ static void pool_grow(unsigned int nr_want)
 			break;
 		}
 		channels[nr_channels].chan = chan;
+		channels[nr_channels].dev = dev;
 		mutex_init(&channels[nr_channels].lock);
 		if (!nr_groups || groups[nr_groups - 1].dev != dev) {
 			groups[nr_groups].dev = dev;
@@ -202,6 +210,49 @@ unsigned long mm_offload_dma_claim(unsigned int want, int nid,
 	return mask;
 }
 EXPORT_SYMBOL_GPL(mm_offload_dma_claim);
+
+/**
+ * mm_offload_dma_claim_spread - claim channels across distinct devices.
+ * @want: channels wanted.
+ * @nid: NUMA node the copy is written to; only groups on it are used
+ *       (a stripe on a remote device would make the whole copy wait on
+ *       remote-link bandwidth - the caller falls back to a plain claim,
+ *       which does try remote groups, when this returns 0).
+ *
+ * Breadth-first: one channel from every node-local group, then a second
+ * from each, ... so @want channels land on as many distinct devices as
+ * possible. Used to stripe one large copy over several devices.
+ *
+ * Return: bitmask of claimed channel indices, 0 if nothing node-local
+ * was free.
+ */
+unsigned long mm_offload_dma_claim_spread(unsigned int want, int nid)
+{
+	unsigned int ngroups = smp_load_acquire(&nr_groups);
+	unsigned int limit = smp_load_acquire(&nr_channels);
+	unsigned int got = 0, maxnr = 0, r, g;
+	unsigned long mask = 0;
+
+	for (g = 0; g < ngroups; g++)
+		if (groups[g].node == nid && groups[g].nr > maxnr)
+			maxnr = groups[g].nr;
+
+	for (r = 0; r < maxnr && got < want; r++) {
+		for (g = 0; g < ngroups && got < want; g++) {
+			struct mm_offload_dma_group *grp = &groups[g];
+			unsigned int idx = grp->first + r;
+
+			if (grp->node != nid || r >= grp->nr || idx >= limit)
+				continue;
+			if (mutex_trylock(&channels[idx].lock)) {
+				mask |= BIT(idx);
+				got++;
+			}
+		}
+	}
+	return mask;
+}
+EXPORT_SYMBOL_GPL(mm_offload_dma_claim_spread);
 
 void mm_offload_dma_release(unsigned long mask)
 {

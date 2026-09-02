@@ -51,11 +51,14 @@ static atomic_long_t pin_us_total;	/* source pinning */
 static atomic_long_t map_us_total;	/* DMA mapping of source + destination */
 static atomic_long_t unmap_us_total;	/* unmap + unpin */
 static atomic_long_t src_contig;
-static atomic_long_t sg_txns;	/* DMA_MEMCPY_SG transactions submitted */	/* copies whose source was one contiguous run */
+static atomic_long_t sg_txns;	/* DMA_MEMCPY_SG transactions submitted */
+static atomic_long_t striped_copies;	/* copies striped over >1 device */	/* copies whose source was one contiguous run */
 
 static bool offloading_enabled;
 static unsigned int nr_dma_chan = 4;
 static unsigned long min_bytes = SZ_64K;
+/* Stripe a contiguous copy over devices in pieces of at least this; 0 = off */
+static unsigned long stripe_min_bytes = SZ_1M;
 static unsigned int cpu_pct;		/* tail fraction copied by the CPU */
 static bool cache_ctrl = true;
 static unsigned int wait_mode = UFFD_DMA_WAIT_IRQ;
@@ -340,14 +343,142 @@ static int uffd_dma_wait(struct uffd_dma_req *req)
 	return atomic_read(&req->error);
 }
 
+struct uffd_dma_stripe {
+	struct device *dev;
+	unsigned long chans;
+	dma_addr_t src;
+	dma_addr_t dst;
+	size_t off;
+	size_t len;
+};
+
+/*
+ * Stripe one physically contiguous copy over the distinct devices the
+ * claimed channels sit on. One device delivers a fixed bandwidth no
+ * matter how many of its channels a copy uses, so a serial stream of
+ * large copies (a restore prefault loop) is bounded by single-device
+ * bandwidth; page-aligned stripes mapped and submitted per device cut
+ * the copy's latency by the device count. The caller has pinned the
+ * source and verified it is one physical run; pinning, unpinning and
+ * channel release stay with the caller, everything between (mapping,
+ * submission, wait, unmapping, result counters) happens here.
+ */
+static int uffd_dma_copy_striped(struct page *dst, struct page **pages,
+				 size_t size, struct uffd_dma_cursor *cur)
+{
+	struct uffd_dma_stripe st[MM_OFFLOAD_DMA_MAX_CHANNELS];
+	struct uffd_dma_req req;
+	unsigned int i, k, ns = 0, mapped = 0;
+	size_t per, off = 0;
+	ktime_t t0, t1;
+	int ret = 0;
+
+	for_each_set_bit(i, &cur->chan_mask, MM_OFFLOAD_DMA_MAX_CHANNELS) {
+		struct device *d = mm_offload_dma_chan_dev(i);
+
+		for (k = 0; k < ns; k++)
+			if (st[k].dev == d)
+				break;
+		if (k == ns) {
+			st[ns].dev = d;
+			st[ns].chans = 0;
+			ns++;
+		}
+		st[k].chans |= BIT(i);
+	}
+
+	per = ALIGN(size / ns, PAGE_SIZE);
+	for (k = 0; k < ns; k++) {
+		st[k].off = off;
+		st[k].len = (k == ns - 1) ? size - off : min_t(size_t, per, size - off);
+		off += st[k].len;
+	}
+
+	t0 = ktime_get();
+	for (mapped = 0; mapped < ns; mapped++) {
+		struct uffd_dma_stripe *sp = &st[mapped];
+
+		sp->src = dma_map_page_attrs(sp->dev, pages[sp->off >> PAGE_SHIFT],
+					     0, sp->len, DMA_TO_DEVICE, 0);
+		if (dma_mapping_error(sp->dev, sp->src)) {
+			ret = -EIO;
+			goto out_unmap;
+		}
+		sp->dst = dma_map_page_attrs(sp->dev, dst + (sp->off >> PAGE_SHIFT),
+					     0, sp->len, DMA_FROM_DEVICE, 0);
+		if (dma_mapping_error(sp->dev, sp->dst)) {
+			dma_unmap_page_attrs(sp->dev, sp->src, sp->len,
+					     DMA_TO_DEVICE, 0);
+			ret = -EIO;
+			goto out_unmap;
+		}
+	}
+	t1 = ktime_get();
+	atomic_long_add(ktime_us_delta(t1, t0), &map_us_total);
+
+	init_completion(&req.done);
+	atomic_set(&req.pending, 1);	/* submission reference */
+	atomic_set(&req.error, 0);
+
+	for (k = 0; k < ns; k++) {
+		struct uffd_dma_cursor scur = {
+			.chan_mask = st[k].chans,
+			.idx = find_first_bit(&st[k].chans,
+					      MM_OFFLOAD_DMA_MAX_CHANNELS),
+			.flags = cur->flags,
+		};
+
+		ret = uffd_dma_submit_contig(&req, &scur, st[k].dst, st[k].src,
+					     st[k].len);
+		if (ret)
+			goto out_terminate;
+	}
+	for_each_set_bit(i, &cur->chan_mask, MM_OFFLOAD_DMA_MAX_CHANNELS)
+		dma_async_issue_pending(mm_offload_dma_chan(i));
+
+	if (atomic_dec_and_test(&req.pending))
+		complete(&req.done);
+	ret = uffd_dma_wait(&req);
+	if (ret == -ETIMEDOUT)
+		goto out_terminate;
+	atomic_long_add(ktime_us_delta(ktime_get(), t1), &wait_ns_total);
+
+out_unmap:
+	for (k = 0; k < mapped; k++) {
+		dma_unmap_page_attrs(st[k].dev, st[k].dst, st[k].len,
+				     DMA_FROM_DEVICE, 0);
+		dma_unmap_page_attrs(st[k].dev, st[k].src, st[k].len,
+				     DMA_TO_DEVICE, 0);
+	}
+	if (ret) {
+		atomic_long_inc(&copies_failed);
+		pr_warn_ratelimited("uffd_dma: striped copy failed (%d), falling back to CPU\n",
+				    ret);
+	} else {
+		atomic_long_inc(&copies_done);
+		atomic_long_inc(&striped_copies);
+		atomic_long_add(size, &bytes_dma);
+	}
+	return ret;
+
+out_terminate:
+	if (atomic_dec_and_test(&req.pending))
+		complete(&req.done);
+	for_each_set_bit(i, &cur->chan_mask, MM_OFFLOAD_DMA_MAX_CHANNELS)
+		dmaengine_terminate_sync(mm_offload_dma_chan(i));
+	goto out_unmap;
+}
+
 static int uffd_dma_copy_pages(struct page *dst, unsigned long nr_pages,
 			       const void __user *usrc, bool allow_pagefault)
 {
 	const size_t size = nr_pages << PAGE_SHIFT;
 	unsigned long src = (unsigned long)usrc;
 	struct mm_offload_dma_group *grp;
-	struct uffd_dma_cursor cur;
+	struct uffd_dma_cursor cur = {};
 	struct uffd_dma_req req;
+	unsigned long stripe_min;
+	bool multi_dev = false;
 	struct page **pages;
 	struct sg_table sgt;
 	struct device *dev;
@@ -368,10 +499,17 @@ static int uffd_dma_copy_pages(struct page *dst, unsigned long nr_pages,
 		return -EBUSY;
 	}
 
-	cur.chan_mask = mm_offload_dma_claim(
-			clamp_t(size_t, size / UFFD_DMA_CHUNK_BYTES, 1,
-				READ_ONCE(nr_dma_chan)),
-			page_to_nid(dst), &grp);
+	stripe_min = READ_ONCE(stripe_min_bytes);
+	if (stripe_min && size >= 2 * stripe_min)
+		cur.chan_mask = mm_offload_dma_claim_spread(
+				clamp_t(size_t, size / stripe_min, 2,
+					READ_ONCE(nr_dma_chan)),
+				page_to_nid(dst));
+	if (!cur.chan_mask)
+		cur.chan_mask = mm_offload_dma_claim(
+				clamp_t(size_t, size / UFFD_DMA_CHUNK_BYTES, 1,
+					READ_ONCE(nr_dma_chan)),
+				page_to_nid(dst), &grp);
 	if (!cur.chan_mask) {
 		atomic_long_inc(&copies_refused);
 		return -EBUSY;
@@ -380,7 +518,7 @@ static int uffd_dma_copy_pages(struct page *dst, unsigned long nr_pages,
 	cur.flags = DMA_PREP_INTERRUPT | DMA_CTRL_ACK;
 	if (READ_ONCE(cache_ctrl))
 		cur.flags |= DMA_PREP_CACHE_CONTROL;
-	dev = grp->dev;
+	dev = mm_offload_dma_chan_dev(cur.idx);
 
 	pages = kvmalloc_array(nr_pages, sizeof(*pages), GFP_KERNEL);
 	if (!pages) {
@@ -401,6 +539,29 @@ static int uffd_dma_copy_pages(struct page *dst, unsigned long nr_pages,
 	 * single range and skip the scatterlist entirely.
 	 */
 	contig = uffd_dma_src_contiguous(pages, nr_pages);
+
+	for_each_set_bit(i, &cur.chan_mask, MM_OFFLOAD_DMA_MAX_CHANNELS)
+		if (mm_offload_dma_chan_dev(i) != dev)
+			multi_dev = true;
+	if (multi_dev && contig) {
+		ret = uffd_dma_copy_striped(dst, pages, size, &cur);
+		goto out_unpin_done;
+	}
+	if (multi_dev) {
+		/*
+		 * A spread claim that cannot stripe (scattered source):
+		 * keep only the first device's channels so the single
+		 * mapping below matches every channel that will use it.
+		 */
+		unsigned long keep = 0;
+
+		for_each_set_bit(i, &cur.chan_mask, MM_OFFLOAD_DMA_MAX_CHANNELS)
+			if (mm_offload_dma_chan_dev(i) == dev)
+				keep |= BIT(i);
+		mm_offload_dma_release(cur.chan_mask & ~keep);
+		cur.chan_mask = keep;
+	}
+
 	if (contig) {
 		src_dma = dma_map_page_attrs(dev, pages[0], 0, size,
 					     DMA_TO_DEVICE, 0);
@@ -505,6 +666,12 @@ static int uffd_dma_copy_pages(struct page *dst, unsigned long nr_pages,
 	atomic_long_add(dma_len, &bytes_dma);
 	atomic_long_add(size - dma_len, &bytes_cpu);
 	return 0;
+
+out_unpin_done:
+	uffd_dma_unpin_src(pages, nr_pages, pinned);
+	kvfree(pages);
+	mm_offload_dma_release(cur.chan_mask);
+	return ret;
 
 out_terminate:
 	for_each_set_bit(i, &cur.chan_mask, MM_OFFLOAD_DMA_MAX_CHANNELS)
@@ -667,6 +834,7 @@ UFFD_DMA_COUNTER_ATTR(map_us_total);
 UFFD_DMA_COUNTER_ATTR(unmap_us_total);
 UFFD_DMA_COUNTER_ATTR(src_contig);
 UFFD_DMA_COUNTER_ATTR(sg_txns);
+UFFD_DMA_COUNTER_ATTR(striped_copies);
 
 static ssize_t min_bytes_show(struct kobject *kobj,
 			      struct kobj_attribute *attr, char *buf)
@@ -690,10 +858,32 @@ static ssize_t min_bytes_store(struct kobject *kobj,
 static struct kobj_attribute offloading_attr = __ATTR_RW(offloading);
 static struct kobj_attribute min_bytes_attr = __ATTR_RW(min_bytes);
 
+static ssize_t stripe_min_bytes_show(struct kobject *kobj,
+				     struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%lu\n", READ_ONCE(stripe_min_bytes));
+}
+
+static ssize_t stripe_min_bytes_store(struct kobject *kobj,
+				      struct kobj_attribute *attr,
+				      const char *buf, size_t count)
+{
+	unsigned long val;
+	int ret = kstrtoul(buf, 0, &val);
+
+	if (ret)
+		return ret;
+	WRITE_ONCE(stripe_min_bytes, val);
+	return count;
+}
+
+static struct kobj_attribute stripe_min_bytes_attr = __ATTR_RW(stripe_min_bytes);
+
 static struct attribute *uffd_dma_attrs[] = {
 	&offloading_attr.attr,
 	&nr_dma_chan_attr.attr,
 	&min_bytes_attr.attr,
+	&stripe_min_bytes_attr.attr,
 	&cpu_pct_attr.attr,
 	&cache_ctrl_attr.attr,
 	&wait_mode_attr.attr,
@@ -712,6 +902,7 @@ static struct attribute *uffd_dma_attrs[] = {
 	&unmap_us_total_attr.attr,
 	&src_contig_attr.attr,
 	&sg_txns_attr.attr,
+	&striped_copies_attr.attr,
 	NULL
 };
 
