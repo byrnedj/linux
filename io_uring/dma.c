@@ -100,6 +100,23 @@ struct io_pfn_cache {
 	atomic64_t		age_evictions;	/* retired for idleness */
 	atomic64_t		ref_skips;	/* sweep passed an in-flight entry */
 
+	/*
+	 * Ghost list: the keys, and only the keys, of segments the cap
+	 * recently forced out, each stored as an xarray value holding
+	 * its eviction time. A miss that hits the ghost is an eviction
+	 * the workload paid for with a remap, which is the one signal
+	 * that separates "the cap is trimming dead streaming entries"
+	 * from "the cap is thrashing a live working set". Ghost hits
+	 * grow the adaptive target below; their absence decays it. Age
+	 * evictions never enter the ghost, idleness is not undersizing.
+	 */
+	struct xarray		ghost;
+	unsigned long		ghost_hand;	/* purge walk cursor */
+	atomic64_t		ghost_count;
+	atomic64_t		ghost_hits;
+	u64			eff_cap;	/* adaptive target, bytes */
+	u64			ghost_hits_snap;/* at the last decay tick */
+	unsigned long		next_adapt;	/* jiffies */
 };
 
 #define IO_PFN_CACHE_DEVS	16
@@ -126,6 +143,44 @@ static u32 io_dma_pfn_cache_cap_mb __read_mostly = 1024;
  * this long is unmapped.
  */
 static u32 io_dma_pfn_cache_max_age_ms __read_mostly = 60000;
+
+/*
+ * Adaptive sizing.  When set, cap_mb is a ceiling rather than the
+ * standing target: the cache aims for an effective cap that ghost
+ * hits grow toward the ceiling and quiet intervals decay toward a
+ * floor of an eighth of the ceiling.  A streaming phase then keeps
+ * the standing device-readable window small, and a re-read phase
+ * whose working set the floor thrashes earns its way back up at one
+ * step per paid-for eviction.  0 pins the target at cap_mb, which is
+ * the historical behaviour.
+ */
+static u32 io_dma_pfn_cache_auto __read_mostly = 1;
+
+/* Ghost growth per hit and decay per quiet 2s tick (eff >> shift). */
+#define IO_PFN_GHOST_GROW_SEGS	8
+#define IO_PFN_ADAPT_DECAY_SHIFT 3
+#define IO_PFN_ADAPT_TICK	(2 * HZ)
+
+static u64 io_pfn_cache_floor(u64 hard)
+{
+	return min(hard, max(hard >> 3, (u64)SZ_64M));
+}
+
+/*
+ * The eviction target: the adaptive effective cap, clamped to the
+ * hard cap, or the hard cap itself when auto sizing is off.
+ */
+static u64 io_pfn_cache_target(struct io_pfn_cache *c, u64 hard)
+{
+	u64 eff;
+
+	if (!READ_ONCE(io_dma_pfn_cache_auto))
+		return hard;
+	eff = READ_ONCE(c->eff_cap);
+	if (!eff)
+		eff = io_pfn_cache_floor(hard);
+	return min(eff, hard);
+}
 
 /* Sweep visit budget per eviction call.  This bounds the datapath
  * latency when the table is large and mostly referenced or in flight.
@@ -173,6 +228,7 @@ static struct io_pfn_cache *io_pfn_cache_get(struct device *dev)
 	if (!c)
 		return NULL;
 	xa_init(&c->xa);
+	xa_init(&c->ghost);
 	spin_lock_init(&c->lock);
 	c->dev = dev;
 	c->quantum = io_dma_map_quantum(dev);
@@ -259,6 +315,7 @@ static void io_pfn_map_displace(struct io_pfn_cache *c, struct io_pfn_map *pm)
 static void io_pfn_cache_evict(struct io_pfn_cache *c, u64 cap)
 {
 	unsigned long max_age = READ_ONCE(io_dma_pfn_cache_max_age_ms);
+	u64 target = io_pfn_cache_target(c, cap);
 	struct io_pfn_map *pm;
 	unsigned long index, age_before = 0;
 	int budget = IO_PFN_EVICT_BUDGET;
@@ -266,7 +323,7 @@ static void io_pfn_cache_evict(struct io_pfn_cache *c, u64 cap)
 	bool over, aging;
 	int pass;
 
-	over = atomic64_read(&c->covered) > cap;
+	over = atomic64_read(&c->covered) > target;
 	aging = max_age && time_after(jiffies, READ_ONCE(c->next_age));
 	if (!over && !aging)
 		return;
@@ -278,6 +335,50 @@ static void io_pfn_cache_evict(struct io_pfn_cache *c, u64 cap)
 		age_before = jiffies - msecs_to_jiffies(max_age);
 		/* Rate-limit the age walk; the cap walk runs on demand. */
 		WRITE_ONCE(c->next_age, jiffies + HZ);
+
+		if (READ_ONCE(io_dma_pfn_cache_auto)) {
+			/*
+			 * Decay the adaptive target when a whole tick has
+			 * passed without a single ghost hit: nothing the
+			 * cap evicted was missed, so the cache can stand
+			 * to be smaller. Growth happens on the miss path.
+			 */
+			if (time_after(jiffies, c->next_adapt)) {
+				u64 gh = atomic64_read(&c->ghost_hits);
+				u64 eff = io_pfn_cache_target(c, cap);
+
+				if (gh == c->ghost_hits_snap)
+					eff -= eff >> IO_PFN_ADAPT_DECAY_SHIFT;
+				c->eff_cap = max(eff, io_pfn_cache_floor(cap));
+				c->ghost_hits_snap = gh;
+				c->next_adapt = jiffies + IO_PFN_ADAPT_TICK;
+			}
+
+			/*
+			 * Purge stale ghosts: entries older than twice
+			 * max_age can no longer say anything about the
+			 * present working set. Bounded walk from a hand.
+			 */
+			{
+				unsigned long gidx = 0;
+				void *gv;
+				int gbudget = IO_PFN_EVICT_BUDGET;
+				unsigned long ghost_before = jiffies -
+					2 * msecs_to_jiffies(max_age ? max_age : 60000);
+
+				xa_for_each_start(&c->ghost, gidx, gv,
+						  c->ghost_hand) {
+					if (--gbudget <= 0)
+						break;
+					if (time_before((unsigned long)xa_to_value(gv),
+							ghost_before)) {
+						xa_erase(&c->ghost, gidx);
+						atomic64_dec(&c->ghost_count);
+					}
+				}
+				c->ghost_hand = gbudget <= 0 ? gidx + 1 : 0;
+			}
+		}
 	}
 
 	for (pass = 0; pass < 2; pass++) {
@@ -309,10 +410,24 @@ static void io_pfn_cache_evict(struct io_pfn_cache *c, u64 cap)
 			xa_erase(&c->xa, index);
 			atomic64_sub(pm->size, &c->covered);
 			atomic64_inc(&c->evictions);
-			if (aged)
+			if (aged) {
 				atomic64_inc(&c->age_evictions);
+			} else if (READ_ONCE(io_dma_pfn_cache_auto)) {
+				/*
+				 * Cap pressure took a live-looking entry.
+				 * Remember its key so a near-term re-read
+				 * can prove the target too small. Values
+				 * carry the eviction time for the purge.
+				 */
+				void *gv = xa_mk_value(jiffies &
+						       (LONG_MAX >> 1));
+
+				if (!xa_is_err(xa_store(&c->ghost, index, gv,
+						GFP_NOWAIT | __GFP_NOWARN)))
+					atomic64_inc(&c->ghost_count);
+			}
 			io_pfn_map_put(pm);	/* Drop the cache bias. */
-			over = atomic64_read(&c->covered) > cap;
+			over = atomic64_read(&c->covered) > target;
 			if (--unmaps <= 0) {
 				c->hand = index + 1;
 				goto out;
@@ -414,6 +529,25 @@ static struct io_pfn_map *io_pfn_map_lookup(struct io_pfn_cache *c,
 miss:
 	atomic64_inc(&c->misses);
 
+	if (READ_ONCE(io_dma_pfn_cache_auto) &&
+	    xa_load(&c->ghost, pfn)) {
+		if (xa_erase(&c->ghost, pfn)) {
+			u64 eff;
+
+			/*
+			 * This segment was evicted by cap pressure and is
+			 * being remapped: the effective cap is thrashing
+			 * the working set. Step the target up toward the
+			 * hard cap, one increment per paid-for eviction.
+			 */
+			atomic64_dec(&c->ghost_count);
+			atomic64_inc(&c->ghost_hits);
+			eff = io_pfn_cache_target(c, cap);
+			eff += (u64)c->quantum * IO_PFN_GHOST_GROW_SEGS;
+			WRITE_ONCE(c->eff_cap, min(eff, cap));
+		}
+	}
+
 	pm = kmalloc_obj(*pm, GFP_NOWAIT | __GFP_NOWARN);
 	if (!pm)
 		goto fail;
@@ -457,7 +591,8 @@ miss:
 	}
 	rcu_read_unlock();
 	atomic64_inc(&c->inserts);
-	if (atomic64_add_return(pm->size, &c->covered) > cap)
+	if (atomic64_add_return(pm->size, &c->covered) >
+			io_pfn_cache_target(c, cap))
 		io_pfn_cache_evict(c, cap);
 	*dma = pm->dma_base + rel;
 	return pm;
@@ -481,6 +616,15 @@ static void io_pfn_cache_flush(struct io_pfn_cache *c)
 		io_pfn_map_put(pm);
 	}
 	c->hand = 0;
+	{
+		void *gv;
+
+		xa_for_each(&c->ghost, index, gv)
+			xa_erase(&c->ghost, index);
+		atomic64_set(&c->ghost_count, 0);
+		c->ghost_hand = 0;
+		c->eff_cap = 0;	/* re-derive the floor on next use */
+	}
 	spin_unlock(&c->lock);
 }
 
@@ -506,7 +650,7 @@ static int io_pfn_cache_stats_show(struct seq_file *m, void *p)
 			break;
 		c = io_pfn_caches[i];
 		seq_printf(m,
-			   "dev %s quantum_kb %zu covered_kb %lld hits %lld misses %lld inserts %lld insert_fails %lld range_fallbacks %lld evictions %lld age_evictions %lld ref_skips %lld\n",
+			   "dev %s quantum_kb %zu covered_kb %lld hits %lld misses %lld inserts %lld insert_fails %lld range_fallbacks %lld evictions %lld age_evictions %lld ref_skips %lld ghost_hits %lld ghost_count %lld eff_cap_mb %llu\n",
 			   dev_name(c->dev),
 			   c->quantum >> 10,
 			   atomic64_read(&c->covered) >> 10,
@@ -517,7 +661,12 @@ static int io_pfn_cache_stats_show(struct seq_file *m, void *p)
 			   atomic64_read(&c->range_fallbacks),
 			   atomic64_read(&c->evictions),
 			   atomic64_read(&c->age_evictions),
-			   atomic64_read(&c->ref_skips));
+			   atomic64_read(&c->ref_skips),
+			   atomic64_read(&c->ghost_hits),
+			   atomic64_read(&c->ghost_count),
+			   io_pfn_cache_target(c,
+				(u64)READ_ONCE(io_dma_pfn_cache_cap_mb) << 20)
+					>> 20);
 	}
 	return 0;
 }
@@ -1279,6 +1428,8 @@ void io_dma_debugfs_init(void)
 			    &io_pfn_cache_stats_fops);
 	debugfs_create_u32("pfn_cache_cap_mb", 0644, dir,
 			   &io_dma_pfn_cache_cap_mb);
+	debugfs_create_u32("pfn_cache_auto", 0644, dir,
+			   &io_dma_pfn_cache_auto);
 	debugfs_create_u32("pfn_cache_max_age_ms", 0644, dir,
 			   &io_dma_pfn_cache_max_age_ms);
 	debugfs_create_file("pfn_cache_flush", 0200, dir, NULL,
