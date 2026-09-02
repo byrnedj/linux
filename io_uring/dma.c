@@ -174,10 +174,10 @@ static u32 io_dma_pfn_cache_auto __read_mostly = 1;
  * under the cliff no matter how generous cap_mb is. The cliff is per
  * IOMMU domain: with position-deterministic striping deduplicating
  * the caches, each device holds only its share, so the machine budget
- * is the per-domain limit times the active devices, about 12GB times
- * four here.
+ * is the per-domain limit times the active devices; 16GB per domain
+ * ran clean across the full grid here.
  */
-static u32 io_dma_pfn_cache_auto_budget_mb __read_mostly = 49152;
+static u32 io_dma_pfn_cache_auto_budget_mb __read_mostly = 65536;
 
 /* Registered per-device caches; slots are never released. */
 static atomic_t io_pfn_cache_nr;
