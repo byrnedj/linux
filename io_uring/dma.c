@@ -2079,15 +2079,20 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 	 */
 #define IO_DMA_STRIPE_SHIFT	20
 	unsigned int nr_chans = ctx->dma.nr_chans ? ctx->dma.nr_chans : 1;
-	unsigned int stripe = ((u64)iocb->ki_pos >> IO_DMA_STRIPE_SHIFT) %
-			      nr_chans;
-	struct dma_chan *chan = ctx->dma.nr_chans ?
-		ctx->dma.chans[stripe] : ctx->dma.chan;
-	struct device *dev = chan->device->dev;
-	struct io_pfn_cache *pfn_cache =
-		io_pfn_cache_usable() ? io_pfn_cache_get(dev) : NULL;
+	/*
+	 * Position-consistent mapping only pays when mappings persist:
+	 * uncached or parked, it concentrates convoyed readers' copies
+	 * on one device for no dedup benefit, so rotate instead. The
+	 * regime is sampled per call; a flip mid-workload only changes
+	 * which device new batches land on.
+	 */
+	bool det_stripe;
+	unsigned int stripe;
+	struct dma_chan *chan;
+	struct device *dev;
+	struct io_pfn_cache *pfn_cache;
 	bool can_wait = !(iocb->ki_flags & IOCB_NOWAIT);
-	size_t map_quantum = io_dma_map_quantum(dev);
+	size_t map_quantum;
 	struct folio_batch fbatch;
 	struct io_dma_batch_entry *entries;
 	unsigned int nr_entries = 0;
@@ -2096,6 +2101,25 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 	size_t batch_bytes = 0;
 	size_t dst_offset = 0;
 	loff_t start_pos = iocb->ki_pos;
+
+	det_stripe = false;
+	if (io_pfn_cache_usable() && nr_chans > 1) {
+		u64 hard = (u64)READ_ONCE(io_dma_pfn_cache_cap_mb) << 20;
+		struct io_pfn_cache *pc =
+			io_pfn_cache_get(ctx->dma.chans[0]->device->dev);
+
+		if (pc && io_pfn_cache_target(pc, hard))
+			det_stripe = true;
+	}
+	if (det_stripe)
+		stripe = ((u64)iocb->ki_pos >> IO_DMA_STRIPE_SHIFT) %
+			 nr_chans;
+	else
+		stripe = ctx->dma.stripe_rr % nr_chans;
+	chan = ctx->dma.nr_chans ? ctx->dma.chans[stripe] : ctx->dma.chan;
+	dev = chan->device->dev;
+	pfn_cache = io_pfn_cache_usable() ? io_pfn_cache_get(dev) : NULL;
+	map_quantum = io_dma_map_quantum(dev);
 	loff_t isize;
 	int i, error = 0;
 	bool writably_mapped;
@@ -2129,7 +2153,11 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 
 	isize = i_size_read(inode);
 	if (unlikely(iocb->ki_pos >= isize)) {
-		kfree(entries);
+		/* Persist the rotation for the uncached regime's spread. */
+	if (!det_stripe)
+		ctx->dma.stripe_rr = stripe + 1;
+
+	kfree(entries);
 		return 0;
 	}
 
@@ -2264,10 +2292,15 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 					 */
 					if (nr_chans > 1 &&
 					    ret == (ssize_t)batch_bytes) {
-						stripe = ((u64)(start_pos +
-							copied) >>
-							IO_DMA_STRIPE_SHIFT) %
-							nr_chans;
+						if (det_stripe)
+							stripe =
+							  ((u64)(start_pos +
+							  copied) >>
+							  IO_DMA_STRIPE_SHIFT)
+							  % nr_chans;
+						else
+							stripe = (stripe + 1) %
+								 nr_chans;
 						chan = ctx->dma.chans[stripe];
 						dev = chan->device->dev;
 						pfn_cache =
