@@ -14,7 +14,8 @@
  *   -o   folio order to hand to move_pages (address stride = 4K << order)
  *   -b   addresses per move_pages call (default: all)
  *   -v   verify the pattern after each migration
- *   -M   mixed mode: alternate <MiB> of THP and <MiB> of base pages;
+ *   -M   mixed mode: alternate <MiB> of THP (folio size 4K<<order) and
+ *        <MiB> of base pages;
  *        the address list interleaves runs of 2M and 4K folios, the
  *        clustered mixed batch that exercises byte-balanced slicing
  */
@@ -136,7 +137,7 @@ int main(int argc, char **argv)
 			return 1;
 		}
 	}
-	if (hugepage && !order)
+	if ((hugepage || mixed_mb) && !order)
 		order = 9;
 
 	len = size_mb << 20;
@@ -184,7 +185,7 @@ int main(int argc, char **argv)
 			size_t chunk = mixed_mb << 20;
 
 			for (n = 0, o = 0; o < per_thread; n++, o += st)
-				st = (o % (2 * chunk)) < chunk ? (1UL << 21) : 4096;
+				st = (o % (2 * chunk)) < chunk ? stride : 4096;
 			thr[i].npages = n;
 		} else {
 			thr[i].npages = per_thread / stride;
@@ -196,7 +197,7 @@ int main(int argc, char **argv)
 			size_t chunk = mixed_mb << 20;
 
 			for (n = 0, o = 0; o < per_thread; n++, o += st) {
-				st = (o % (2 * chunk)) < chunk ? (1UL << 21) : 4096;
+				st = (o % (2 * chunk)) < chunk ? stride : 4096;
 				thr[i].pages[n] = thr[i].buf + o;
 			}
 		} else {
