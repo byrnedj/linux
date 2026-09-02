@@ -50,7 +50,8 @@ static atomic_long_t wait_ns_total;	/* submit -> completion, microseconds */
 static atomic_long_t pin_us_total;	/* source pinning */
 static atomic_long_t map_us_total;	/* DMA mapping of source + destination */
 static atomic_long_t unmap_us_total;	/* unmap + unpin */
-static atomic_long_t src_contig;	/* copies whose source was one contiguous run */
+static atomic_long_t src_contig;
+static atomic_long_t sg_txns;	/* DMA_MEMCPY_SG transactions submitted */	/* copies whose source was one contiguous run */
 
 static bool offloading_enabled;
 static unsigned int nr_dma_chan = 4;
@@ -59,6 +60,8 @@ static unsigned int cpu_pct;		/* tail fraction copied by the CPU */
 static bool cache_ctrl = true;
 static unsigned int wait_mode = UFFD_DMA_WAIT_IRQ;
 static unsigned int spin_us = 60;
+/* Source segments per DMA_MEMCPY_SG transaction; 0 disables the batch path */
+static unsigned int sg_elems = 32;
 static bool util_gate;
 
 static DEFINE_MUTEX(uffd_dma_mutex);
@@ -218,6 +221,89 @@ static int uffd_dma_submit(struct uffd_dma_req *req,
 	return 0;
 }
 
+/*
+ * Batch path: pack the scattered source into DMA_MEMCPY_SG transactions
+ * of up to sg_elems segments against one contiguous destination window.
+ * A batch-capable engine such as DSA executes one transaction as one
+ * hardware BATCH descriptor, so a 512-page copy occupies a handful of
+ * ring slots instead of one per segment (which could exhaust the ring,
+ * the -EIO fallback) and the submission cost is paid once per
+ * transaction. Transactions rotate over the claimed channels.
+ */
+static int uffd_dma_submit_sg(struct uffd_dma_req *req,
+			      struct uffd_dma_cursor *cur,
+			      struct sg_table *sgt, dma_addr_t dst,
+			      size_t dma_len)
+{
+	unsigned int elems = clamp(READ_ONCE(sg_elems), 1U, 1024U);
+	struct scatterlist *src_win, dst_sg;
+	struct scatterlist *sg = sgt->sgl;
+	unsigned int nents = sgt->nents;
+	size_t sg_off = 0, off = 0;
+	int ret = 0;
+
+	src_win = kmalloc_array(elems, sizeof(*src_win), GFP_KERNEL);
+	if (!src_win)
+		return -ENOMEM;
+
+	while (off < dma_len && nents) {
+		struct dma_async_tx_descriptor *tx;
+		size_t win_len = 0;
+		unsigned int n = 0;
+		dma_cookie_t cookie;
+
+		sg_init_table(src_win, elems);
+		while (n < elems && nents && off + win_len < dma_len) {
+			size_t seg = min(sg_dma_len(sg) - sg_off,
+					 dma_len - off - win_len);
+
+			sg_dma_address(&src_win[n]) = sg_dma_address(sg) + sg_off;
+			sg_dma_len(&src_win[n]) = seg;
+			win_len += seg;
+			n++;
+			sg_off += seg;
+			if (sg_off == sg_dma_len(sg)) {
+				sg = sg_next(sg);
+				sg_off = 0;
+				nents--;
+			}
+		}
+		if (!n)
+			break;
+
+		sg_init_table(&dst_sg, 1);
+		sg_dma_address(&dst_sg) = dst + off;
+		sg_dma_len(&dst_sg) = win_len;
+
+		tx = dmaengine_prep_dma_memcpy_sg(mm_offload_dma_chan(cur->idx),
+						  &dst_sg, 1, src_win, n,
+						  cur->flags);
+		if (!tx) {
+			ret = -EIO;
+			break;
+		}
+		tx->callback_result = uffd_dma_callback;
+		tx->callback_param = req;
+		atomic_inc(&req->pending);
+		cookie = dmaengine_submit(tx);
+		if (dma_submit_error(cookie)) {
+			atomic_dec(&req->pending);
+			ret = -EIO;
+			break;
+		}
+		atomic_long_inc(&sg_txns);
+		off += win_len;
+		cur->idx = find_next_bit(&cur->chan_mask,
+					 MM_OFFLOAD_DMA_MAX_CHANNELS,
+					 cur->idx + 1);
+		if (cur->idx >= MM_OFFLOAD_DMA_MAX_CHANNELS)
+			cur->idx = find_first_bit(&cur->chan_mask,
+						  MM_OFFLOAD_DMA_MAX_CHANNELS);
+	}
+	kfree(src_win);
+	return ret;
+}
+
 /* Contiguous source: chunks of UFFD_DMA_CHUNK_BYTES over the claimed channels. */
 static int uffd_dma_submit_contig(struct uffd_dma_req *req,
 				  struct uffd_dma_cursor *cur, dma_addr_t dst,
@@ -354,7 +440,14 @@ static int uffd_dma_copy_pages(struct page *dst, unsigned long nr_pages,
 			ret = uffd_dma_submit_contig(&req, &cur, dst_dma, src_dma,
 						     dma_len);
 		else
-			ret = uffd_dma_submit(&req, &cur, &sgt, dst_dma, dma_len);
+			if (READ_ONCE(sg_elems) &&
+			    dma_has_cap(DMA_MEMCPY_SG,
+					mm_offload_dma_chan(cur.idx)->device->cap_mask))
+				ret = uffd_dma_submit_sg(&req, &cur, &sgt,
+							 dst_dma, dma_len);
+			else
+				ret = uffd_dma_submit(&req, &cur, &sgt, dst_dma,
+						      dma_len);
 		if (ret)
 			goto out_terminate;
 		for_each_set_bit(i, &cur.chan_mask, MM_OFFLOAD_DMA_MAX_CHANNELS)
@@ -559,6 +652,7 @@ UFFD_DMA_UINT_ATTR(nr_dma_chan, 1, MM_OFFLOAD_DMA_MAX_CHANNELS, true);
 UFFD_DMA_UINT_ATTR(cpu_pct, 0, 100, false);
 UFFD_DMA_UINT_ATTR(wait_mode, 0, 1, false);
 UFFD_DMA_UINT_ATTR(spin_us, 0, 100000, false);
+UFFD_DMA_UINT_ATTR(sg_elems, 0, 1024, false);
 UFFD_DMA_BOOL_ATTR(cache_ctrl);
 UFFD_DMA_BOOL_ATTR(util_gate);
 UFFD_DMA_COUNTER_ATTR(copies_done);
@@ -572,6 +666,7 @@ UFFD_DMA_COUNTER_ATTR(pin_us_total);
 UFFD_DMA_COUNTER_ATTR(map_us_total);
 UFFD_DMA_COUNTER_ATTR(unmap_us_total);
 UFFD_DMA_COUNTER_ATTR(src_contig);
+UFFD_DMA_COUNTER_ATTR(sg_txns);
 
 static ssize_t min_bytes_show(struct kobject *kobj,
 			      struct kobj_attribute *attr, char *buf)
@@ -603,6 +698,7 @@ static struct attribute *uffd_dma_attrs[] = {
 	&cache_ctrl_attr.attr,
 	&wait_mode_attr.attr,
 	&spin_us_attr.attr,
+	&sg_elems_attr.attr,
 	&util_gate_attr.attr,
 	&copies_done_attr.attr,
 	&copies_failed_attr.attr,
@@ -615,6 +711,7 @@ static struct attribute *uffd_dma_attrs[] = {
 	&map_us_total_attr.attr,
 	&unmap_us_total_attr.attr,
 	&src_contig_attr.attr,
+	&sg_txns_attr.attr,
 	NULL
 };
 
