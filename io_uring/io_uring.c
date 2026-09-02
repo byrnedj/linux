@@ -2524,6 +2524,29 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 		}
 	}
 
+	/*
+	 * Canonicalize the stripe order across rings. The file-position
+	 * stripe sends a given region's batches to chans[i] for the
+	 * same i on every ring, but the acquisition rotation fills the
+	 * array in a per-ring order: without a shared order, rings
+	 * disagree on which device owns a region and their per-device
+	 * PFN caches re-duplicate the working set. Sorting by device
+	 * makes every ring on the same devices agree. The primary
+	 * follows the sort; nothing has used it yet.
+	 */
+	{
+		unsigned int a, b;
+
+		for (a = 1; a < ctx->dma.nr_chans; a++) {
+			for (b = a; b > 0 &&
+			     ctx->dma.chans[b]->device->dev <
+			     ctx->dma.chans[b - 1]->device->dev; b--)
+				swap(ctx->dma.chans[b],
+				     ctx->dma.chans[b - 1]);
+		}
+		ctx->dma.chan = ctx->dma.chans[0];
+	}
+
 	io_dma_init_freelist(ctx, p);
 
 	return 0;
