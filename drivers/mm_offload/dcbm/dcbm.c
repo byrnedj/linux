@@ -56,6 +56,7 @@ static bool cache_ctrl = true;
 static unsigned long min_clear_bytes = SZ_2M;
 static bool cpu_warm = true;
 static bool util_gate = true;
+static bool byte_balance = true;
 static DEFINE_MUTEX(dcbm_mutex);
 
 
@@ -369,16 +370,51 @@ static int folios_copy_dma(struct list_head *dst_list,
 		actual_channels++;
 	}
 
-	for (i = 0; i < actual_channels; i++) {
-		folios_per_chan = nr_folios * (i + 1) / actual_channels -
-				(nr_folios * i) / actual_channels;
-		if (folios_per_chan == 0)
-			continue;
+	/*
+	 * Slice the folio list over the channels. Count-based slicing
+	 * splits a mixed list of huge and base folios unevenly: one
+	 * channel can end up carrying several 2M folios while another
+	 * gets only base pages, and completion waits on the most loaded
+	 * channel. Byte-based slicing cuts the list so every channel
+	 * carries a near-equal share of the bytes.
+	 */
+	if (READ_ONCE(byte_balance)) {
+		struct list_head *peek = src_pos;
+		size_t total = 0, acc = 0;
+		unsigned int taken = 0;
+		struct folio *f;
 
-		ret = map_folios(&works[i], &src_pos, &dst_pos,
-				 folios_per_chan);
-		if (ret)
-			goto err_cleanup;
+		list_for_each_entry(f, src_list, lru)
+			total += folio_size(f);
+
+		for (i = 0; i < actual_channels && taken < nr_folios; i++) {
+			size_t target = total * (i + 1) / actual_channels;
+			unsigned int cnt = 0;
+
+			do {
+				f = list_entry(peek, struct folio, lru);
+				acc += folio_size(f);
+				peek = peek->next;
+				cnt++;
+			} while (taken + cnt < nr_folios && acc < target);
+
+			ret = map_folios(&works[i], &src_pos, &dst_pos, cnt);
+			if (ret)
+				goto err_cleanup;
+			taken += cnt;
+		}
+	} else {
+		for (i = 0; i < actual_channels; i++) {
+			folios_per_chan = nr_folios * (i + 1) / actual_channels -
+					(nr_folios * i) / actual_channels;
+			if (folios_per_chan == 0)
+				continue;
+
+			ret = map_folios(&works[i], &src_pos, &dst_pos,
+					 folios_per_chan);
+			if (ret)
+				goto err_cleanup;
+		}
 	}
 
 	for (i = 0; i < actual_channels; i++) {
@@ -830,6 +866,8 @@ MODULE_PARM_DESC(max_inflight, "Descriptors in flight per channel before waiting
 
 module_param(sg_elems, uint, 0644);
 MODULE_PARM_DESC(sg_elems, "Folios per scatter-gather transaction on DMA_MEMCPY_SG providers");
+module_param(byte_balance, bool, 0644);
+MODULE_PARM_DESC(byte_balance, "Slice batches over channels by bytes instead of folio count");
 
 static int __init dcbm_init(void)
 {

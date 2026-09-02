@@ -14,6 +14,9 @@
  *   -o   folio order to hand to move_pages (address stride = 4K << order)
  *   -b   addresses per move_pages call (default: all)
  *   -v   verify the pattern after each migration
+ *   -M   mixed mode: alternate <MiB> of THP and <MiB> of base pages;
+ *        the address list interleaves runs of 2M and 4K folios, the
+ *        clustered mixed batch that exercises byte-balanced slicing
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -33,6 +36,7 @@ static size_t size_mb = 1024;
 static int src_node = 0, dst_node = 1, nthreads = 1, iters = 3;
 static int hugepage, order, verify;
 static unsigned long batch;
+static unsigned long mixed_mb;
 
 struct thr {
 	int id;
@@ -115,7 +119,7 @@ int main(int argc, char **argv)
 	unsigned long nodemask;
 	struct rusage ru0, ru1;
 
-	while ((c = getopt(argc, argv, "s:f:t:T:i:Ho:vb:")) != -1) {
+	while ((c = getopt(argc, argv, "s:f:t:T:i:Ho:vb:M:")) != -1) {
 		switch (c) {
 		case 's': size_mb = strtoul(optarg, NULL, 0); break;
 		case 'f': src_node = atoi(optarg); break;
@@ -126,6 +130,7 @@ int main(int argc, char **argv)
 		case 'o': order = atoi(optarg); break;
 		case 'v': verify = 1; break;
 		case 'b': batch = strtoul(optarg, NULL, 0); break;
+		case 'M': mixed_mb = strtoul(optarg, NULL, 0); break;
 		default:
 			fprintf(stderr, "usage: %s -s MiB -f src -t dst [-T thr] [-i iters] [-H] [-o order] [-v] [-b batch]\n", argv[0]);
 			return 1;
@@ -142,7 +147,19 @@ int main(int argc, char **argv)
 		perror("mmap");
 		return 1;
 	}
-	madvise(buf, len, hugepage ? MADV_HUGEPAGE : MADV_NOHUGEPAGE);
+	if (mixed_mb) {
+		size_t chunk = mixed_mb << 20, o;
+
+		for (o = 0; o < len; o += 2 * chunk) {
+			madvise(buf + o, chunk, MADV_HUGEPAGE);
+			if (o + chunk < len)
+				madvise(buf + o + chunk,
+					chunk < len - o - chunk ? chunk : len - o - chunk,
+					MADV_NOHUGEPAGE);
+		}
+	} else {
+		madvise(buf, len, hugepage ? MADV_HUGEPAGE : MADV_NOHUGEPAGE);
+	}
 	nodemask = 1UL << src_node;
 	if (mbind(buf, len, MPOL_BIND, &nodemask, sizeof(nodemask) * 8, 0)) {
 		perror("mbind");
@@ -152,24 +169,46 @@ int main(int argc, char **argv)
 
 	thr = calloc(nthreads, sizeof(*thr));
 	tid = calloc(nthreads, sizeof(*tid));
-	per_thread = (len / nthreads) & ~(stride - 1);
+	if (mixed_mb)
+		per_thread = (len / nthreads) & ~((mixed_mb << 21) - 1);
+	else
+		per_thread = (len / nthreads) & ~(stride - 1);
 	for (i = 0; i < nthreads; i++) {
 		unsigned long n;
+		size_t o, st;
 
 		thr[i].id = i;
 		thr[i].buf = buf + i * per_thread;
 		thr[i].len = per_thread;
-		thr[i].npages = per_thread / stride;
+		if (mixed_mb) {
+			size_t chunk = mixed_mb << 20;
+
+			for (n = 0, o = 0; o < per_thread; n++, o += st)
+				st = (o % (2 * chunk)) < chunk ? (1UL << 21) : 4096;
+			thr[i].npages = n;
+		} else {
+			thr[i].npages = per_thread / stride;
+		}
 		thr[i].pages = calloc(thr[i].npages, sizeof(void *));
 		thr[i].nodes = calloc(thr[i].npages, sizeof(int));
 		thr[i].status = calloc(thr[i].npages, sizeof(int));
-		for (n = 0; n < thr[i].npages; n++)
-			thr[i].pages[n] = thr[i].buf + n * stride;
+		if (mixed_mb) {
+			size_t chunk = mixed_mb << 20;
+
+			for (n = 0, o = 0; o < per_thread; n++, o += st) {
+				st = (o % (2 * chunk)) < chunk ? (1UL << 21) : 4096;
+				thr[i].pages[n] = thr[i].buf + o;
+			}
+		} else {
+			for (n = 0; n < thr[i].npages; n++)
+				thr[i].pages[n] = thr[i].buf + n * stride;
+		}
 	}
 
-	printf("migbench: %zu MiB node %d -> %d, %d threads, order %d, stride %zu KiB, %lu addrs/thread%s\n",
+	printf("migbench: %zu MiB node %d -> %d, %d threads, order %d, stride %zu KiB, %lu addrs/thread%s%s\n",
 	       size_mb, src_node, dst_node, nthreads, order, stride >> 10,
-	       thr[0].npages, hugepage ? ", THP" : "");
+	       thr[0].npages, hugepage ? ", THP" : "",
+	       mixed_mb ? ", mixed" : "");
 
 	for (it = 0; it < iters; it++) {
 		int from = it & 1 ? dst_node : src_node;
