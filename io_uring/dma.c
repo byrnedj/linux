@@ -174,10 +174,15 @@ static u32 io_dma_pfn_cache_auto __read_mostly = 1;
  * under the cliff no matter how generous cap_mb is. The cliff is per
  * IOMMU domain: with position-deterministic striping deduplicating
  * the caches, each device holds only its share, so the machine budget
- * is the per-domain limit times the active devices; 16GB per domain
- * ran clean across the full grid here.
+ * is bounded by the per-domain IOVA limit times the active devices,
+ * but the default stays well under it: standing mappings pin their
+ * folios away from reclaim, and on a memory-pressured host a generous
+ * budget trades application memory for cache coverage - a 64GB budget
+ * cost a shuffle-heavy Spark job 25% of its wall clock. Hosts running
+ * pure I/O against working sets beyond the default can raise it; 16GB
+ * per domain measured clean on the I/O side here.
  */
-static u32 io_dma_pfn_cache_auto_budget_mb __read_mostly = 65536;
+static u32 io_dma_pfn_cache_auto_budget_mb __read_mostly = 16384;
 
 /* Registered per-device caches; slots are never released. */
 static atomic_t io_pfn_cache_nr;
