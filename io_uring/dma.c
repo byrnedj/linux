@@ -2267,10 +2267,26 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 				dst_offset += chunk;
 				batch_bytes += chunk;
 
-				/* Flush the batch if it is full. */
+				/* Flush when the batch is entry-full or
+				 * carries this op's share of one engine.
+				 * A batch descriptor executes serially on
+				 * one engine, so a multi-megabyte op
+				 * folded into a single batch runs at
+				 * single-engine speed while the rest of
+				 * the group idles: 4M reads plateaued at
+				 * a third of their rate. Splitting each
+				 * op into about four batches, bounded to
+				 * [256K, 1M] apiece, spreads it across
+				 * engines; the bounds keep small ops from
+				 * shattering into per-entry descriptors
+				 * and huge ops from oversplitting.
+				 */
 				if (nr_entries >= min_t(unsigned int,
 						READ_ONCE(io_dma_batch_max),
-						IO_DMA_BATCH_MAX)) {
+						IO_DMA_BATCH_MAX) ||
+				    batch_bytes >= clamp(want / 4,
+						(size_t)SZ_256K,
+						(size_t)SZ_1M)) {
 					ssize_t ret;
 
 					ret = io_dma_flush_batch(req, dev, chan,
