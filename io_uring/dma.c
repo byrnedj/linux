@@ -114,8 +114,13 @@ struct io_pfn_cache {
 	unsigned long		ghost_hand;	/* purge walk cursor */
 	atomic64_t		ghost_count;
 	atomic64_t		ghost_hits;
-	u64			eff_cap;	/* adaptive target, bytes */
+	u64			eff_cap;	/* adaptive target, bytes;
+						 * 0 uninitialized, 1 parked
+						 */
 	u64			ghost_hits_snap;/* at the last decay tick */
+	u64			hits_snap;	/* ditto, for the utility check */
+	u64			misses_snap;
+	u32			parked_ticks;	/* ticks spent parked */
 	unsigned long		next_adapt;	/* jiffies */
 };
 
@@ -156,30 +161,61 @@ static u32 io_dma_pfn_cache_max_age_ms __read_mostly = 60000;
  */
 static u32 io_dma_pfn_cache_auto __read_mostly = 1;
 
+/*
+ * Machine-wide standing-mapping budget for adaptive mode, in MiB.
+ * Striping gives every device its own cache and the devices duplicate
+ * coverage of a shared working set, so per-device targets multiply
+ * into total standing bytes. Past roughly 20GB total on this class of
+ * machine the IOVA rcaches deplete and every transient mapping falls
+ * to the domain rbtree: throughput collapses by an order of magnitude
+ * while the caches report healthy hit rates. The adaptive ceiling is
+ * this budget split across the registered caches, so the sum stays
+ * under the cliff no matter how generous cap_mb is.
+ */
+static u32 io_dma_pfn_cache_auto_budget_mb __read_mostly = 12288;
+
+/* Registered per-device caches; slots are never released. */
+static atomic_t io_pfn_cache_nr;
+
 /* Ghost growth per hit and decay per quiet 2s tick (eff >> shift). */
 #define IO_PFN_GHOST_GROW_SEGS	8
 #define IO_PFN_ADAPT_DECAY_SHIFT 3
 #define IO_PFN_ADAPT_TICK	(2 * HZ)
 
-static u64 io_pfn_cache_floor(u64 hard)
+/* Per-cache adaptive ceiling: the machine budget's fair share. */
+static u64 io_pfn_cache_ceiling(u64 hard)
 {
-	return min(hard, max(hard >> 3, (u64)SZ_64M));
+	u64 budget = (u64)READ_ONCE(io_dma_pfn_cache_auto_budget_mb) << 20;
+	unsigned int n = atomic_read(&io_pfn_cache_nr);
+
+	return min(hard, budget) / (n ? n : 1);
+}
+
+static u64 io_pfn_cache_floor(u64 ceil)
+{
+	return min(ceil, clamp(ceil >> 3, (u64)SZ_64M, (u64)SZ_2G));
 }
 
 /*
  * The eviction target: the adaptive effective cap, clamped to the
- * hard cap, or the hard cap itself when auto sizing is off.
+ * per-cache ceiling, or the hard cap itself when auto sizing is off.
  */
+#define IO_PFN_EFF_PARKED	1
+#define IO_PFN_PARK_PROBE_TICKS	8
+
 static u64 io_pfn_cache_target(struct io_pfn_cache *c, u64 hard)
 {
-	u64 eff;
+	u64 eff, ceil;
 
 	if (!READ_ONCE(io_dma_pfn_cache_auto))
 		return hard;
+	ceil = io_pfn_cache_ceiling(hard);
 	eff = READ_ONCE(c->eff_cap);
+	if (eff == IO_PFN_EFF_PARKED)
+		return 0;
 	if (!eff)
-		eff = io_pfn_cache_floor(hard);
-	return min(eff, hard);
+		eff = io_pfn_cache_floor(ceil);
+	return min(eff, ceil);
 }
 
 /* Sweep visit budget per eviction call.  This bounds the datapath
@@ -250,6 +286,7 @@ static struct io_pfn_cache *io_pfn_cache_get(struct device *dev)
 			 */
 			get_device(dev);
 			io_pfn_caches[i] = c;
+			atomic_inc(&io_pfn_cache_nr);
 			/* pairs with the lockless load above */
 			smp_store_release(&io_pfn_cache_devs[i], dev);
 			spin_unlock(&io_pfn_cache_reg_lock);
@@ -345,12 +382,56 @@ static void io_pfn_cache_evict(struct io_pfn_cache *c, u64 cap)
 			 */
 			if (time_after(jiffies, c->next_adapt)) {
 				u64 gh = atomic64_read(&c->ghost_hits);
+				u64 h = atomic64_read(&c->hits);
+				u64 m = atomic64_read(&c->misses);
+				u64 dh = h - c->hits_snap;
+				u64 dm = m - c->misses_snap;
+				u64 floor = io_pfn_cache_floor(
+						io_pfn_cache_ceiling(cap));
 				u64 eff = io_pfn_cache_target(c, cap);
 
-				if (gh == c->ghost_hits_snap)
+				if (READ_ONCE(c->eff_cap) == IO_PFN_EFF_PARKED) {
+					/*
+					 * Parked: the cache proved useless
+					 * for the current pattern and every
+					 * lookup bypasses it. Probe again
+					 * periodically; access patterns
+					 * change with workload phases.
+					 */
+					if (++c->parked_ticks >=
+					    IO_PFN_PARK_PROBE_TICKS) {
+						c->parked_ticks = 0;
+						WRITE_ONCE(c->eff_cap, floor);
+					}
+				} else if (dh < dm && (dh || dm)) {
+					/*
+					 * Under half the lookups hit. Ghost
+					 * hits under a cyclic pattern larger
+					 * than the ceiling keep demanding
+					 * growth that cannot help until the
+					 * whole set fits, which it never
+					 * will; the hit ratio is the utility
+					 * check the ghost lacks. Halve, and
+					 * once at the floor park entirely:
+					 * a floor-sized cache under cyclic
+					 * access is pure mapping churn.
+					 */
+					if (eff <= floor) {
+						WRITE_ONCE(c->eff_cap,
+							   IO_PFN_EFF_PARKED);
+						c->parked_ticks = 0;
+					} else {
+						WRITE_ONCE(c->eff_cap,
+							max(eff >> 1, floor));
+					}
+				} else if (gh == c->ghost_hits_snap) {
 					eff -= eff >> IO_PFN_ADAPT_DECAY_SHIFT;
-				c->eff_cap = max(eff, io_pfn_cache_floor(cap));
+					WRITE_ONCE(c->eff_cap,
+						   max(eff, floor));
+				}
 				c->ghost_hits_snap = gh;
+				c->hits_snap = h;
+				c->misses_snap = m;
 				c->next_adapt = jiffies + IO_PFN_ADAPT_TICK;
 			}
 
@@ -488,6 +569,16 @@ static struct io_pfn_map *io_pfn_map_lookup(struct io_pfn_cache *c,
 	 */
 	io_pfn_cache_evict(c, cap);
 
+	/*
+	 * Parked: the utility check found the pattern uncacheable, so
+	 * skip straight to the caller's plain per-chunk map instead of
+	 * inserting entries the sweep immediately evicts. The sweep
+	 * call above keeps draining what is left and runs the adapt
+	 * tick that eventually un-parks for a fresh look.
+	 */
+	if (!io_pfn_cache_target(c, cap))
+		return NULL;
+
 	seg_base = offset & ~(c->quantum - 1);
 	seg_len = min_t(size_t, c->quantum, map_len - seg_base);
 	rel = offset - seg_base;
@@ -542,9 +633,19 @@ miss:
 			 */
 			atomic64_dec(&c->ghost_count);
 			atomic64_inc(&c->ghost_hits);
+			/*
+			 * Step up, and never converge to exactly the
+			 * resident bytes: a target equal to the working
+			 * set keeps the evict sweep hot on every insert.
+			 * An eighth of headroom over what is currently
+			 * mapped parks the sweep once the set fits.
+			 */
 			eff = io_pfn_cache_target(c, cap);
 			eff += (u64)c->quantum * IO_PFN_GHOST_GROW_SEGS;
-			WRITE_ONCE(c->eff_cap, min(eff, cap));
+			eff = max(eff, (u64)atomic64_read(&c->covered) +
+				       ((u64)atomic64_read(&c->covered) >> 3));
+			WRITE_ONCE(c->eff_cap,
+				   min(eff, io_pfn_cache_ceiling(cap)));
 		}
 	}
 
@@ -624,6 +725,10 @@ static void io_pfn_cache_flush(struct io_pfn_cache *c)
 		atomic64_set(&c->ghost_count, 0);
 		c->ghost_hand = 0;
 		c->eff_cap = 0;	/* re-derive the floor on next use */
+		c->hits_snap = atomic64_read(&c->hits);
+		c->misses_snap = atomic64_read(&c->misses);
+		c->ghost_hits_snap = atomic64_read(&c->ghost_hits);
+		c->parked_ticks = 0;
 	}
 	spin_unlock(&c->lock);
 }
@@ -1430,6 +1535,8 @@ void io_dma_debugfs_init(void)
 			   &io_dma_pfn_cache_cap_mb);
 	debugfs_create_u32("pfn_cache_auto", 0644, dir,
 			   &io_dma_pfn_cache_auto);
+	debugfs_create_u32("pfn_cache_auto_budget_mb", 0644, dir,
+			   &io_dma_pfn_cache_auto_budget_mb);
 	debugfs_create_u32("pfn_cache_max_age_ms", 0644, dir,
 			   &io_dma_pfn_cache_max_age_ms);
 	debugfs_create_file("pfn_cache_flush", 0200, dir, NULL,
