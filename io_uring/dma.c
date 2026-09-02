@@ -120,6 +120,7 @@ struct io_pfn_cache {
 	u64			ghost_hits_snap;/* at the last decay tick */
 	u64			hits_snap;	/* ditto, for the utility check */
 	u64			misses_snap;
+	u32			prev_ratio;	/* hit % at the last tick */
 	u32			parked_ticks;	/* ticks spent parked */
 	unsigned long		next_adapt;	/* jiffies */
 };
@@ -172,7 +173,7 @@ static u32 io_dma_pfn_cache_auto __read_mostly = 1;
  * this budget split across the registered caches, so the sum stays
  * under the cliff no matter how generous cap_mb is.
  */
-static u32 io_dma_pfn_cache_auto_budget_mb __read_mostly = 12288;
+static u32 io_dma_pfn_cache_auto_budget_mb __read_mostly = 16384;
 
 /* Registered per-device caches; slots are never released. */
 static atomic_t io_pfn_cache_nr;
@@ -360,7 +361,12 @@ static void io_pfn_cache_evict(struct io_pfn_cache *c, u64 cap)
 	bool over, aging;
 	int pass;
 
-	over = atomic64_read(&c->covered) > target;
+	/* A dead-band of a few segments over the target parks the sweep
+	 * when a fitting working set sits at its converged size; without
+	 * it every insert at the boundary evicts one entry and the sweep
+	 * stays hot on the datapath.
+	 */
+	over = atomic64_read(&c->covered) > target + ((u64)c->quantum << 2);
 	aging = max_age && time_after(jiffies, READ_ONCE(c->next_age));
 	if (!over && !aging)
 		return;
@@ -403,31 +409,48 @@ static void io_pfn_cache_evict(struct io_pfn_cache *c, u64 cap)
 						c->parked_ticks = 0;
 						WRITE_ONCE(c->eff_cap, floor);
 					}
-				} else if (dh < dm && (dh || dm)) {
-					/*
-					 * Under half the lookups hit. Ghost
-					 * hits under a cyclic pattern larger
-					 * than the ceiling keep demanding
-					 * growth that cannot help until the
-					 * whole set fits, which it never
-					 * will; the hit ratio is the utility
-					 * check the ghost lacks. Halve, and
-					 * once at the floor park entirely:
-					 * a floor-sized cache under cyclic
-					 * access is pure mapping churn.
-					 */
-					if (eff <= floor) {
+				} else {
+					u32 ratio = (dh + dm) ?
+						(u32)div64_u64(dh * 100,
+							       dh + dm) : 100;
+					bool ghosting =
+						gh != c->ghost_hits_snap;
+
+					if (ghosting && ratio < 50 &&
+					    ratio <= c->prev_ratio + 2) {
+						/*
+						 * Ghost hits keep demanding
+						 * growth but the hit ratio
+						 * is low and no longer
+						 * improving: a cyclic set
+						 * larger than the ceiling,
+						 * where growth cannot help
+						 * until the whole set fits,
+						 * which it never will. A set
+						 * still growing toward a fit
+						 * shows a climbing ratio and
+						 * is spared. Halve, and once
+						 * at the floor park: a
+						 * floor-sized cache under
+						 * cyclic access is pure
+						 * mapping churn.
+						 */
+						if (eff <= floor) {
+							WRITE_ONCE(c->eff_cap,
+							    IO_PFN_EFF_PARKED);
+							c->parked_ticks = 0;
+						} else {
+							WRITE_ONCE(c->eff_cap,
+							    max(eff >> 1,
+								floor));
+						}
+					} else if (!ghosting) {
+						eff -= eff >>
+						    IO_PFN_ADAPT_DECAY_SHIFT;
 						WRITE_ONCE(c->eff_cap,
-							   IO_PFN_EFF_PARKED);
-						c->parked_ticks = 0;
-					} else {
-						WRITE_ONCE(c->eff_cap,
-							max(eff >> 1, floor));
+							   max(eff, floor));
 					}
-				} else if (gh == c->ghost_hits_snap) {
-					eff -= eff >> IO_PFN_ADAPT_DECAY_SHIFT;
-					WRITE_ONCE(c->eff_cap,
-						   max(eff, floor));
+					c->prev_ratio = ratio;
 				}
 				c->ghost_hits_snap = gh;
 				c->hits_snap = h;
@@ -508,7 +531,8 @@ static void io_pfn_cache_evict(struct io_pfn_cache *c, u64 cap)
 					atomic64_inc(&c->ghost_count);
 			}
 			io_pfn_map_put(pm);	/* Drop the cache bias. */
-			over = atomic64_read(&c->covered) > target;
+			over = atomic64_read(&c->covered) >
+				target + ((u64)c->quantum << 2);
 			if (--unmaps <= 0) {
 				c->hand = index + 1;
 				goto out;
@@ -728,6 +752,7 @@ static void io_pfn_cache_flush(struct io_pfn_cache *c)
 		c->hits_snap = atomic64_read(&c->hits);
 		c->misses_snap = atomic64_read(&c->misses);
 		c->ghost_hits_snap = atomic64_read(&c->ghost_hits);
+		c->prev_ratio = 0;
 		c->parked_ticks = 0;
 	}
 	spin_unlock(&c->lock);
