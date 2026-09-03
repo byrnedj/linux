@@ -284,6 +284,40 @@ prq_advance:
 	return IRQ_RETVAL(handled);
 }
 
+#define PRQ_WATCHDOG_INTERVAL	HZ
+
+static void prq_watchdog_fn(struct work_struct *work)
+{
+	struct intel_iommu *iommu = container_of(work, struct intel_iommu,
+						 prq_watchdog.work);
+	u64 head = readq(iommu->reg + DMAR_PQH_REG) & PRQ_RING_MASK;
+	u64 tail = readq(iommu->reg + DMAR_PQT_REG) & PRQ_RING_MASK;
+
+	if (head != tail && head == iommu->prq_wd_last_head) {
+		/*
+	 	 * The queue has been non-empty with no handler progress for a
+		 * full interval: the page request event interrupt was lost or
+		 * cannot be delivered (e.g. a stale or unreachable MSI
+		 * destination). Drain inline; prq_event_thread() clears PPR
+		 * first, which re-arms the event edge for future requests.
+		 * disable_irq() excludes a concurrently running irq thread.
+		 */
+		pr_warn_ratelimited("IOMMU: %s: page request queue stalled (head %llx tail %llx PRS %x PECTL %x PEDATA %x PEADDR %x PEUADDR %x), draining inline\n",
+				    iommu->name, head, tail,
+				    readl(iommu->reg + DMAR_PRS_REG),
+				    readl(iommu->reg + DMAR_PECTL_REG),
+				    readl(iommu->reg + DMAR_PEDATA_REG),
+				    readl(iommu->reg + DMAR_PEADDR_REG),
+				    readl(iommu->reg + DMAR_PEUADDR_REG));
+		disable_irq(iommu->pr_irq);
+		prq_event_thread(iommu->pr_irq, iommu);
+		enable_irq(iommu->pr_irq);
+		head = readq(iommu->reg + DMAR_PQH_REG) & PRQ_RING_MASK;
+	}
+	iommu->prq_wd_last_head = head;
+	schedule_delayed_work(&iommu->prq_watchdog, PRQ_WATCHDOG_INTERVAL);
+}
+
 int intel_iommu_enable_prq(struct intel_iommu *iommu)
 {
 	struct iopf_queue *iopfq;
@@ -331,6 +365,10 @@ int intel_iommu_enable_prq(struct intel_iommu *iommu)
 
 	init_completion(&iommu->prq_complete);
 
+	iommu->prq_wd_last_head = 0;
+	INIT_DELAYED_WORK(&iommu->prq_watchdog, prq_watchdog_fn);
+	schedule_delayed_work(&iommu->prq_watchdog, PRQ_WATCHDOG_INTERVAL);
+
 	return 0;
 
 free_iopfq:
@@ -348,6 +386,7 @@ free_prq:
 
 int intel_iommu_finish_prq(struct intel_iommu *iommu)
 {
+	cancel_delayed_work_sync(&iommu->prq_watchdog);
 	writeq(0ULL, iommu->reg + DMAR_PQH_REG);
 	writeq(0ULL, iommu->reg + DMAR_PQT_REG);
 	writeq(0ULL, iommu->reg + DMAR_PQA_REG);
