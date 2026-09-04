@@ -441,11 +441,15 @@ static enum dma_status idxd_dma_tx_status(struct dma_chan *dma_chan,
 
 	/*
 	 * The completion record is device memory that
-	 * idxd_wq_leaked_release() frees once the queue is dead; its
-	 * synchronize_rcu() orders the flag before the free.
+	 * idxd_wq_leaked_release() frees once the queue is dead, and its
+	 * synchronize_rcu() orders the flag before the free. A release
+	 * that could not stop the device keeps the records, and the
+	 * descriptors may still complete, so they are read on.
 	 */
 	guard(rcu)();
-	if (unlikely(READ_ONCE(wq->dead))) {
+	/* Pairs with the release in idxd_wq_leaked_release(). */
+	if (unlikely(smp_load_acquire(&wq->dead)) &&
+	    !READ_ONCE(wq->dead_live)) {
 		idxd_dma_retire_dead(desc);
 		return DMA_ERROR;
 	}
@@ -523,6 +527,15 @@ static enum dma_status idxd_dma_tx_status(struct dma_chan *dma_chan,
 			return DMA_IN_PROGRESS;
 		return DMA_ERROR;
 	}
+	/*
+	 * A queue released while its device stayed enabled reads disabled,
+	 * but the device may still run what it holds, so a failure here
+	 * would invite the reuse of memory it is about to write. The
+	 * descriptor stays in progress until a halt, a disable that ran or
+	 * the PCI remove retires it.
+	 */
+	if (READ_ONCE(wq->dead_live))
+		return DMA_IN_PROGRESS;
 	if (wq->state != IDXD_WQ_ENABLED || READ_ONCE(wq->unbind_drained))
 		return DMA_ERROR;
 
@@ -579,11 +592,13 @@ static int idxd_dma_terminate_all(struct dma_chan *c)
 
 	/*
 	 * A dead queue flushed its lists when its interrupt was freed and
-	 * accepts nothing since, and its completion records are gone.
+	 * accepts nothing since. Its completion records are freed, or left
+	 * to a device that may still write them.
 	 */
 	if (READ_ONCE(wq->dead))
 		return 0;
-	idxd_wq_flush_descs(wq);
+	/* The device keeps running what the lists held. See synchronize. */
+	idxd_wq_flush_descs(wq, true);
 
 	return 0;
 }
@@ -591,8 +606,81 @@ static int idxd_dma_terminate_all(struct dma_chan *c)
 static void idxd_dma_synchronize(struct dma_chan *c)
 {
 	struct idxd_wq *wq = to_idxd_wq(c);
+	LIST_HEAD(quarantined);
+	u32 epoch;
 
-	idxd_wq_drain(wq);
+	/* A dead queue reuses no slot and runs no drain. See terminate_all. */
+	if (READ_ONCE(wq->dead))
+		return;
+	/*
+	 * dmaengine_synchronize() promises the client that its memory may
+	 * be freed afterwards. A drain that completed keeps that promise,
+	 * and nothing the device held before it is left to write a
+	 * completion record, so the slots terminate_all quarantined are
+	 * free again. A drain that never completed, or that was refused
+	 * because an earlier command never did, leaves the client's
+	 * descriptors in a device that may still run them. The channel
+	 * release path runs this under dma_list_mutex, and a device that
+	 * refused the drain offers nothing to wait for, so waiting longer
+	 * here would hold up every dmaengine user for nothing. The driver
+	 * cannot keep the promise for the client's memory then and says so.
+	 * It keeps its own memory safe: the quarantined slots stay out of
+	 * use and the queue takes no new descriptor until a later drain
+	 * completes or a halt kills what the device holds, so a late
+	 * completion record lands in a slot nobody reuses, and
+	 * idxd_drv_disable_wq() leaks what the device may still write.
+	 * Only a device reset ends the exposure of the client's memory.
+	 */
+	idxd_wq_quarantine_take(wq, &quarantined);
+	/*
+	 * A halt during the drain kills every descriptor submitted before
+	 * it, which is all of them, and a reset that followed may have
+	 * ended the drain itself. Such a drain is as good as complete.
+	 */
+	epoch = READ_ONCE(wq->idxd->reset_epoch);
+	if (!idxd_wq_drain(wq) || READ_ONCE(wq->idxd->reset_epoch) != epoch) {
+		/*
+		 * The drain returns at once for a queue that is not enabled.
+		 * A device-level remove that could not stop the device may
+		 * have released this one meanwhile, and the device may still
+		 * run what the quarantine holds, so it stays for the reclaim
+		 * to drop. The release marks the queue dead before it changes
+		 * the state, with the full barrier of synchronize_rcu()
+		 * between, so a drain that saw the change sees the mark.
+		 */
+		smp_rmb();
+		/* Pairs with the release in idxd_wq_leaked_release(). */
+		if (unlikely(smp_load_acquire(&wq->dead)) &&
+		    READ_ONCE(wq->dead_live)) {
+			idxd_wq_quarantine_put_back(wq, &quarantined);
+			return;
+		}
+		idxd_wq_quarantine_free(wq, &quarantined);
+		WRITE_ONCE(wq->stuck, false);
+		return;
+	}
+	idxd_wq_quarantine_put_back(wq, &quarantined);
+	/*
+	 * A device-level remove that stopped the device may have released
+	 * the queue since the take and found the quarantine empty. The
+	 * release marks the queue dead before its own take, and the list
+	 * lock orders that take against this put back, so either the
+	 * release frees these slots or the queue reads dead here. A
+	 * stopped device runs none of them. The acquire pairs with the
+	 * release in idxd_wq_leaked_release(), as above.
+	 */
+	if (unlikely(smp_load_acquire(&wq->dead)) &&
+	    !READ_ONCE(wq->dead_live)) {
+		LIST_HEAD(dead_descs);
+
+		idxd_wq_quarantine_take(wq, &dead_descs);
+		idxd_wq_quarantine_free(wq, &dead_descs);
+		return;
+	}
+	WRITE_ONCE(wq->stuck, true);
+	dev_err_ratelimited(&wq->idxd->pdev->dev,
+			    "wq %d: drain failed. Its descriptors may still complete and it takes no new work until a drain completes or the device is reset\n",
+			    wq->id);
 }
 
 int idxd_register_dma_device(struct idxd_device *idxd)
@@ -899,10 +987,17 @@ static void idxd_dmaengine_drv_remove(struct idxd_dev *idxd_dev)
 		 * outstanding on it as failed: a client acting on that, by
 		 * copying the data itself or by reusing the buffer, must
 		 * not race a late write from a descriptor that was only
-		 * slow.
+		 * slow. After a drain that timed out, or that was refused
+		 * because an earlier command did, the device may still run
+		 * them, so they stay in progress until a reset or a halt
+		 * retires them.
 		 */
-		idxd_wq_drain(wq);
-		WRITE_ONCE(wq->unbind_drained, true);
+		if (idxd_wq_drain(wq))
+			dev_err(&wq->idxd->pdev->dev,
+				"wq %d: drain failed with live DMA clients and their descriptors stay outstanding\n",
+				wq->id);
+		else
+			WRITE_ONCE(wq->unbind_drained, true);
 		wq->leaked_chan = wq->idxd_chan;
 		wq->idxd_chan = NULL;
 		/*

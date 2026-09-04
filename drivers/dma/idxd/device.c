@@ -12,10 +12,14 @@
 #include "idxd.h"
 #include "registers.h"
 
+/* generous bound: drain of a loaded WQ is the slowest legitimate command */
+#define IDXD_CMD_TIMEOUT_MS	30000
+
 static void idxd_cmd_exec(struct idxd_device *idxd, int cmd_code, u32 operand,
 			  u32 *status);
 static void idxd_device_wqs_clear_state(struct idxd_device *idxd);
 static void idxd_wq_disable_cleanup(struct idxd_wq *wq);
+static inline bool idxd_device_is_halted(struct idxd_device *idxd);
 static int idxd_wq_config_write(struct idxd_wq *wq);
 
 /* Interrupt control bits */
@@ -173,6 +177,9 @@ int idxd_wq_alloc_resources(struct idxd_wq *wq)
 	if (wq->type != IDXD_WQT_KERNEL)
 		return 0;
 
+	/* A fresh pool: nothing outstanding can land in it. */
+	wq->stuck = false;
+	INIT_LIST_HEAD(&wq->quarantine);
 	num_descs = wq_dedicated(wq) ? wq->size : wq->threshold;
 	wq->num_descs = num_descs;
 
@@ -253,6 +260,10 @@ static void idxd_wq_free_device_resources(struct idxd_wq *wq)
 /* The memory the clients reach: the descriptor arrays and the allocator. */
 static void idxd_wq_free_client_resources(struct idxd_wq *wq)
 {
+	/* The quarantine links into the descriptors freed here. */
+	spin_lock(&wq->ie.list_lock);
+	INIT_LIST_HEAD(&wq->quarantine);
+	spin_unlock(&wq->ie.list_lock);
 	free_hw_descs(wq);
 	free_descs(wq);
 	sbitmap_queue_free(&wq->sbq);
@@ -262,9 +273,18 @@ static void idxd_wq_free_client_resources(struct idxd_wq *wq)
 
 void idxd_wq_free_resources(struct idxd_wq *wq)
 {
+	LIST_HEAD(dead_descs);
+
 	if (wq->type != IDXD_WQT_KERNEL)
 		return;
 
+	/*
+	 * The disable frees the pool only after its drain and its reset
+	 * completed, and a failed enable has run nothing, so the device no
+	 * longer reaches what a quarantined descriptor maps.
+	 */
+	idxd_wq_quarantine_take(wq, &dead_descs);
+	idxd_wq_quarantine_free(wq, &dead_descs);
 	idxd_wq_free_device_resources(wq);
 	idxd_wq_free_client_resources(wq);
 }
@@ -273,28 +293,60 @@ EXPORT_SYMBOL_NS_GPL(idxd_wq_free_resources, "IDXD");
 /*
  * Release what a work queue unbound with live DMA clients still holds of
  * its device: the portal, the interrupt and the memory the device reads
- * and writes. The device has been disabled or reset, so nothing in
- * flight can complete. The clients learn of it through wq->dead, which
- * tx_status and the prep paths read under RCU before they touch that
- * memory, and the synchronize_rcu() here orders the flag before the
- * free. What the clients can still reach, the descriptor arrays and the
- * allocator, stays until the last of them releases the channel and
- * idxd_wq_leaked_reclaim() runs.
+ * and writes. With @device_stopped the device has been disabled, reset
+ * or halted, so nothing in flight can complete and that memory is freed.
+ * Otherwise a device command timed out and the device stayed enabled, so
+ * the memory is kept, as the work queue disable keeps its own. The
+ * clients learn of the dead queue through wq->dead, which tx_status and
+ * the prep paths read under RCU before they touch that memory, and the
+ * synchronize_rcu() here orders the flag before the free. What the
+ * clients can still reach, the descriptor arrays and the allocator,
+ * stays until the last of them releases the channel and
+ * idxd_wq_leaked_reclaim() runs. The batch arrays hang off the
+ * descriptors, so a release that keeps them detaches them first, or the
+ * reclaim would free them with the descriptors.
  */
-void idxd_wq_leaked_release(struct idxd_wq *wq)
+void idxd_wq_leaked_release(struct idxd_wq *wq, bool device_stopped)
 {
+	LIST_HEAD(dead_descs);
+	int i;
+
 	lockdep_assert_held(&wq->wq_lock);
 
 	if (wq->dead || wq->type != IDXD_WQT_KERNEL)
 		return;
 	idxd_wq_unmap_portal(wq);
-	/* The disable or reset revoked every interrupt handle. */
+	/*
+	 * A disable or reset revoked every interrupt handle, and a device
+	 * that refused both needs a reset, which revokes them as well.
+	 */
 	WRITE_ONCE(wq->ie.int_handle, INVALID_INT_HANDLE);
 	idxd_wq_free_irq(wq);
-	WRITE_ONCE(wq->dead, true);
+	WRITE_ONCE(wq->dead_live, !device_stopped);
+	/*
+	 * Pairs with the acquire in tx_status, which keeps reading the
+	 * completion records of a queue whose device may still write them
+	 * and so must see dead_live with dead.
+	 */
+	smp_store_release(&wq->dead, true);
 	/* Every reader that saw the queue alive has left the memory. */
 	synchronize_rcu();
-	idxd_wq_free_device_resources(wq);
+	if (device_stopped) {
+		/*
+		 * A stopped device reaches nothing a quarantined descriptor
+		 * maps either. The reclaim may run after the device has left
+		 * its IOMMU, so those mappings go now.
+		 */
+		idxd_wq_quarantine_take(wq, &dead_descs);
+		idxd_wq_quarantine_free(wq, &dead_descs);
+		idxd_wq_free_device_resources(wq);
+	} else {
+		for (i = 0; i < wq->num_descs; i++)
+			wq->descs[i]->batch = NULL;
+		dev_err(&wq->idxd->pdev->dev,
+			"wq %d: device still enabled, leaking its completion records and batch arrays\n",
+			wq->id);
+	}
 	clear_bit(wq->id, wq->idxd->wq_enable_map);
 	wq->state = IDXD_WQ_DISABLED;
 }
@@ -308,6 +360,7 @@ void idxd_wq_leaked_reclaim(struct idxd_wq *wq)
 	percpu_ref_exit(&wq->wq_active);
 	wq->client_count = 0;
 	wq->dead = false;
+	wq->dead_live = false;
 }
 
 int idxd_wq_enable(struct idxd_wq *wq)
@@ -340,6 +393,7 @@ int idxd_wq_disable(struct idxd_wq *wq, bool reset_config)
 	struct idxd_device *idxd = wq->idxd;
 	struct device *dev = &idxd->pdev->dev;
 	u32 status, operand;
+	int rc;
 
 	dev_dbg(dev, "Disabling WQ %d\n", wq->id);
 
@@ -357,8 +411,14 @@ int idxd_wq_disable(struct idxd_wq *wq, bool reset_config)
 	 * To make sure pending translations are drained before WQ
 	 * attributes are changed, we use a WQ Drain followed by WQ Reset and
 	 * then restore the WQ configuration.
+	 *
+	 * A drain that timed out leaves descriptors in the queue. Report
+	 * it instead of resetting, so that the caller keeps whatever those
+	 * descriptors can still reach, a PASID for instance.
 	 */
-	idxd_wq_drain(wq);
+	rc = idxd_wq_drain(wq);
+	if (rc)
+		return rc;
 
 	operand = BIT(wq->id % 16) | ((wq->id / 16) << 16);
 	idxd_cmd_exec(idxd, IDXD_CMD_RESET_WQ, operand, &status);
@@ -378,36 +438,72 @@ int idxd_wq_disable(struct idxd_wq *wq, bool reset_config)
 	return 0;
 }
 
-void idxd_wq_drain(struct idxd_wq *wq)
+/*
+ * The result of a drain or a reset. IDXD_CMDSTS_HW_ERR stands for a
+ * command that timed out, or was refused after one did, and then the
+ * device may still run what it holds. It is also the device's own code
+ * for a hardware error, after which the specification has software read
+ * GENSTS. Both leave the device enabled unless it halted, and a halted
+ * device runs nothing until it is reset, so what it holds is then as
+ * gone as after a drain and that is not a timeout.
+ */
+static int idxd_cmd_drain_result(struct idxd_device *idxd, u32 status)
+{
+	if (status != IDXD_CMDSTS_HW_ERR || idxd_device_is_halted(idxd))
+		return 0;
+	return -ETIMEDOUT;
+}
+
+/*
+ * Returns -ETIMEDOUT when the command never completed, or was refused
+ * because an earlier one never did, in which case descriptors may still
+ * be in the device and the caller must not free anything it can write
+ * into.
+ */
+int idxd_wq_drain(struct idxd_wq *wq)
 {
 	struct idxd_device *idxd = wq->idxd;
 	struct device *dev = &idxd->pdev->dev;
-	u32 operand;
+	u32 operand, status;
 
 	if (wq->state != IDXD_WQ_ENABLED) {
 		dev_dbg(dev, "WQ %d in wrong state: %d\n", wq->id, wq->state);
-		return;
+		return 0;
 	}
 
 	dev_dbg(dev, "Draining WQ %d\n", wq->id);
 	operand = BIT(wq->id % 16) | ((wq->id / 16) << 16);
-	idxd_cmd_exec(idxd, IDXD_CMD_DRAIN_WQ, operand, NULL);
+	idxd_cmd_exec(idxd, IDXD_CMD_DRAIN_WQ, operand, &status);
+	return idxd_cmd_drain_result(idxd, status);
 }
 
-void idxd_wq_reset(struct idxd_wq *wq)
+int idxd_wq_reset(struct idxd_wq *wq)
 {
 	struct idxd_device *idxd = wq->idxd;
 	struct device *dev = &idxd->pdev->dev;
-	u32 operand;
+	u32 operand, status;
+	int rc;
 
 	if (wq->state != IDXD_WQ_ENABLED) {
 		dev_dbg(dev, "WQ %d in wrong state: %d\n", wq->id, wq->state);
-		return;
+		return 0;
 	}
 
 	operand = BIT(wq->id % 16) | ((wq->id / 16) << 16);
-	idxd_cmd_exec(idxd, IDXD_CMD_RESET_WQ, operand, NULL);
+	idxd_cmd_exec(idxd, IDXD_CMD_RESET_WQ, operand, &status);
+	/*
+	 * A reset that timed out, or was refused after a command did,
+	 * leaves the queue enabled in the device on its configuration.
+	 * Its software state stays enabled too, as after a failed
+	 * idxd_wq_disable(), so that the queue is neither reconfigured nor
+	 * enabled again on a configuration the device does not run until
+	 * a device disable or reset has stopped it.
+	 */
+	rc = idxd_cmd_drain_result(idxd, status);
+	if (rc)
+		return rc;
 	idxd_wq_disable_cleanup(wq);
+	return 0;
 }
 
 int idxd_wq_map_portal(struct idxd_wq *wq)
@@ -632,10 +728,19 @@ static void idxd_cmd_exec(struct idxd_device *idxd, int cmd_code, u32 operand,
 	union idxd_command_reg cmd;
 	DECLARE_COMPLETION_ONSTACK(done);
 	u32 stat;
-	unsigned long flags;
+	unsigned long flags, left;
 
 	if (idxd_device_is_halted(idxd)) {
 		dev_warn(&idxd->pdev->dev, "Device is HALTED!\n");
+		if (status)
+			*status = IDXD_CMDSTS_HW_ERR;
+		return;
+	}
+
+	if (test_bit(IDXD_FLAG_CMD_TIMEDOUT, &idxd->flags)) {
+		dev_warn(&idxd->pdev->dev,
+			 "Not sending command %#x: an earlier device command timed out, device needs a reset\n",
+			 cmd_code);
 		if (status)
 			*status = IDXD_CMDSTS_HW_ERR;
 		return;
@@ -647,15 +752,54 @@ static void idxd_cmd_exec(struct idxd_device *idxd, int cmd_code, u32 operand,
 	cmd.int_req = 1;
 
 	spin_lock_irqsave(&idxd->cmd_lock, flags);
-	wait_event_lock_irq(idxd->cmd_waitq,
-			    !test_bit(IDXD_FLAG_CMD_RUNNING, &idxd->flags),
-			    idxd->cmd_lock);
+	/*
+	 * Wait for the running command, if any. Only its owner can tell
+	 * that it is stuck, so this wait does not declare a timeout of its
+	 * own: its budget covers one owner and restarts whenever another
+	 * command starts running, and it ends early when the owner gives
+	 * up and marks the device. Several healthy commands queued behind
+	 * one another therefore never add up to a false timeout.
+	 */
+	while (test_bit(IDXD_FLAG_CMD_RUNNING, &idxd->flags)) {
+		u32 seq = idxd->cmd_seq;
+
+		if (test_bit(IDXD_FLAG_CMD_TIMEDOUT, &idxd->flags)) {
+			spin_unlock_irqrestore(&idxd->cmd_lock, flags);
+			dev_err(&idxd->pdev->dev,
+				"not sending command %#x: the running device command timed out, device needs a reset\n",
+				cmd_code);
+			if (status)
+				*status = IDXD_CMDSTS_HW_ERR;
+			return;
+		}
+		if (!wait_event_lock_irq_timeout(idxd->cmd_waitq,
+				!test_bit(IDXD_FLAG_CMD_RUNNING, &idxd->flags) ||
+				test_bit(IDXD_FLAG_CMD_TIMEDOUT, &idxd->flags) ||
+				idxd->cmd_seq != seq,
+				idxd->cmd_lock,
+				msecs_to_jiffies(IDXD_CMD_TIMEOUT_MS))) {
+			/*
+			 * The owner started before this wait and has the
+			 * same budget, so its own timeout is due; it marks
+			 * the device and wakes this queue. Give up without
+			 * marking anything here.
+			 */
+			spin_unlock_irqrestore(&idxd->cmd_lock, flags);
+			dev_err(&idxd->pdev->dev,
+				"timed out waiting for the running device command before %#x\n",
+				cmd_code);
+			if (status)
+				*status = IDXD_CMDSTS_HW_ERR;
+			return;
+		}
+	}
 
 	dev_dbg(&idxd->pdev->dev, "%s: sending cmd: %#x op: %#x\n",
 		__func__, cmd_code, operand);
 
 	idxd->cmd_status = 0;
 	__set_bit(IDXD_FLAG_CMD_RUNNING, &idxd->flags);
+	idxd->cmd_seq++;
 	idxd->cmd_done = &done;
 	iowrite32(cmd.bits, idxd->reg_base + IDXD_CMD_OFFSET);
 
@@ -664,9 +808,57 @@ static void idxd_cmd_exec(struct idxd_device *idxd, int cmd_code, u32 operand,
 	 * the command completes via interrupt.
 	 */
 	spin_unlock_irqrestore(&idxd->cmd_lock, flags);
-	wait_for_completion(&done);
-	stat = ioread32(idxd->reg_base + IDXD_CMDSTS_OFFSET);
+	left = wait_for_completion_timeout(&done,
+				msecs_to_jiffies(IDXD_CMD_TIMEOUT_MS));
 	spin_lock(&idxd->cmd_lock);
+	/*
+	 * A reset, or the recovery from a halt, forgot this command
+	 * meanwhile, and another may be running by now. Forgetting the
+	 * command completes the wait, but it can also happen between the
+	 * interrupt's completion and this lock, or after the wait ran out,
+	 * so ownership is checked whichever way the wait ended. The device
+	 * is not stuck on this command, and the command state belongs to
+	 * whatever runs now. Mark nothing and leave that state alone, even
+	 * if this command completed just before the reset or the halt: its
+	 * status can no longer be trusted.
+	 */
+	if (idxd->cmd_done != &done) {
+		spin_unlock(&idxd->cmd_lock);
+		dev_err(&idxd->pdev->dev,
+			"device command %#x was ended by a reset\n",
+			cmd_code);
+		if (status)
+			*status = IDXD_CMDSTS_HW_ERR;
+		return;
+	}
+	/* A timeout, unless the interrupt beat the lock. */
+	if (!left && !completion_done(&done)) {
+		/*
+		 * The device did not complete the command. Detach the
+		 * on-stack completion so a late interrupt cannot touch it,
+		 * and leave IDXD_FLAG_CMD_RUNNING set: the device may still
+		 * be executing, so no further commands may be issued.
+		 * IDXD_FLAG_CMD_TIMEDOUT makes waiters and future callers
+		 * fail fast; a late completion interrupt or a device reset
+		 * clears both flags.
+		 */
+		idxd->cmd_done = NULL;
+		set_bit(IDXD_FLAG_CMD_TIMEDOUT, &idxd->flags);
+		wake_up(&idxd->cmd_waitq);
+		spin_unlock(&idxd->cmd_lock);
+		dev_err(&idxd->pdev->dev,
+			"device command %#x timed out, device needs a reset\n",
+			cmd_code);
+		if (status)
+			*status = IDXD_CMDSTS_HW_ERR;
+		return;
+	}
+	/*
+	 * Read the status while this command still owns the register: no
+	 * other command is written before RUNNING is cleared below.
+	 */
+	stat = ioread32(idxd->reg_base + IDXD_CMDSTS_OFFSET);
+	idxd->cmd_done = NULL;
 	if (status)
 		*status = stat;
 	idxd->cmd_status = stat & GENMASK(7, 0);
@@ -675,6 +867,77 @@ static void idxd_cmd_exec(struct idxd_device *idxd, int cmd_code, u32 operand,
 	/* Wake up other pending commands */
 	wake_up(&idxd->cmd_waitq);
 	spin_unlock(&idxd->cmd_lock);
+}
+
+/*
+ * Forget the running command, whether its owner still waits for it or
+ * has given up on it. Called when the device has been reset or has
+ * halted, so the command can no longer be executing. A waiting owner is
+ * woken instead of sleeping out its timeout. It finds that it no longer
+ * owns the command and returns without touching the command state,
+ * which belongs to whatever command runs next.
+ */
+void idxd_cmd_reset_state(struct idxd_device *idxd)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&idxd->cmd_lock, flags);
+	/*
+	 * The completion is on the owner's stack. It is valid while
+	 * cmd_done points to it, since the owner clears cmd_done, or sees
+	 * that it points elsewhere, under cmd_lock before it returns.
+	 */
+	if (idxd->cmd_done)
+		complete(idxd->cmd_done);
+	idxd->cmd_done = NULL;
+	__clear_bit(IDXD_FLAG_CMD_RUNNING, &idxd->flags);
+	clear_bit(IDXD_FLAG_CMD_TIMEDOUT, &idxd->flags);
+	wake_up(&idxd->cmd_waitq);
+	spin_unlock_irqrestore(&idxd->cmd_lock, flags);
+}
+
+/*
+ * Hold device commands off while the re-probe after a reset frees the
+ * interrupts and requests them again. A command whose completion
+ * interrupt comes while the misc vector is gone is never completed, and
+ * its owner would time out and fence the device that was just reset.
+ * The running command, if any, is waited for first: its owner gives up
+ * within its timeout, and the misc vector still takes its interrupt.
+ * RUNNING is then held without an owner, and new commands wait for it
+ * as for any running command. Returns false, holding nothing, when a
+ * command timed out, since commands then fail fast anyway.
+ */
+bool idxd_cmd_hold(struct idxd_device *idxd, u32 *seq)
+{
+	bool held = false;
+
+	spin_lock_irq(&idxd->cmd_lock);
+	wait_event_lock_irq(idxd->cmd_waitq,
+			    !test_bit(IDXD_FLAG_CMD_RUNNING, &idxd->flags) ||
+			    test_bit(IDXD_FLAG_CMD_TIMEDOUT, &idxd->flags),
+			    idxd->cmd_lock);
+	if (!test_bit(IDXD_FLAG_CMD_RUNNING, &idxd->flags)) {
+		__set_bit(IDXD_FLAG_CMD_RUNNING, &idxd->flags);
+		*seq = ++idxd->cmd_seq;
+		held = true;
+	}
+	spin_unlock_irq(&idxd->cmd_lock);
+	return held;
+}
+
+/*
+ * End a hold taken by idxd_cmd_hold(). A halt's recovery may have
+ * forgotten the hold meanwhile and let another command run, which then
+ * has an owner or a newer sequence number, and its state is left alone.
+ */
+void idxd_cmd_unhold(struct idxd_device *idxd, u32 seq)
+{
+	spin_lock_irq(&idxd->cmd_lock);
+	if (idxd->cmd_seq == seq && !idxd->cmd_done) {
+		__clear_bit(IDXD_FLAG_CMD_RUNNING, &idxd->flags);
+		wake_up(&idxd->cmd_waitq);
+	}
+	spin_unlock_irq(&idxd->cmd_lock);
 }
 
 int idxd_device_enable(struct idxd_device *idxd)
@@ -712,9 +975,16 @@ int idxd_device_disable(struct idxd_device *idxd)
 
 	idxd_cmd_exec(idxd, IDXD_CMD_DISABLE_DEVICE, 0, &status);
 
-	/* If the command is successful or if the device was disabled */
+	/*
+	 * The command succeeded, or the device was already disabled. The
+	 * error code is a value, not a bit mask, so compare it whole. A
+	 * refused command reports IDXD_CMDSTS_HW_ERR, which shares a bit
+	 * with the already-disabled code but leaves the device enabled,
+	 * and clearing the software state of an enabled device lets a
+	 * later teardown free memory the device still writes.
+	 */
 	if (status != IDXD_CMDSTS_SUCCESS &&
-	    !(status & IDXD_CMDSTS_ERR_DIS_DEV_EN)) {
+	    (status & IDXD_CMDSTS_ERR_MASK) != IDXD_CMDSTS_ERR_DIS_DEV_EN) {
 		dev_dbg(dev, "%s: err_code: %#x\n", __func__, status);
 		return -ENXIO;
 	}
@@ -723,24 +993,41 @@ int idxd_device_disable(struct idxd_device *idxd)
 	return 0;
 }
 
-void idxd_device_reset(struct idxd_device *idxd)
+/*
+ * Returns -ENXIO when the device refused or never ran the reset. The
+ * software state is cleared only after a reset that ran, since clearing
+ * it for an enabled device lets a later teardown free memory the device
+ * still writes.
+ */
+int idxd_device_reset(struct idxd_device *idxd)
 {
-	idxd_cmd_exec(idxd, IDXD_CMD_RESET_DEVICE, 0, NULL);
+	u32 status;
+
+	idxd_cmd_exec(idxd, IDXD_CMD_RESET_DEVICE, 0, &status);
+	if (status != IDXD_CMDSTS_SUCCESS) {
+		dev_dbg(&idxd->pdev->dev, "%s: err_code: %#x\n", __func__, status);
+		return -ENXIO;
+	}
 	idxd_device_clear_state(idxd);
 	spin_lock(&idxd->dev_lock);
 	idxd_unmask_error_interrupts(idxd);
 	spin_unlock(&idxd->dev_lock);
+	return 0;
 }
 
-void idxd_device_drain_pasid(struct idxd_device *idxd, int pasid)
+/* Returns -ETIMEDOUT when the drain was never run or never completed. */
+int idxd_device_drain_pasid(struct idxd_device *idxd, int pasid)
 {
 	struct device *dev = &idxd->pdev->dev;
-	u32 operand;
+	u32 operand, status;
 
 	operand = pasid;
 	dev_dbg(dev, "cmd: %u operand: %#x\n", IDXD_CMD_DRAIN_PASID, operand);
-	idxd_cmd_exec(idxd, IDXD_CMD_DRAIN_PASID, operand, NULL);
+	idxd_cmd_exec(idxd, IDXD_CMD_DRAIN_PASID, operand, &status);
+	if (idxd_cmd_drain_result(idxd, status))
+		return -ETIMEDOUT;
 	dev_dbg(dev, "pasid %d drained\n", pasid);
+	return 0;
 }
 
 int idxd_device_request_int_handle(struct idxd_device *idxd, int idx, int *handle,
@@ -778,31 +1065,20 @@ int idxd_device_release_int_handle(struct idxd_device *idxd, int handle,
 {
 	struct device *dev = &idxd->pdev->dev;
 	u32 operand, status;
-	union idxd_command_reg cmd;
 
 	if (!(idxd->hw.cmd_cap & BIT(IDXD_CMD_RELEASE_INT_HANDLE)))
 		return -EOPNOTSUPP;
 
 	dev_dbg(dev, "release int handle, handle %d\n", handle);
 
-	memset(&cmd, 0, sizeof(cmd));
 	operand = handle & GENMASK(15, 0);
 
 	if (irq_type == IDXD_IRQ_IMS)
 		operand |= CMD_INT_HANDLE_IMS;
 
-	cmd.cmd = IDXD_CMD_RELEASE_INT_HANDLE;
-	cmd.operand = operand;
-
 	dev_dbg(dev, "cmd: %u operand: %#x\n", IDXD_CMD_RELEASE_INT_HANDLE, operand);
 
-	spin_lock(&idxd->cmd_lock);
-	iowrite32(cmd.bits, idxd->reg_base + IDXD_CMD_OFFSET);
-
-	while (ioread32(idxd->reg_base + IDXD_CMDSTS_OFFSET) & IDXD_CMDSTS_ACTIVE)
-		cpu_relax();
-	status = ioread32(idxd->reg_base + IDXD_CMDSTS_OFFSET);
-	spin_unlock(&idxd->cmd_lock);
+	idxd_cmd_exec(idxd, IDXD_CMD_RELEASE_INT_HANDLE, operand, &status);
 
 	if ((status & IDXD_CMDSTS_ERR_MASK) != IDXD_CMDSTS_SUCCESS) {
 		dev_dbg(dev, "release int handle failed: %#x\n", status);
@@ -1403,11 +1679,14 @@ int idxd_device_load_config(struct idxd_device *idxd)
 	return 0;
 }
 
-static void idxd_flush_pending_descs(struct idxd_irq_entry *ie)
+static void idxd_flush_pending_descs(struct idxd_irq_entry *ie,
+				     bool quarantine)
 {
+	struct idxd_wq *wq = ie_to_wq(ie);
 	struct idxd_desc *desc, *itr;
 	struct llist_node *head;
 	LIST_HEAD(flist);
+	LIST_HEAD(qlist);
 	enum idxd_complete_type ctype;
 
 	spin_lock(&ie->list_lock);
@@ -1435,8 +1714,91 @@ static void idxd_flush_pending_descs(struct idxd_irq_entry *ie)
 		tx = &desc->txd;
 		tx->callback = NULL;
 		tx->callback_result = NULL;
+		/*
+		 * A descriptor the device has not finished still has its
+		 * completion record to write. A flush that leaves the
+		 * device running keeps its slot out of use, or the record
+		 * would land on the slot's next owner and complete it with
+		 * this descriptor's status. Its unmap data stays with the
+		 * slot as well, since the device may still access what it
+		 * maps, and an address released now could be mapped again
+		 * for someone else before the late access.
+		 */
+		if (quarantine && ctype == IDXD_COMPLETE_ABORT) {
+			struct dmaengine_unmap_data *unmap = tx->unmap;
+
+			tx->unmap = NULL;
+			idxd_dma_complete_txd(desc, ctype, false, NULL, NULL);
+			tx->unmap = unmap;
+			list_add_tail(&desc->list, &qlist);
+			continue;
+		}
 		idxd_dma_complete_txd(desc, ctype, true, NULL, NULL);
 	}
+
+	if (list_empty(&qlist))
+		return;
+	spin_lock(&ie->list_lock);
+	list_splice_tail(&qlist, &wq->quarantine);
+	spin_unlock(&ie->list_lock);
+}
+
+/*
+ * Take what terminate_all has quarantined so far. A drain covers only
+ * what the device held when it was issued, so a synchronize takes the
+ * quarantine before it drains and frees it if the drain completed. A
+ * descriptor terminated meanwhile waits for the next one. The list lock
+ * serialises this with the flush that adds to the quarantine and with a
+ * halt or a teardown that frees it all.
+ */
+void idxd_wq_quarantine_take(struct idxd_wq *wq, struct list_head *list)
+{
+	spin_lock(&wq->ie.list_lock);
+	list_splice_init(&wq->quarantine, list);
+	spin_unlock(&wq->ie.list_lock);
+}
+
+/* The drain did not complete: the device may still run them. */
+void idxd_wq_quarantine_put_back(struct idxd_wq *wq, struct list_head *list)
+{
+	spin_lock(&wq->ie.list_lock);
+	list_splice(list, &wq->quarantine);
+	spin_unlock(&wq->ie.list_lock);
+}
+
+/*
+ * Nothing the device holds can write their completion records, or reach
+ * the memory their unmap data maps, any more. The unmap data goes before
+ * the slot, which a new owner may take at once.
+ */
+void idxd_wq_quarantine_free(struct idxd_wq *wq, struct list_head *list)
+{
+	struct idxd_desc *desc, *itr;
+
+	list_for_each_entry_safe(desc, itr, list, list) {
+		list_del(&desc->list);
+		dma_descriptor_unmap(&desc->txd);
+		idxd_free_desc(wq, desc);
+	}
+}
+
+/*
+ * A halt killed every descriptor the device held: the quarantined slots
+ * are free, and the fence a failed drain raised can be lifted. Under
+ * wq_lock, since an unbind racing the halt may free the pool.
+ */
+void idxd_wq_halt_release(struct idxd_wq *wq)
+{
+	LIST_HEAD(dead_descs);
+
+	guard(mutex)(&wq->wq_lock);
+
+	if (wq->state != IDXD_WQ_ENABLED || wq->type != IDXD_WQT_KERNEL)
+		return;
+
+	idxd_wq_quarantine_take(wq, &dead_descs);
+	idxd_wq_quarantine_free(wq, &dead_descs);
+	WRITE_ONCE(wq->stuck, false);
 }
 
 static void idxd_device_set_perm_entry(struct idxd_device *idxd,
@@ -1468,12 +1830,18 @@ void idxd_wq_free_irq(struct idxd_wq *wq)
 		return;
 
 	free_irq(ie->vector, ie);
-	idxd_flush_pending_descs(ie);
+	idxd_flush_pending_descs(ie, false);
 
 	/* FLR revokes every handle; the halt path marks them invalid. */
 	if (ie->int_handle == INVALID_INT_HANDLE)
 		return;
 
+	/*
+	 * The release waits for a running command like any other command.
+	 * It is not sent, or does not complete, only on a halted device or
+	 * after a command timed out, and the reset such a device needs
+	 * revokes the handle. The handle is forgotten in any case.
+	 */
 	if (idxd->request_int_handles)
 		idxd_device_release_int_handle(idxd, ie->int_handle, IDXD_IRQ_MSIX);
 	idxd_device_clear_perm_entry(idxd, ie);
@@ -1482,16 +1850,38 @@ void idxd_wq_free_irq(struct idxd_wq *wq)
 	ie->pasid = IOMMU_PASID_INVALID;
 }
 
-void idxd_wq_flush_descs(struct idxd_wq *wq)
+/*
+ * @quarantine: the device keeps running, so the slots of the descriptors
+ * it has not finished stay out of use until a drain covers them. A halt
+ * has killed them and frees their slots at once.
+ */
+void idxd_wq_flush_descs(struct idxd_wq *wq, bool quarantine)
 {
 	struct idxd_irq_entry *ie = &wq->ie;
+	bool killed = false;
 
 	guard(mutex)(&wq->wq_lock);
 
 	if (wq->state != IDXD_WQ_ENABLED || wq->type != IDXD_WQT_KERNEL)
 		return;
 
-	idxd_flush_pending_descs(ie);
+	/*
+	 * A submitter between its list add and its portal write holds
+	 * wq_active. Waiting for the reference to die puts every listed
+	 * descriptor in the device, where the drain that frees the
+	 * quarantine covers it. A halt flush has done this itself.
+	 */
+	if (quarantine && !percpu_ref_is_dying(&wq->wq_active)) {
+		reinit_completion(&wq->wq_resurrect);
+		percpu_ref_kill(&wq->wq_active);
+		wait_for_completion(&wq->wq_dead);
+		killed = true;
+	}
+	idxd_flush_pending_descs(ie, quarantine);
+	if (killed) {
+		percpu_ref_reinit(&wq->wq_active);
+		complete_all(&wq->wq_resurrect);
+	}
 }
 
 int idxd_wq_request_irq(struct idxd_wq *wq)
@@ -1700,6 +2090,7 @@ void idxd_drv_disable_wq(struct idxd_wq *wq)
 {
 	struct idxd_device *idxd = wq->idxd;
 	struct device *dev = &idxd->pdev->dev;
+	int rc;
 
 	lockdep_assert_held(&wq->wq_lock);
 
@@ -1708,10 +2099,19 @@ void idxd_drv_disable_wq(struct idxd_wq *wq)
 			 wq->id, idxd_wq_refcount(wq));
 
 	idxd_wq_unmap_portal(wq);
-	idxd_wq_drain(wq);
+	rc = idxd_wq_drain(wq);
 	idxd_wq_free_irq(wq);
-	idxd_wq_reset(wq);
-	idxd_wq_free_resources(wq);
+	rc |= idxd_wq_reset(wq);
+	/*
+	 * A drain or reset that never completed leaves descriptors in the
+	 * device, and their completion records live in the memory freed
+	 * here. Leak it; the device writing into freed memory is worse.
+	 */
+	if (rc)
+		dev_err(dev, "wq %d: drain or reset timed out, leaking its descriptor memory\n",
+			wq->id);
+	else
+		idxd_wq_free_resources(wq);
 	percpu_ref_exit(&wq->wq_active);
 	wq->client_count = 0;
 }
@@ -1779,6 +2179,7 @@ void idxd_device_drv_remove(struct idxd_dev *idxd_dev)
 {
 	struct device *dev = &idxd_dev->conf_dev;
 	struct idxd_device *idxd = idxd_dev_to_idxd(idxd_dev);
+	bool stopped;
 	int i;
 
 	for (i = 0; i < idxd->max_wqs; i++) {
@@ -1799,12 +2200,19 @@ void idxd_device_drv_remove(struct idxd_dev *idxd_dev)
 	}
 
 	idxd_unregister_dma_device(idxd);
-	idxd_device_disable(idxd);
-	if (test_bit(IDXD_FLAG_CONFIGURABLE, &idxd->flags))
-		idxd_device_reset(idxd);
+	/*
+	 * A disable or a reset that ran, or found the device disabled or
+	 * halted, leaves nothing in flight. Both are refused after a device
+	 * command timed out, and the device then stays enabled with whatever
+	 * it holds, so what it may still write is kept.
+	 */
+	stopped = !idxd_device_disable(idxd);
+	if (test_bit(IDXD_FLAG_CONFIGURABLE, &idxd->flags) &&
+	    !idxd_device_reset(idxd))
+		stopped = true;
 	/*
 	 * A queue unbound with live DMA clients kept its device resources
-	 * for them. The device is disabled now and nothing of theirs can
+	 * for them. Once the device has stopped nothing of theirs can
 	 * complete, so release those before the device goes away; the
 	 * channel state itself waits for the last client.
 	 */
@@ -1828,7 +2236,7 @@ void idxd_device_drv_remove(struct idxd_dev *idxd_dev)
 		mutex_lock(&wq->wq_lock);
 		deferred = wq->deferred_unbind;
 		if (deferred)
-			idxd_wq_leaked_release(wq);
+			idxd_wq_leaked_release(wq, stopped);
 		mutex_unlock(&wq->wq_lock);
 		/*
 		 * The deferred teardown tests dead without wq_lock, so one
@@ -1844,7 +2252,10 @@ void idxd_device_drv_remove(struct idxd_dev *idxd_dev)
 		if (deferred)
 			flush_work(&wq->deferred_unbind_work);
 	}
-	idxd_device_evl_free(idxd);
+	if (stopped)
+		idxd_device_evl_free(idxd);
+	else
+		dev_err(dev, "device still enabled after a command timeout, leaking the event log\n");
 }
 
 static enum idxd_dev_type dev_types[] = {

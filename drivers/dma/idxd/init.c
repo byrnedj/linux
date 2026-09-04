@@ -219,6 +219,7 @@ static int idxd_setup_wqs(struct idxd_device *idxd)
 		init_waitqueue_head(&wq->err_queue);
 		init_completion(&wq->wq_dead);
 		init_completion(&wq->wq_resurrect);
+		INIT_LIST_HEAD(&wq->quarantine);
 		wq->max_xfer_bytes = WQ_DEFAULT_MAX_XFER;
 		idxd_wq_set_max_batch_size(idxd->data->type, wq, WQ_DEFAULT_MAX_BATCH);
 		idxd_wq_set_init_max_sgl_size(idxd, wq);
@@ -1067,6 +1068,15 @@ static void idxd_reset_done(struct pci_dev *pdev)
 	struct device *dev;
 	int rc, i;
 
+	/*
+	 * A reset ends any command, including one that had timed out. The
+	 * PCI core resets the device even when the preparation failed and
+	 * the device is not rebound, and it calls this after a reset that
+	 * failed as well, which cannot be told apart here. Like the rebind
+	 * below, this assumes that the reset ran.
+	 */
+	idxd_cmd_reset_state(idxd);
+
 	if (!idxd->idxd_saved)
 		return;
 
@@ -1212,6 +1222,14 @@ int idxd_pci_probe_alloc(struct idxd_device *idxd, struct pci_dev *pdev,
 	}
 
 	if (!alloc_idxd) {
+		bool held;
+		u32 seq;
+
+		/*
+		 * Commands complete through the misc interrupt, which is
+		 * gone until it is requested again.
+		 */
+		held = idxd_cmd_hold(idxd, &seq);
 		/* Release interrupts in the IDXD device. */
 		idxd_cleanup_interrupts(idxd);
 
@@ -1219,6 +1237,8 @@ int idxd_pci_probe_alloc(struct idxd_device *idxd, struct pci_dev *pdev,
 		rc = idxd_setup_interrupts(idxd);
 		if (rc)
 			dev_warn(dev, "IDXD interrupts failed to setup\n");
+		if (held)
+			idxd_cmd_unhold(idxd, seq);
 	}
 
 	dev_info(&pdev->dev, "Intel(R) Accelerator Device (v%x)\n",
@@ -1296,6 +1316,13 @@ static void idxd_remove(struct pci_dev *pdev)
 	 * that driver while the queues still exist.
 	 */
 	device_release_driver(idxd_confdev(idxd));
+	/*
+	 * Disable the device while the queues still exist too. The
+	 * sub-driver's remove leaves the device enabled when a command has
+	 * timed out, a late completion can clear that state at any time,
+	 * and the disable below then clears the queues' software state.
+	 */
+	idxd_shutdown(pdev);
 	idxd_unregister_devices(idxd);
 	/*
 	 * When ->release() is called for the idxd->conf_dev, it frees all the memory related
@@ -1306,7 +1333,6 @@ static void idxd_remove(struct pci_dev *pdev)
 	 */
 	get_device(idxd_confdev(idxd));
 	device_unregister(idxd_confdev(idxd));
-	idxd_shutdown(pdev);
 	idxd_device_remove_debugfs(idxd);
 	perfmon_pmu_remove(idxd);
 	idxd_cleanup_interrupts(idxd);
@@ -1315,6 +1341,13 @@ static void idxd_remove(struct pci_dev *pdev)
 	pci_iounmap(pdev, idxd->reg_base);
 	put_device(idxd_confdev(idxd));
 	pci_disable_device(pdev);
+	/*
+	 * Bus mastering is off, so nothing the device holds can complete.
+	 * The clients of a queue leaked with the device still enabled read
+	 * the state through the references the leak took, and retire their
+	 * descriptors on it.
+	 */
+	idxd->state = IDXD_DEV_DISABLED;
 }
 
 static struct pci_driver idxd_pci_driver = {

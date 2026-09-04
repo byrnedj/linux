@@ -239,6 +239,22 @@ struct idxd_wq {
 				 * clients; read under RCU before the
 				 * completion records or batches are touched
 				 */
+	bool dead_live;		/* released while the device stayed enabled:
+				 * the completion records are kept and the
+				 * descriptors may still complete
+				 */
+	bool stuck;		/* a drain failed with the device enabled: the
+				 * outstanding descriptors may complete at any
+				 * time, so no slot is reused until a later
+				 * drain completes or a halt kills them
+				 */
+	struct list_head quarantine;	/* descriptors a terminate_all took
+					 * off the lists while the device
+					 * still held them. Their slots, with
+					 * their unmap data, are freed once a
+					 * drain that covers them completes or
+					 * the device stops. Under ie.list_lock.
+					 */
 	char name[WQ_NAME_SIZE + 1];
 	u64 max_xfer_bytes;
 	u32 max_batch_size;
@@ -292,6 +308,7 @@ enum idxd_device_state {
 enum idxd_device_flag {
 	IDXD_FLAG_CONFIGURABLE = 0,
 	IDXD_FLAG_CMD_RUNNING,
+	IDXD_FLAG_CMD_TIMEDOUT,
 	IDXD_FLAG_PASID_ENABLED,
 	IDXD_FLAG_USER_PASID_ENABLED,
 	IDXD_FLAG_REMOVING,	/* PCI remove under way, refuse binds */
@@ -357,6 +374,7 @@ struct idxd_device {
 	spinlock_t dev_lock;	/* spinlock for device */
 	spinlock_t cmd_lock;	/* spinlock for device commands */
 	struct completion *cmd_done;
+	u32 cmd_seq;		/* bumps when a command starts running */
 	u32 reset_epoch;	/* bumps on every device halt */
 	struct idxd_group **groups;
 	struct idxd_wq **wqs;
@@ -825,10 +843,13 @@ void idxd_drv_disable_wq(struct idxd_wq *wq);
 int idxd_device_init_reset(struct idxd_device *idxd);
 int idxd_device_enable(struct idxd_device *idxd);
 int idxd_device_disable(struct idxd_device *idxd);
-void idxd_device_reset(struct idxd_device *idxd);
+int idxd_device_reset(struct idxd_device *idxd);
 void idxd_device_clear_state(struct idxd_device *idxd);
+void idxd_cmd_reset_state(struct idxd_device *idxd);
+bool idxd_cmd_hold(struct idxd_device *idxd, u32 *seq);
+void idxd_cmd_unhold(struct idxd_device *idxd, u32 seq);
 int idxd_device_config(struct idxd_device *idxd);
-void idxd_device_drain_pasid(struct idxd_device *idxd, int pasid);
+int idxd_device_drain_pasid(struct idxd_device *idxd, int pasid);
 int idxd_device_load_config(struct idxd_device *idxd);
 int idxd_device_request_int_handle(struct idxd_device *idxd, int idx, int *handle,
 				   enum idxd_interrupt_type irq_type);
@@ -839,12 +860,12 @@ int idxd_device_release_int_handle(struct idxd_device *idxd, int handle,
 void idxd_wqs_unmap_portal(struct idxd_device *idxd);
 int idxd_wq_alloc_resources(struct idxd_wq *wq);
 void idxd_wq_free_resources(struct idxd_wq *wq);
-void idxd_wq_leaked_release(struct idxd_wq *wq);
+void idxd_wq_leaked_release(struct idxd_wq *wq, bool device_stopped);
 void idxd_wq_leaked_reclaim(struct idxd_wq *wq);
 int idxd_wq_enable(struct idxd_wq *wq);
 int idxd_wq_disable(struct idxd_wq *wq, bool reset_config);
-void idxd_wq_drain(struct idxd_wq *wq);
-void idxd_wq_reset(struct idxd_wq *wq);
+int idxd_wq_drain(struct idxd_wq *wq);
+int idxd_wq_reset(struct idxd_wq *wq);
 int idxd_wq_map_portal(struct idxd_wq *wq);
 void idxd_wq_unmap_portal(struct idxd_wq *wq);
 int idxd_wq_set_pasid(struct idxd_wq *wq, int pasid);
@@ -854,7 +875,11 @@ void idxd_wq_quiesce(struct idxd_wq *wq);
 int idxd_wq_init_percpu_ref(struct idxd_wq *wq);
 void idxd_wq_free_irq(struct idxd_wq *wq);
 int idxd_wq_request_irq(struct idxd_wq *wq);
-void idxd_wq_flush_descs(struct idxd_wq *wq);
+void idxd_wq_flush_descs(struct idxd_wq *wq, bool quarantine);
+void idxd_wq_quarantine_take(struct idxd_wq *wq, struct list_head *list);
+void idxd_wq_quarantine_put_back(struct idxd_wq *wq, struct list_head *list);
+void idxd_wq_quarantine_free(struct idxd_wq *wq, struct list_head *list);
+void idxd_wq_halt_release(struct idxd_wq *wq);
 
 /* submission */
 int idxd_submit_desc(struct idxd_wq *wq, struct idxd_desc *desc);
