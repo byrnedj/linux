@@ -7,10 +7,14 @@
 #include <linux/io-64-nonatomic-lo-hi.h>
 #include <linux/dmaengine.h>
 #include <linux/irq.h>
+#include <linux/iopoll.h>
 #include <uapi/linux/idxd.h>
 #include "../dmaengine.h"
 #include "idxd.h"
 #include "registers.h"
+
+/* generous bound: drain of a loaded WQ is the slowest legitimate command */
+#define IDXD_CMD_TIMEOUT_MS	30000
 
 static void idxd_cmd_exec(struct idxd_device *idxd, int cmd_code, u32 operand,
 			  u32 *status);
@@ -374,36 +378,43 @@ int idxd_wq_disable(struct idxd_wq *wq, bool reset_config)
 	return 0;
 }
 
-void idxd_wq_drain(struct idxd_wq *wq)
+/*
+ * Returns -ETIMEDOUT when the command was never run or never completed,
+ * in which case descriptors may still be in the device and the caller
+ * must not free anything it can write into.
+ */
+int idxd_wq_drain(struct idxd_wq *wq)
 {
 	struct idxd_device *idxd = wq->idxd;
 	struct device *dev = &idxd->pdev->dev;
-	u32 operand;
+	u32 operand, status;
 
 	if (wq->state != IDXD_WQ_ENABLED) {
 		dev_dbg(dev, "WQ %d in wrong state: %d\n", wq->id, wq->state);
-		return;
+		return 0;
 	}
 
 	dev_dbg(dev, "Draining WQ %d\n", wq->id);
 	operand = BIT(wq->id % 16) | ((wq->id / 16) << 16);
-	idxd_cmd_exec(idxd, IDXD_CMD_DRAIN_WQ, operand, NULL);
+	idxd_cmd_exec(idxd, IDXD_CMD_DRAIN_WQ, operand, &status);
+	return status == IDXD_CMDSTS_HW_ERR ? -ETIMEDOUT : 0;
 }
 
-void idxd_wq_reset(struct idxd_wq *wq)
+int idxd_wq_reset(struct idxd_wq *wq)
 {
 	struct idxd_device *idxd = wq->idxd;
 	struct device *dev = &idxd->pdev->dev;
-	u32 operand;
+	u32 operand, status;
 
 	if (wq->state != IDXD_WQ_ENABLED) {
 		dev_dbg(dev, "WQ %d in wrong state: %d\n", wq->id, wq->state);
-		return;
+		return 0;
 	}
 
 	operand = BIT(wq->id % 16) | ((wq->id / 16) << 16);
-	idxd_cmd_exec(idxd, IDXD_CMD_RESET_WQ, operand, NULL);
+	idxd_cmd_exec(idxd, IDXD_CMD_RESET_WQ, operand, &status);
 	idxd_wq_disable_cleanup(wq);
+	return status == IDXD_CMDSTS_HW_ERR ? -ETIMEDOUT : 0;
 }
 
 int idxd_wq_map_portal(struct idxd_wq *wq)
@@ -634,21 +645,69 @@ static void idxd_cmd_exec(struct idxd_device *idxd, int cmd_code, u32 operand,
 		return;
 	}
 
+	if (test_bit(IDXD_FLAG_CMD_TIMEDOUT, &idxd->flags)) {
+		dev_warn(&idxd->pdev->dev,
+			 "Not sending command %#x: an earlier device command timed out, device needs a reset\n",
+			 cmd_code);
+		if (status)
+			*status = IDXD_CMDSTS_HW_ERR;
+		return;
+	}
+
 	memset(&cmd, 0, sizeof(cmd));
 	cmd.cmd = cmd_code;
 	cmd.operand = operand;
 	cmd.int_req = 1;
 
 	spin_lock_irqsave(&idxd->cmd_lock, flags);
-	wait_event_lock_irq(idxd->cmd_waitq,
-			    !test_bit(IDXD_FLAG_CMD_RUNNING, &idxd->flags),
-			    idxd->cmd_lock);
+	/*
+	 * Wait for the running command, if any. Only its owner can tell
+	 * that it is stuck, so this wait does not declare a timeout of its
+	 * own: its budget covers one owner and restarts whenever another
+	 * command starts running, and it ends early when the owner gives
+	 * up and marks the device. Several healthy commands queued behind
+	 * one another therefore never add up to a false timeout.
+	 */
+	while (test_bit(IDXD_FLAG_CMD_RUNNING, &idxd->flags)) {
+		u32 seq = idxd->cmd_seq;
+
+		if (test_bit(IDXD_FLAG_CMD_TIMEDOUT, &idxd->flags)) {
+			spin_unlock_irqrestore(&idxd->cmd_lock, flags);
+			dev_err(&idxd->pdev->dev,
+				"not sending command %#x: the running device command timed out, device needs a reset\n",
+				cmd_code);
+			if (status)
+				*status = IDXD_CMDSTS_HW_ERR;
+			return;
+		}
+		if (!wait_event_lock_irq_timeout(idxd->cmd_waitq,
+				!test_bit(IDXD_FLAG_CMD_RUNNING, &idxd->flags) ||
+				test_bit(IDXD_FLAG_CMD_TIMEDOUT, &idxd->flags) ||
+				idxd->cmd_seq != seq,
+				idxd->cmd_lock,
+				msecs_to_jiffies(IDXD_CMD_TIMEOUT_MS))) {
+			/*
+			 * The owner started before this wait and has the
+			 * same budget, so its own timeout is due; it marks
+			 * the device and wakes this queue. Give up without
+			 * marking anything here.
+			 */
+			spin_unlock_irqrestore(&idxd->cmd_lock, flags);
+			dev_err(&idxd->pdev->dev,
+				"timed out waiting for the running device command before %#x\n",
+				cmd_code);
+			if (status)
+				*status = IDXD_CMDSTS_HW_ERR;
+			return;
+		}
+	}
 
 	dev_dbg(&idxd->pdev->dev, "%s: sending cmd: %#x op: %#x\n",
 		__func__, cmd_code, operand);
 
 	idxd->cmd_status = 0;
 	__set_bit(IDXD_FLAG_CMD_RUNNING, &idxd->flags);
+	idxd->cmd_seq++;
 	idxd->cmd_done = &done;
 	iowrite32(cmd.bits, idxd->reg_base + IDXD_CMD_OFFSET);
 
@@ -657,9 +716,38 @@ static void idxd_cmd_exec(struct idxd_device *idxd, int cmd_code, u32 operand,
 	 * the command completes via interrupt.
 	 */
 	spin_unlock_irqrestore(&idxd->cmd_lock, flags);
-	wait_for_completion(&done);
+	if (!wait_for_completion_timeout(&done,
+				msecs_to_jiffies(IDXD_CMD_TIMEOUT_MS))) {
+		spin_lock(&idxd->cmd_lock);
+		/* The interrupt beat the lock: a completion, not a timeout. */
+		if (completion_done(&done)) {
+			spin_unlock(&idxd->cmd_lock);
+			goto completed;
+		}
+		/*
+		 * The device did not complete the command. Detach the
+		 * on-stack completion so a late interrupt cannot touch it,
+		 * and leave IDXD_FLAG_CMD_RUNNING set: the device may still
+		 * be executing, so no further commands may be issued.
+		 * IDXD_FLAG_CMD_TIMEDOUT makes waiters and future callers
+		 * fail fast; a late completion interrupt or a device reset
+		 * clears both flags.
+		 */
+		idxd->cmd_done = NULL;
+		set_bit(IDXD_FLAG_CMD_TIMEDOUT, &idxd->flags);
+		wake_up(&idxd->cmd_waitq);
+		spin_unlock(&idxd->cmd_lock);
+		dev_err(&idxd->pdev->dev,
+			"device command %#x timed out, device needs a reset\n",
+			cmd_code);
+		if (status)
+			*status = IDXD_CMDSTS_HW_ERR;
+		return;
+	}
+completed:
 	stat = ioread32(idxd->reg_base + IDXD_CMDSTS_OFFSET);
 	spin_lock(&idxd->cmd_lock);
+	idxd->cmd_done = NULL;
 	if (status)
 		*status = stat;
 	idxd->cmd_status = stat & GENMASK(7, 0);
@@ -668,6 +756,23 @@ static void idxd_cmd_exec(struct idxd_device *idxd, int cmd_code, u32 operand,
 	/* Wake up other pending commands */
 	wake_up(&idxd->cmd_waitq);
 	spin_unlock(&idxd->cmd_lock);
+}
+
+/*
+ * Forget a timed-out command. Called when the device has been reset, so
+ * the command can no longer be executing, or when its completion
+ * interrupt finally arrives.
+ */
+void idxd_cmd_reset_state(struct idxd_device *idxd)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&idxd->cmd_lock, flags);
+	idxd->cmd_done = NULL;
+	__clear_bit(IDXD_FLAG_CMD_RUNNING, &idxd->flags);
+	clear_bit(IDXD_FLAG_CMD_TIMEDOUT, &idxd->flags);
+	wake_up(&idxd->cmd_waitq);
+	spin_unlock_irqrestore(&idxd->cmd_lock, flags);
 }
 
 int idxd_device_enable(struct idxd_device *idxd)
@@ -725,15 +830,19 @@ void idxd_device_reset(struct idxd_device *idxd)
 	spin_unlock(&idxd->dev_lock);
 }
 
-void idxd_device_drain_pasid(struct idxd_device *idxd, int pasid)
+/* Returns -ETIMEDOUT when the drain was never run or never completed. */
+int idxd_device_drain_pasid(struct idxd_device *idxd, int pasid)
 {
 	struct device *dev = &idxd->pdev->dev;
-	u32 operand;
+	u32 operand, status;
 
 	operand = pasid;
 	dev_dbg(dev, "cmd: %u operand: %#x\n", IDXD_CMD_DRAIN_PASID, operand);
-	idxd_cmd_exec(idxd, IDXD_CMD_DRAIN_PASID, operand, NULL);
+	idxd_cmd_exec(idxd, IDXD_CMD_DRAIN_PASID, operand, &status);
+	if (status == IDXD_CMDSTS_HW_ERR)
+		return -ETIMEDOUT;
 	dev_dbg(dev, "pasid %d drained\n", pasid);
+	return 0;
 }
 
 int idxd_device_request_int_handle(struct idxd_device *idxd, int idx, int *handle,
@@ -790,11 +899,29 @@ int idxd_device_release_int_handle(struct idxd_device *idxd, int handle,
 	dev_dbg(dev, "cmd: %u operand: %#x\n", IDXD_CMD_RELEASE_INT_HANDLE, operand);
 
 	spin_lock(&idxd->cmd_lock);
+	/*
+	 * This polls instead of going through idxd_cmd_exec(), so it has
+	 * to honour the same protocol: never write the command register
+	 * while another command is running, and never spin without bound
+	 * behind one that timed out. A handle not released here is
+	 * revoked by the reset the timed-out device needs anyway.
+	 */
+	if (test_bit(IDXD_FLAG_CMD_RUNNING, &idxd->flags) ||
+	    test_bit(IDXD_FLAG_CMD_TIMEDOUT, &idxd->flags)) {
+		spin_unlock(&idxd->cmd_lock);
+		dev_dbg(dev, "release int handle skipped: a device command is running or timed out\n");
+		return -EBUSY;
+	}
 	iowrite32(cmd.bits, idxd->reg_base + IDXD_CMD_OFFSET);
 
-	while (ioread32(idxd->reg_base + IDXD_CMDSTS_OFFSET) & IDXD_CMDSTS_ACTIVE)
-		cpu_relax();
-	status = ioread32(idxd->reg_base + IDXD_CMDSTS_OFFSET);
+	if (readl_poll_timeout_atomic(idxd->reg_base + IDXD_CMDSTS_OFFSET,
+				      status, !(status & IDXD_CMDSTS_ACTIVE),
+				      1, IDXD_CMD_TIMEOUT_MS * USEC_PER_MSEC)) {
+		set_bit(IDXD_FLAG_CMD_TIMEDOUT, &idxd->flags);
+		spin_unlock(&idxd->cmd_lock);
+		dev_err(dev, "release int handle timed out, device needs a reset\n");
+		return -ETIMEDOUT;
+	}
 	spin_unlock(&idxd->cmd_lock);
 
 	if ((status & IDXD_CMDSTS_ERR_MASK) != IDXD_CMDSTS_SUCCESS) {
@@ -1676,6 +1803,7 @@ void idxd_drv_disable_wq(struct idxd_wq *wq)
 {
 	struct idxd_device *idxd = wq->idxd;
 	struct device *dev = &idxd->pdev->dev;
+	int rc;
 
 	lockdep_assert_held(&wq->wq_lock);
 
@@ -1684,10 +1812,19 @@ void idxd_drv_disable_wq(struct idxd_wq *wq)
 			 wq->id, idxd_wq_refcount(wq));
 
 	idxd_wq_unmap_portal(wq);
-	idxd_wq_drain(wq);
+	rc = idxd_wq_drain(wq);
 	idxd_wq_free_irq(wq);
-	idxd_wq_reset(wq);
-	idxd_wq_free_resources(wq);
+	rc |= idxd_wq_reset(wq);
+	/*
+	 * A drain or reset that never completed leaves descriptors in the
+	 * device, and their completion records live in the memory freed
+	 * here. Leak it; the device writing into freed memory is worse.
+	 */
+	if (rc)
+		dev_err(dev, "wq %d: drain or reset timed out, leaking its descriptor memory\n",
+			wq->id);
+	else
+		idxd_wq_free_resources(wq);
 	percpu_ref_exit(&wq->wq_active);
 	wq->client_count = 0;
 }

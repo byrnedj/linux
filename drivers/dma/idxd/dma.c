@@ -565,7 +565,16 @@ static void idxd_dma_synchronize(struct dma_chan *c)
 {
 	struct idxd_wq *wq = to_idxd_wq(c);
 
-	idxd_wq_drain(wq);
+	/*
+	 * A drain that never completes leaves the client's descriptors in
+	 * the device. The client is told nothing here, so the driver keeps
+	 * their completion records: idxd_drv_disable_wq() leaks memory a
+	 * failed drain did not clear.
+	 */
+	if (idxd_wq_drain(wq))
+		dev_warn_ratelimited(&wq->idxd->pdev->dev,
+				     "wq %d: synchronize could not drain the queue\n",
+				     wq->id);
 }
 
 int idxd_register_dma_device(struct idxd_device *idxd)
@@ -824,9 +833,13 @@ static void idxd_dmaengine_drv_remove(struct idxd_dev *idxd_dev)
 		 * outstanding on it as failed: a client acting on that, by
 		 * copying the data itself or by reusing the buffer, must
 		 * not race a late write from a descriptor that was only
-		 * slow.
+		 * slow. A drain that times out leaves a device presumed
+		 * dead, as elsewhere.
 		 */
-		idxd_wq_drain(wq);
+		if (idxd_wq_drain(wq))
+			dev_err(&wq->idxd->pdev->dev,
+				"wq %d: drain timed out with live DMA clients\n",
+				wq->id);
 		WRITE_ONCE(wq->unbind_drained, true);
 		wq->leaked_chan = wq->idxd_chan;
 		wq->idxd_chan = NULL;

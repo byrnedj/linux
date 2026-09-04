@@ -1076,6 +1076,9 @@ static void idxd_reset_done(struct pci_dev *pdev)
 	/* Restore PCI device state. */
 	pci_restore_state(idxd->pdev);
 
+	/* The reset ended any command, including one that had timed out. */
+	idxd_cmd_reset_state(idxd);
+
 	/* Unbind idxd device from driver. */
 	idxd_unbind(&idxd_drv.drv, idxd_name);
 
