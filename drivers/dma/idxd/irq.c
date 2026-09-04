@@ -523,7 +523,15 @@ irqreturn_t idxd_misc_thread(int vec, void *data)
 
 	if (cause & IDXD_INTC_CMD) {
 		val |= IDXD_INTC_CMD;
-		complete(idxd->cmd_done);
+		/*
+		 * cmd_done is cleared under cmd_lock when idxd_cmd_exec()
+		 * gives up on a command: the completion lives on its stack,
+		 * so a late interrupt must not touch it.
+		 */
+		spin_lock(&idxd->cmd_lock);
+		if (idxd->cmd_done)
+			complete(idxd->cmd_done);
+		spin_unlock(&idxd->cmd_lock);
 	}
 
 	if (cause & IDXD_INTC_OCCUPY) {
