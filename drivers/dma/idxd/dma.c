@@ -515,7 +515,16 @@ static void idxd_dma_synchronize(struct dma_chan *c)
 {
 	struct idxd_wq *wq = to_idxd_wq(c);
 
-	idxd_wq_drain(wq);
+	/*
+	 * A drain that never completes leaves the client's descriptors in
+	 * the device. The client is told nothing here, so the driver keeps
+	 * their completion records: idxd_drv_disable_wq() leaks memory a
+	 * failed drain did not clear.
+	 */
+	if (idxd_wq_drain(wq))
+		dev_warn_ratelimited(&wq->idxd->pdev->dev,
+				     "wq %d: synchronize could not drain the queue\n",
+				     wq->id);
 }
 
 int idxd_register_dma_device(struct idxd_device *idxd)

@@ -120,13 +120,13 @@ static void idxd_file_dev_release(struct device *dev)
 	struct idxd_user_context *ctx = dev_to_uctx(dev);
 	struct idxd_wq *wq = ctx->wq;
 	struct idxd_device *idxd = wq->idxd;
-	int rc;
+	int rc, drained = 0;
 
 	ida_free(&file_ida, ctx->id);
 
 	/* Wait for in-flight operations to complete. */
 	if (wq_shared(wq)) {
-		idxd_device_drain_pasid(idxd, ctx->pasid);
+		drained = idxd_device_drain_pasid(idxd, ctx->pasid);
 	} else {
 		if (device_user_pasid_enabled(idxd)) {
 			/* The wq disable in the disable pasid function will drain the wq */
@@ -134,8 +134,21 @@ static void idxd_file_dev_release(struct device *dev)
 			if (rc < 0)
 				dev_err(dev, "wq disable pasid failed.\n");
 		} else {
-			idxd_wq_drain(wq);
+			drained = idxd_wq_drain(wq);
 		}
+	}
+
+	/*
+	 * A drain that never completed leaves this context's descriptors
+	 * in the device, tagged with its PASID. Unbinding the PASID would
+	 * let it be reused by another process while the device can still
+	 * issue DMA with it, so the binding, the PASID lookup entry and the
+	 * context are leaked instead.
+	 */
+	if (drained) {
+		dev_err(dev, "pasid %u: drain timed out, leaking the context and its PASID binding\n",
+			ctx->pasid);
+		goto put_wq;
 	}
 
 	if (ctx->sva) {
@@ -144,6 +157,7 @@ static void idxd_file_dev_release(struct device *dev)
 		idxd_xa_pasid_remove(ctx);
 	}
 	kfree(ctx);
+put_wq:
 	mutex_lock(&wq->wq_lock);
 	idxd_wq_put(wq);
 	mutex_unlock(&wq->wq_lock);
