@@ -403,6 +403,14 @@ static void io_pfn_cache_evict(struct io_pfn_cache *c, u64 cap)
 	if (!spin_trylock(&c->lock))
 		return;
 
+	/*
+	 * The entries this walk examines are freed with kfree_rcu(), and
+	 * the xarray iterators hand them back outside any read-side
+	 * section. Under preemptible RCU c->lock is not one, so a grace
+	 * period elapsing mid-sweep would leave it reading freed entries.
+	 */
+	rcu_read_lock();
+
 	if (aging) {
 		age_before = jiffies - msecs_to_jiffies(max_age);
 		/* Rate-limit the age walk; the cap walk runs on demand. */
@@ -551,7 +559,21 @@ static void io_pfn_cache_evict(struct io_pfn_cache *c, u64 cap)
 					continue;
 				}
 			}
-			xa_erase(&c->xa, index);
+			/*
+			 * Identity-checked: io_pfn_map_lookup() displaces
+			 * outgrown entries without this lock, so between
+			 * the walk handing us @pm and the removal another
+			 * CPU can take it out, drop the bias and insert a
+			 * replacement under the same key. An unconditional
+			 * erase would then evict the replacement without
+			 * dropping its bias and retire @pm a second time,
+			 * unmapping and freeing it under its users. Only
+			 * the remover that actually took an entry out may
+			 * drop its bias.
+			 */
+			if (xa_cmpxchg(&c->xa, index, pm, NULL,
+				       GFP_NOWAIT | __GFP_NOWARN) != pm)
+				continue;
 			atomic64_sub(pm->size, &c->covered);
 			atomic64_inc(&c->evictions);
 			if (aged) {
@@ -592,6 +614,7 @@ static void io_pfn_cache_evict(struct io_pfn_cache *c, u64 cap)
 			aging = false;
 	}
 out:
+	rcu_read_unlock();
 	spin_unlock(&c->lock);
 }
 
@@ -775,11 +798,20 @@ static void io_pfn_cache_flush(struct io_pfn_cache *c)
 	unsigned long index;
 
 	spin_lock(&c->lock);
+	/* Entries are freed with kfree_rcu() and the walk hands them back
+	 * outside any read-side section; under preemptible RCU c->lock is
+	 * not one, so take an explicit read lock here and let only the
+	 * remover that took an entry out retire it.
+	 */
+	rcu_read_lock();
 	xa_for_each(&c->xa, index, pm) {
-		xa_erase(&c->xa, index);
+		if (xa_cmpxchg(&c->xa, index, pm, NULL,
+			       GFP_NOWAIT | __GFP_NOWARN) != pm)
+			continue;	/* a sweep got there first */
 		atomic64_sub(pm->size, &c->covered);
 		io_pfn_map_put(pm);
 	}
+	rcu_read_unlock();
 	c->hand = 0;
 	{
 		void *gv;
