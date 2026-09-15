@@ -2744,6 +2744,48 @@ static ssize_t io_dma_flush_batch(struct io_kiocb *req,
 	return ret;
 }
 
+/*
+ * File-position striping. A region's transfers go to the same device
+ * from every ring, at this granule, so the per-device PFN caches each
+ * hold one share of a shared working set instead of a full copy each.
+ * The granule index is hashed so block-aligned op starts do not
+ * resonate with the stripe modulus. Position-consistent placement only
+ * pays when mappings persist: uncached or parked it would concentrate
+ * convoyed readers on one device for no dedup benefit, so a ring
+ * rotates instead. Reads and writes share both rules; that is what
+ * lets the entry a write inserts serve the read that follows it.
+ */
+#define IO_DMA_STRIPE_SHIFT	20
+
+static bool io_dma_stripe_deterministic(struct io_ring_ctx *ctx)
+{
+	u64 hard = (u64)READ_ONCE(io_dma_pfn_cache_cap_mb) << 20;
+	struct io_pfn_cache *pc;
+
+	if (!io_pfn_cache_usable() || ctx->dma.nr_chans <= 1)
+		return false;
+	pc = io_pfn_cache_get(ctx->dma.chans[0]->device->dev);
+	return pc && io_pfn_cache_target(pc, hard);
+}
+
+/* The stripe for @pos: hashed when deterministic, else rotating from @rr. */
+static unsigned int io_dma_stripe_index(struct io_ring_ctx *ctx, loff_t pos,
+					bool det, unsigned int rr)
+{
+	unsigned int nr_chans = ctx->dma.nr_chans ? ctx->dma.nr_chans : 1;
+	u64 granule = (u64)pos >> IO_DMA_STRIPE_SHIFT;
+
+	if (det)
+		return hash_64(granule, 32) % nr_chans;
+	return (rr + (unsigned int)granule) % nr_chans;
+}
+
+static struct dma_chan *io_dma_stripe_chan(struct io_ring_ctx *ctx,
+					   unsigned int stripe)
+{
+	return ctx->dma.nr_chans ? ctx->dma.chans[stripe] : ctx->dma.chan;
+}
+
 /* Reads at or below this size fall back to the CPU copy path */
 #define IO_DMA_MIN_READ_BYTES	SZ_16K
 
@@ -2782,7 +2824,6 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 	 * addresses, the PFN cache instance, and the flush target,
 	 * follows the current stripe.
 	 */
-#define IO_DMA_STRIPE_SHIFT	20
 	unsigned int nr_chans = ctx->dma.nr_chans ? ctx->dma.nr_chans : 1;
 	/*
 	 * Position-consistent mapping only pays when mappings persist:
@@ -2807,15 +2848,7 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 	size_t dst_offset = 0;
 	loff_t start_pos = iocb->ki_pos;
 
-	det_stripe = false;
-	if (io_pfn_cache_usable() && nr_chans > 1) {
-		u64 hard = (u64)READ_ONCE(io_dma_pfn_cache_cap_mb) << 20;
-		struct io_pfn_cache *pc =
-			io_pfn_cache_get(ctx->dma.chans[0]->device->dev);
-
-		if (pc && io_pfn_cache_target(pc, hard))
-			det_stripe = true;
-	}
+	det_stripe = io_dma_stripe_deterministic(ctx);
 	/*
 	 * Hash the granule index rather than using it raw: block-aligned
 	 * op starts otherwise resonate with the stripe modulus, opening
@@ -3173,6 +3206,9 @@ struct io_dma_fmw_dst {
 	unsigned int off;		/* offset in its folio */
 	struct folio *folio;
 	struct io_pfn_map *pm;		/* NULL = plain per-piece mapping */
+	struct dma_chan *chan;		/* the piece's stripe */
+	struct device *dev;
+	unsigned int stripe;
 };
 
 /* One in-flight write descriptor, carrying what qstat accounting needs. */
@@ -3180,6 +3216,7 @@ struct io_dma_fmw_ck {
 	dma_cookie_t ck;
 	unsigned int len;
 	u64 submit_ns;
+	struct dma_chan *chan;
 };
 
 /*
@@ -3194,8 +3231,8 @@ struct io_dma_fmw_ck {
  * and starved application heartbeats at O(100) shared rings.
  * Therefore we back off to sleeping once the fast path misses.
  */
-static int io_dma_fmw_wait(struct dma_chan *chan, struct io_dma_fmw_ck *cookies,
-			   unsigned int *nr, bool *redo)
+static int io_dma_fmw_wait(struct io_dma_fmw_ck *cookies, unsigned int *nr,
+			   bool *redo)
 {
 	unsigned int wait_ms = READ_ONCE(io_dma_fmw_wait_ms);
 	unsigned long deadline = jiffies + msecs_to_jiffies(wait_ms);
@@ -3205,6 +3242,8 @@ static int io_dma_fmw_wait(struct dma_chan *chan, struct io_dma_fmw_ck *cookies,
 
 	for (i = 0; i < *nr; i++) {
 		enum dma_status st;
+
+		struct dma_chan *chan = cookies[i].chan;
 
 		spins = 0;
 		while ((st = dmaengine_async_is_tx_complete(chan, cookies[i].ck))
@@ -3216,7 +3255,7 @@ static int io_dma_fmw_wait(struct dma_chan *chan, struct io_dma_fmw_ck *cookies,
 				 * the caller.
 				 */
 				for (j = i; j < *nr; j++)
-					io_dma_qstat_complete(chan,
+					io_dma_qstat_complete(cookies[j].chan,
 							cookies[j].len, 0,
 							true);
 				*nr = 0;
@@ -3264,6 +3303,16 @@ static int io_dma_fmw_wait(struct dma_chan *chan, struct io_dma_fmw_ck *cookies,
  * group's folios are deliberately leaked and -EIO is returned, so the
  * caller must stop.
  */
+/* Ring the doorbell of every stripe with submitted, unissued work. */
+static void io_dma_fmw_issue(struct io_ring_ctx *ctx, unsigned long *issued)
+{
+	unsigned int i;
+
+	for_each_set_bit(i, issued, IO_DMA_RING_CHANS)
+		dma_async_issue_pending(io_dma_stripe_chan(ctx, i));
+	*issued = 0;
+}
+
 static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
 				struct iov_iter *from, u64 src_user_addr,
 				size_t base, size_t room,
@@ -3281,14 +3330,22 @@ static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
 	struct io_mapped_ubuf *imu = req->buf_node->buf;
 	struct dma_chan *chan = ctx->dma.chan;
 	struct device *dev = chan->device->dev;
+	/*
+	 * Each destination piece is placed by file position like a read
+	 * batch, so the entry a write inserts is on the device the read
+	 * of that region will use. The pieces are split at quantum
+	 * boundaries aligned to file position, so none crosses a stripe
+	 * granule. Rotation, when the cache is parked, advances per group.
+	 */
+	bool det = io_dma_stripe_deterministic(ctx);
+	unsigned int rr = det ? 0 : ctx->dma.stripe_rr++;
+	unsigned long issued = 0;
 	/* Clamp the write chunks, and so the transient dst-folio maps, to
 	 * the IOVA-rcache-served quantum.
 	 */
 	size_t map_quantum = io_dma_map_quantum(dev);
 	size_t max_chunk = min_t(size_t, mapping_max_folio_size(mapping),
 				 map_quantum);
-	struct io_pfn_cache *pfn_cache =
-		io_pfn_cache_usable() ? io_pfn_cache_get(dev) : NULL;
 	struct io_dma_fmw_dst *cur_dst = NULL;
 	size_t cur_dst_remain = 0;
 	unsigned int nr_dst = 0;
@@ -3369,16 +3426,6 @@ static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
 			redo = true;
 			goto record;
 		}
-		if (io_dma_budget_refuse_wr(chan)) {
-			/*
-			 * We are over the device in-flight budget, so this
-			 * chunk goes to the CPU-redo pass.  The budget is
-			 * re-checked per chunk so that a draining queue
-			 * readmits mid-write.
-			 */
-			redo = true;
-			goto record;
-		}
 		/* Split at source registered-buffer folio boundaries and
 		 * at map-quantum boundaries of the destination folio. The
 		 * dst folios are the same page-cache folios reads source
@@ -3396,20 +3443,21 @@ static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
 			dma_addr_t src_dma, dst;
 			dma_cookie_t ck;
 
-			src_dma = io_reg_buf_dma_addr(imu, uaddr,
-						      &src_seg_remain,
-						      dev);
-			if (unlikely(!src_dma)) {
-				redo = true;	/* The CPU-redo pass covers the chunk. */
-				break;
-			}
-
-			/* Acquire the dst piece covering offset + sub. */
+			/* Acquire the dst piece covering offset + sub; it
+			 * picks the stripe every descriptor into it uses.
+			 */
 			if (!cur_dst || !cur_dst_remain) {
 				size_t doff = offset + sub;
 				size_t plen = min_t(size_t, bytes - sub,
 						max_chunk -
 						(doff & (max_chunk - 1)));
+				unsigned int stripe = io_dma_stripe_index(ctx,
+							pos + sub, det, rr);
+				struct dma_chan *pchan =
+					io_dma_stripe_chan(ctx, stripe);
+				struct device *pdev = pchan->device->dev;
+				struct io_pfn_cache *pc = io_pfn_cache_usable() ?
+					io_pfn_cache_get(pdev) : NULL;
 				struct io_pfn_map *pm = NULL;
 				dma_addr_t d;
 
@@ -3417,8 +3465,20 @@ static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
 					redo = true;
 					break;
 				}
-				pm = pfn_cache ?
-					io_pfn_map_lookup(pfn_cache, folio,
+				if (io_dma_budget_refuse_wr(pchan)) {
+					/*
+					 * Over that device's in-flight
+					 * budget: the rest of this chunk
+					 * goes to the CPU-redo pass. The
+					 * budget is re-checked per piece so
+					 * a draining queue readmits
+					 * mid-write.
+					 */
+					redo = true;
+					break;
+				}
+				pm = pc ?
+					io_pfn_map_lookup(pc, folio,
 							  doff, plen,
 							  folio_size(folio),
 							  (!collected && !sub) ||
@@ -3429,14 +3489,14 @@ static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
 					 * it owns the piece until the wait
 					 * below hands it back.
 					 */
-					dma_sync_single_for_device(dev, d, plen,
+					dma_sync_single_for_device(pdev, d, plen,
 								   DMA_FROM_DEVICE);
 				} else {
-					d = dma_map_page(dev,
+					d = dma_map_page(pdev,
 							 folio_page(folio, 0),
 							 doff, plen,
 							 DMA_FROM_DEVICE);
-					if (dma_mapping_error(dev, d)) {
+					if (dma_mapping_error(pdev, d)) {
 						redo = true;
 						break;
 					}
@@ -3444,9 +3504,19 @@ static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
 				dsts[nr_dst] = (struct io_dma_fmw_dst){
 					.dma = d, .len = plen, .off = doff,
 					.folio = folio, .pm = pm,
+					.chan = pchan, .dev = pdev,
+					.stripe = stripe,
 				};
 				cur_dst = &dsts[nr_dst++];
 				cur_dst_remain = plen;
+			}
+			chan = cur_dst->chan;
+			src_dma = io_reg_buf_dma_addr(imu, uaddr,
+						      &src_seg_remain,
+						      cur_dst->dev);
+			if (unlikely(!src_dma)) {
+				redo = true;	/* The CPU-redo pass covers the chunk. */
+				break;
 			}
 			dst = cur_dst->dma +
 			      (cur_dst->len - cur_dst_remain);
@@ -3459,9 +3529,9 @@ static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
 				/* The pool is exhausted. Drain in-flight
 				 * work and retry once.
 				 */
-				dma_async_issue_pending(chan);
-				wedged = io_dma_fmw_wait(chan, cookies,
-							 &nr_cookies, &redo);
+				io_dma_fmw_issue(ctx, &issued);
+				wedged = io_dma_fmw_wait(cookies, &nr_cookies,
+							 &redo);
 				if (wedged)
 					goto collect_done;
 				tx = dmaengine_prep_dma_memcpy(chan, dst,
@@ -3489,12 +3559,14 @@ static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
 						(struct io_dma_fmw_ck){
 							.ck = ck, .len = len,
 							.submit_ns = ktime_get_ns(),
+							.chan = chan,
 						};
+					issued |= BIT(cur_dst->stripe);
 					io_dma_qstat_submit(chan, len, true);
 				}
 				if (nr_cookies == max_cookies) {
-					dma_async_issue_pending(chan);
-					wedged = io_dma_fmw_wait(chan, cookies,
+					io_dma_fmw_issue(ctx, &issued);
+					wedged = io_dma_fmw_wait(cookies,
 							&nr_cookies, &redo);
 					if (wedged)
 						goto collect_done;
@@ -3515,8 +3587,8 @@ record:
 
 collect_done:
 	if (!wedged) {
-		dma_async_issue_pending(chan);
-		wedged = io_dma_fmw_wait(chan, cookies, &nr_cookies, &redo);
+		io_dma_fmw_issue(ctx, &issued);
+		wedged = io_dma_fmw_wait(cookies, &nr_cookies, &redo);
 	}
 
 	/* Unmap the dst IOVAs. After a timeout this also fences late DMA
@@ -3530,8 +3602,8 @@ collect_done:
 			 * hand the piece back to the CPU before the folio
 			 * is unlocked or leaked.
 			 */
-			dma_sync_single_for_cpu(dev, dsts[i].dma, dsts[i].len,
-						DMA_FROM_DEVICE);
+			dma_sync_single_for_cpu(dsts[i].dev, dsts[i].dma,
+						dsts[i].len, DMA_FROM_DEVICE);
 			/* On a wedge the cached mapping must not stay
 			 * device-writable, so displace it; the unmap
 			 * happens when the last reference drops, which
@@ -3539,10 +3611,11 @@ collect_done:
 			 * same segment.
 			 */
 			if (unlikely(wedged))
-				io_pfn_map_displace(pfn_cache, dsts[i].pm);
+				io_pfn_map_displace(dsts[i].pm->cache,
+						    dsts[i].pm);
 			io_pfn_map_put(dsts[i].pm);
 		} else {
-			dma_unmap_page(dev, dsts[i].dma, dsts[i].len,
+			dma_unmap_page(dsts[i].dev, dsts[i].dma, dsts[i].len,
 				       DMA_FROM_DEVICE);
 		}
 	}
