@@ -159,7 +159,20 @@ struct io_pfn_cache {
 	spinlock_t		slot_lock;
 	atomic64_t		slot_links;	/* entries linked into the range */
 	atomic64_t		slot_fails;	/* range full or link failed */
+	atomic64_t		waits;		/* hits taken after waiting for
+						 * another CPU's insert
+						 */
+	atomic64_t		wait_timeouts;	/* waits that ran out */
 };
+
+/*
+ * A miss claims its key with this marker before it maps, so the
+ * followers of a convoy find the claim and wait for the entry instead
+ * of each mapping the segment, losing the insert race to the leader and
+ * unmapping again: a fifth of all touches did that under four jobs. The
+ * marker holds no bytes and no reference; walkers skip it.
+ */
+#define IO_PFN_PENDING		xa_mk_value(0)
 
 #define IO_PFN_CACHE_DEVS	16
 static struct io_pfn_cache *io_pfn_caches[IO_PFN_CACHE_DEVS];
@@ -238,6 +251,13 @@ static u32 io_dma_pfn_mrc_shift __read_mostly;
  * still works: entries past the range take plain maps.
  */
 static u32 io_dma_pfn_iova_reserve_mb __read_mostly = 65536;
+
+/*
+ * How long a lookup waits for another CPU's insert of the same segment,
+ * in microseconds, before mapping for itself. A link and its sync take
+ * a few microseconds; the wait costs nothing when no insert is pending.
+ */
+static u32 io_dma_pfn_wait_us __read_mostly = 20;
 
 /* Ghost growth per hit and decay per quiet 2s tick (eff >> shift). */
 #define IO_PFN_GHOST_GROW_SEGS	8
@@ -550,6 +570,55 @@ static void io_pfn_map_displace(struct io_pfn_cache *c, struct io_pfn_map *pm)
 }
 
 /*
+ * Wait for a pending insert of @pfn. Returns the entry with a reference
+ * taken, or NULL when the claim was dropped or the wait ran out.
+ */
+static struct io_pfn_map *io_pfn_map_wait(struct io_pfn_cache *c,
+					  unsigned long pfn)
+{
+	u64 end = ktime_get_ns() +
+		  (u64)READ_ONCE(io_dma_pfn_wait_us) * NSEC_PER_USEC;
+	struct io_pfn_map *pm;
+	void *e;
+
+	do {
+		cpu_relax();
+		rcu_read_lock();
+		e = xa_load(&c->xa, pfn);
+		if (e && !xa_is_value(e)) {
+			pm = e;
+			if (atomic_inc_not_zero(&pm->refs)) {
+				rcu_read_unlock();
+				return pm;
+			}
+		}
+		rcu_read_unlock();
+		if (!e)
+			return NULL;	/* the claimant gave up */
+	} while (ktime_get_ns() < end);
+	atomic64_inc(&c->wait_timeouts);
+	return NULL;
+}
+
+/* Finish a hit on @pm, which the caller holds a reference to. */
+static struct io_pfn_map *io_pfn_map_hit(struct io_pfn_cache *c,
+					 struct io_pfn_map *pm, size_t rel,
+					 size_t len, dma_addr_t *dma,
+					 atomic64_t *counter)
+{
+	if (unlikely(rel + len > pm->size)) {
+		atomic64_inc(&c->range_fallbacks);
+		io_pfn_map_put(pm);
+		return NULL;
+	}
+	WRITE_ONCE(pm->referenced, true);
+	WRITE_ONCE(pm->last_used, jiffies);
+	atomic64_inc(counter);
+	*dma = pm->dma_base + rel;
+	return pm;
+}
+
+/*
  * The CLOCK sweep advances the hand from where it last stopped.  It
  * gives referenced entries a second chance and skips entries with
  * in-flight users.  The second chance provides scan resistance since a
@@ -735,9 +804,12 @@ static void io_pfn_cache_evict(struct io_pfn_cache *c, u64 cap)
 			break;
 
 		xa_for_each_start(&c->xa, index, pm, start) {
-			bool aged = aging &&
-				time_before(READ_ONCE(pm->last_used), age_before);
+			bool aged;
 
+			if (xa_is_value(pm))
+				continue;	/* an insert's claim */
+			aged = aging &&
+				time_before(READ_ONCE(pm->last_used), age_before);
 			if (--budget <= 0) {
 				c->hand = index + 1;
 				goto out;
@@ -889,7 +961,7 @@ static struct io_pfn_map *io_pfn_map_lookup(struct io_pfn_cache *c,
 
 	rcu_read_lock();
 	pm = xa_load(&c->xa, pfn);
-	if (pm && atomic_inc_not_zero(&pm->refs)) {
+	if (pm && !xa_is_value(pm) && atomic_inc_not_zero(&pm->refs)) {
 		rcu_read_unlock();
 		if (unlikely(rel + len > pm->size)) {
 			/*
@@ -916,7 +988,33 @@ static struct io_pfn_map *io_pfn_map_lookup(struct io_pfn_cache *c,
 		return pm;
 	}
 	rcu_read_unlock();
+	if (xa_is_value(pm)) {
+		/* Another CPU is inserting this segment; take its entry. */
+		pm = io_pfn_map_wait(c, pfn);
+		if (!pm)
+			return NULL;
+		return io_pfn_map_hit(c, pm, rel, len, dma, &c->waits);
+	}
 miss:
+	/*
+	 * Claim the key before mapping. A claim already there is a
+	 * concurrent insert to wait for; an entry already there is a hit.
+	 */
+	old = xa_cmpxchg(&c->xa, pfn, NULL, IO_PFN_PENDING,
+			 GFP_NOWAIT | __GFP_NOWARN);
+	if (old) {
+		if (xa_is_err(old))
+			goto fail;
+		if (xa_is_value(old)) {
+			pm = io_pfn_map_wait(c, pfn);
+			if (!pm)
+				return NULL;
+			return io_pfn_map_hit(c, pm, rel, len, dma, &c->waits);
+		}
+		if (!atomic_inc_not_zero(&old->refs))
+			goto fail;
+		return io_pfn_map_hit(c, old, rel, len, dma, &c->hits);
+	}
 	atomic64_inc(&c->misses);
 
 	if (READ_ONCE(io_dma_pfn_cache_auto) &&
@@ -950,12 +1048,12 @@ miss:
 
 	pm = kmalloc_obj(*pm, GFP_NOWAIT | __GFP_NOWARN);
 	if (!pm)
-		goto fail;
+		goto unclaim;
 	pm->cache = c;
 	base = io_pfn_map_segment(c, pm, folio, seg_base, seg_len);
 	if (!base) {
 		kfree(pm);
-		goto fail;
+		goto unclaim;
 	}
 	pm->pfn = pfn;
 	pm->dma_base = base;
@@ -976,32 +1074,19 @@ miss:
 	 */
 	atomic64_add(seg_len, &c->covered);
 
-	rcu_read_lock();
-	old = xa_cmpxchg(&c->xa, pfn, NULL, pm, GFP_NOWAIT | __GFP_NOWARN);
-	if (old) {
-		/* We lost an insert race or the xarray node allocation
-		 * failed.
-		 */
+	/*
+	 * Publish over the claim. Nothing else takes a claim out, so this
+	 * cannot fail; the fallback below only guards the invariant.
+	 */
+	old = xa_cmpxchg(&c->xa, pfn, IO_PFN_PENDING, pm,
+			 GFP_NOWAIT | __GFP_NOWARN);
+	if (unlikely(old != IO_PFN_PENDING)) {
+		WARN_ON_ONCE(1);
 		atomic64_sub(seg_len, &c->covered);
 		io_pfn_map_unmap(pm);
 		kfree(pm);
-		if (!xa_is_err(old) && atomic_inc_not_zero(&old->refs)) {
-			rcu_read_unlock();
-			if (unlikely(rel + len > old->size)) {
-				atomic64_inc(&c->range_fallbacks);
-				io_pfn_map_put(old);
-				return NULL;
-			}
-			WRITE_ONCE(old->referenced, true);
-			WRITE_ONCE(old->last_used, jiffies);
-			atomic64_inc(&c->hits);
-			*dma = old->dma_base + rel;
-			return old;
-		}
-		rcu_read_unlock();
 		goto fail;
 	}
-	rcu_read_unlock();
 	/*
 	 * Pairs with the barrier in io_pfn_cache_cap_set(): if the cap
 	 * was cleared under this insert, either the revoking flush's walk
@@ -1017,6 +1102,8 @@ miss:
 		io_pfn_cache_evict(c, cap);
 	*dma = pm->dma_base + rel;
 	return pm;
+unclaim:
+	xa_cmpxchg(&c->xa, pfn, IO_PFN_PENDING, NULL, GFP_NOWAIT | __GFP_NOWARN);
 fail:
 	atomic64_inc(&c->insert_fails);
 	return NULL;
@@ -1040,6 +1127,8 @@ static void io_pfn_cache_flush(struct io_pfn_cache *c)
 	 */
 	rcu_read_lock();
 	xa_for_each(&c->xa, index, pm) {
+		if (xa_is_value(pm))
+			continue;	/* an insert's claim; it publishes later */
 		if (xa_cmpxchg(&c->xa, index, pm, NULL,
 			       GFP_NOWAIT | __GFP_NOWARN) != pm)
 			continue;	/* a sweep got there first */
@@ -1089,7 +1178,7 @@ static int io_pfn_cache_stats_show(struct seq_file *m, void *p)
 			break;
 		c = io_pfn_caches[i];
 		seq_printf(m,
-			   "dev %s quantum_kb %zu iova_mb %llu slots_used %u links %lld link_fails %lld covered_kb %lld hits %lld misses %lld inserts %lld insert_fails %lld range_fallbacks %lld evictions %lld age_evictions %lld ref_skips %lld ghost_hits %lld ghost_count %lld eff_cap_mb %llu\n",
+			   "dev %s quantum_kb %zu iova_mb %llu slots_used %u links %lld link_fails %lld covered_kb %lld hits %lld waits %lld wait_timeouts %lld misses %lld inserts %lld insert_fails %lld range_fallbacks %lld evictions %lld age_evictions %lld ref_skips %lld ghost_hits %lld ghost_count %lld eff_cap_mb %llu\n",
 			   dev_name(c->dev),
 			   c->quantum >> 10,
 			   ((u64)c->nslots << c->quantum_shift) >> 20,
@@ -1098,6 +1187,8 @@ static int io_pfn_cache_stats_show(struct seq_file *m, void *p)
 			   atomic64_read(&c->slot_fails),
 			   atomic64_read(&c->covered) >> 10,
 			   atomic64_read(&c->hits),
+			   atomic64_read(&c->waits),
+			   atomic64_read(&c->wait_timeouts),
 			   atomic64_read(&c->misses),
 			   atomic64_read(&c->inserts),
 			   atomic64_read(&c->insert_fails),
@@ -1200,11 +1291,12 @@ static int io_pfn_cache_rtd_show(struct seq_file *m, void *p)
 		if (!smp_load_acquire(&io_pfn_cache_devs[i]))
 			break;
 		c = io_pfn_caches[i];
-		seq_printf(m, "# dev %s quantum_kb %zu covered_kb %lld target_mb %llu hits %lld misses %lld inserts %lld evictions %lld ghost_hits %lld\n",
+		seq_printf(m, "# dev %s quantum_kb %zu covered_kb %lld target_mb %llu hits %lld waits %lld misses %lld inserts %lld evictions %lld ghost_hits %lld\n",
 			   dev_name(c->dev), c->quantum >> 10,
 			   atomic64_read(&c->covered),
 			   io_pfn_cache_target(c, hard) >> 20,
-			   atomic64_read(&c->hits), atomic64_read(&c->misses),
+			   atomic64_read(&c->hits), atomic64_read(&c->waits),
+			   atomic64_read(&c->misses),
 			   atomic64_read(&c->inserts),
 			   atomic64_read(&c->evictions),
 			   atomic64_read(&c->ghost_hits));
@@ -2037,6 +2129,7 @@ void io_dma_debugfs_init(void)
 				   &io_pfn_mrc_shift_fops);
 	debugfs_create_u32("pfn_cache_iova_reserve_mb", 0644, dir,
 			   &io_dma_pfn_iova_reserve_mb);
+	debugfs_create_u32("pfn_cache_wait_us", 0644, dir, &io_dma_pfn_wait_us);
 }
 
 /* Datapath allocation takes from the pool first and then falls back
