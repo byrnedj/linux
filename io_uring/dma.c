@@ -791,6 +791,16 @@ miss:
 		goto fail;
 	}
 	rcu_read_unlock();
+	/*
+	 * Pairs with the barrier in io_pfn_cache_cap_set(): if the cap
+	 * was cleared under this insert, either the revoking flush's walk
+	 * finds the entry now that it is published, or the clear is
+	 * visible here and this insert takes its own entry back out. With
+	 * the cap at zero nothing else would ever retire it.
+	 */
+	smp_mb();
+	if (unlikely(!READ_ONCE(io_dma_pfn_cache_cap_mb)))
+		io_pfn_map_displace(c, pm);
 	atomic64_inc(&c->inserts);
 	if (atomic64_read(&c->covered) > (s64)io_pfn_cache_target(c, cap))
 		io_pfn_cache_evict(c, cap);
@@ -886,9 +896,7 @@ static int io_pfn_cache_stats_show(struct seq_file *m, void *p)
 }
 DEFINE_SHOW_ATTRIBUTE(io_pfn_cache_stats);
 
-static ssize_t io_pfn_cache_flush_write(struct file *file,
-					const char __user *ubuf,
-					size_t len, loff_t *ppos)
+static void io_pfn_cache_flush_all(void)
 {
 	int i;
 
@@ -900,6 +908,13 @@ static ssize_t io_pfn_cache_flush_write(struct file *file,
 			break;
 		io_pfn_cache_flush(io_pfn_caches[i]);
 	}
+}
+
+static ssize_t io_pfn_cache_flush_write(struct file *file,
+					const char __user *ubuf,
+					size_t len, loff_t *ppos)
+{
+	io_pfn_cache_flush_all();
 	return len;
 }
 
@@ -909,6 +924,40 @@ static const struct file_operations io_pfn_cache_flush_fops = {
 	.write		= io_pfn_cache_flush_write,
 	.llseek		= noop_llseek,
 };
+
+/*
+ * Capping the cache at nothing has to revoke the mappings it already
+ * holds. With the cap at zero the datapath never asks for the cache,
+ * so no lookup runs and no sweep with it, neither the CLOCK walk nor
+ * the age retirement: "off" would otherwise leave standing device
+ * access to every folio the cache had touched, past even the age
+ * bound, until the cap was raised again.
+ */
+static int io_pfn_cache_cap_get(void *data, u64 *val)
+{
+	*val = READ_ONCE(io_dma_pfn_cache_cap_mb);
+	return 0;
+}
+
+static int io_pfn_cache_cap_set(void *data, u64 val)
+{
+	if (val > U32_MAX)
+		return -ERANGE;
+	WRITE_ONCE(io_dma_pfn_cache_cap_mb, val);
+	if (!val) {
+		/*
+		 * Pairs with the barrier after the publish in
+		 * io_pfn_map_lookup(): an insert that read the old cap
+		 * either lands where this flush's walk still finds it,
+		 * or sees the zero and takes its own entry back out.
+		 */
+		smp_mb();
+		io_pfn_cache_flush_all();
+	}
+	return 0;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(io_pfn_cache_cap_fops, io_pfn_cache_cap_get,
+			 io_pfn_cache_cap_set, "%llu\n");
 
 /*
  * Busy-poll budget in microseconds for draining in-flight DMA
@@ -1640,8 +1689,8 @@ void io_dma_debugfs_init(void)
 			    &io_dma_lat_reset_fops);
 	debugfs_create_file("pfn_cache", 0444, dir, NULL,
 			    &io_pfn_cache_stats_fops);
-	debugfs_create_u32("pfn_cache_cap_mb", 0644, dir,
-			   &io_dma_pfn_cache_cap_mb);
+	debugfs_create_file_unsafe("pfn_cache_cap_mb", 0644, dir, NULL,
+				   &io_pfn_cache_cap_fops);
 	debugfs_create_u32("pfn_cache_auto", 0644, dir,
 			   &io_dma_pfn_cache_auto);
 	debugfs_create_u32("pfn_cache_auto_budget_mb", 0644, dir,
