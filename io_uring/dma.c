@@ -163,6 +163,9 @@ struct io_pfn_cache {
 						 * another CPU's insert
 						 */
 	atomic64_t		wait_timeouts;	/* waits that ran out */
+	atomic64_t		short_fallbacks;/* segment shorter than the
+						 * quantum: not cached
+						 */
 };
 
 /*
@@ -934,6 +937,19 @@ static struct io_pfn_map *io_pfn_map_lookup(struct io_pfn_cache *c,
 	pfn = folio_pfn(folio) + (seg_base >> PAGE_SHIFT);
 
 	/*
+	 * A segment shorter than the quantum is a small folio or a folio
+	 * tail. Each would take a whole slot of the reserved range for a
+	 * fraction of its bytes - small-folio files exhausted a 64 GB
+	 * range with 2 GB of data - and a mapping that small saves the
+	 * plain path almost nothing. Leave them to per-chunk maps, which
+	 * recycle through the allocator's per-CPU cache.
+	 */
+	if (seg_len < c->quantum) {
+		atomic64_inc(&c->short_fallbacks);
+		return NULL;
+	}
+
+	/*
 	 * Sample the access before the cache decides anything about
 	 * it: the curve describes the stream, parked or not.
 	 */
@@ -1178,7 +1194,7 @@ static int io_pfn_cache_stats_show(struct seq_file *m, void *p)
 			break;
 		c = io_pfn_caches[i];
 		seq_printf(m,
-			   "dev %s quantum_kb %zu iova_mb %llu slots_used %u links %lld link_fails %lld covered_kb %lld hits %lld waits %lld wait_timeouts %lld misses %lld inserts %lld insert_fails %lld range_fallbacks %lld evictions %lld age_evictions %lld ref_skips %lld ghost_hits %lld ghost_count %lld eff_cap_mb %llu\n",
+			   "dev %s quantum_kb %zu iova_mb %llu slots_used %u links %lld link_fails %lld covered_kb %lld hits %lld waits %lld wait_timeouts %lld misses %lld inserts %lld insert_fails %lld range_fallbacks %lld short_fallbacks %lld evictions %lld age_evictions %lld ref_skips %lld ghost_hits %lld ghost_count %lld eff_cap_mb %llu\n",
 			   dev_name(c->dev),
 			   c->quantum >> 10,
 			   ((u64)c->nslots << c->quantum_shift) >> 20,
@@ -1193,6 +1209,7 @@ static int io_pfn_cache_stats_show(struct seq_file *m, void *p)
 			   atomic64_read(&c->inserts),
 			   atomic64_read(&c->insert_fails),
 			   atomic64_read(&c->range_fallbacks),
+			   atomic64_read(&c->short_fallbacks),
 			   atomic64_read(&c->evictions),
 			   atomic64_read(&c->age_evictions),
 			   atomic64_read(&c->ref_skips),
