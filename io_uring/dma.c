@@ -395,7 +395,8 @@ static void io_pfn_cache_evict(struct io_pfn_cache *c, u64 cap)
 	 * it every insert at the boundary evicts one entry and the sweep
 	 * stays hot on the datapath.
 	 */
-	over = atomic64_read(&c->covered) > target + ((u64)c->quantum << 2);
+	over = atomic64_read(&c->covered) >
+		(s64)(target + ((u64)c->quantum << 2));
 	aging = max_age && time_after(jiffies, READ_ONCE(c->next_age));
 	if (!over && !aging)
 		return;
@@ -594,7 +595,7 @@ static void io_pfn_cache_evict(struct io_pfn_cache *c, u64 cap)
 			}
 			io_pfn_map_put(pm);	/* Drop the cache bias. */
 			over = atomic64_read(&c->covered) >
-				target + ((u64)c->quantum << 2);
+				(s64)(target + ((u64)c->quantum << 2));
 			if (--unmaps <= 0) {
 				c->hand = index + 1;
 				goto out;
@@ -753,12 +754,24 @@ miss:
 	pm->last_used = jiffies;
 	atomic_set(&pm->refs, 2);	/* the cache bias plus this I/O */
 
+	/*
+	 * Charge before publishing: once the entry is visible a flush, or
+	 * a lookup displacing it for a longer run under the same key, may
+	 * remove it and subtract its bytes, and a remover that subtracts
+	 * what was never added drives the counter negative. covered is
+	 * signed and the cap is not, so a negative count compared unsigned
+	 * reads as enormous and the sweep spends its whole budget on every
+	 * call until the add lands.
+	 */
+	atomic64_add(seg_len, &c->covered);
+
 	rcu_read_lock();
 	old = xa_cmpxchg(&c->xa, pfn, NULL, pm, GFP_NOWAIT | __GFP_NOWARN);
 	if (old) {
 		/* We lost an insert race or the xarray node allocation
 		 * failed.
 		 */
+		atomic64_sub(seg_len, &c->covered);
 		dma_unmap_page(c->dev, base, pm->size, DMA_BIDIRECTIONAL);
 		kfree(pm);
 		if (!xa_is_err(old) && atomic_inc_not_zero(&old->refs)) {
@@ -779,8 +792,7 @@ miss:
 	}
 	rcu_read_unlock();
 	atomic64_inc(&c->inserts);
-	if (atomic64_add_return(pm->size, &c->covered) >
-			io_pfn_cache_target(c, cap))
+	if (atomic64_read(&c->covered) > (s64)io_pfn_cache_target(c, cap))
 		io_pfn_cache_evict(c, cap);
 	*dma = pm->dma_base + rel;
 	return pm;
