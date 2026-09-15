@@ -58,6 +58,14 @@ static inline unsigned long io_dma_prep_flags(void)
  * This is the same trade that page_pool's persistent NIC mappings
  * make.
  *
+ * A standing mapping outlives the I/O that made it, so the ownership
+ * transfers a per-chunk map and unmap perform at their ends have no
+ * place here: segments are mapped with DMA_ATTR_SKIP_CPU_SYNC and the
+ * datapath transfers explicitly, handing a source chunk to the device
+ * before its descriptor is issued and a destination piece to the
+ * device before its write and back to the CPU once the write has
+ * landed. On a coherent device each transfer is a flag test.
+ *
  * The entry lifetime is refs = 1 cache bias plus one per in-flight
  * batch entry.  Lookup takes a ref with atomic_inc_not_zero() under
  * RCU.  Eviction erases the entry and drops the bias, so a mapping
@@ -333,7 +341,8 @@ static void io_pfn_map_put(struct io_pfn_map *pm)
 {
 	if (!atomic_dec_and_test(&pm->refs))
 		return;
-	dma_unmap_page(pm->dev, pm->dma_base, pm->size, DMA_BIDIRECTIONAL);
+	dma_unmap_page_attrs(pm->dev, pm->dma_base, pm->size, DMA_BIDIRECTIONAL,
+			     DMA_ATTR_SKIP_CPU_SYNC);
 	kfree_rcu(pm, rcu);
 }
 
@@ -740,8 +749,9 @@ miss:
 	pm = kmalloc_obj(*pm, GFP_NOWAIT | __GFP_NOWARN);
 	if (!pm)
 		goto fail;
-	base = dma_map_page(c->dev, folio_page(folio, 0), seg_base,
-			    seg_len, DMA_BIDIRECTIONAL);
+	base = dma_map_page_attrs(c->dev, folio_page(folio, 0), seg_base,
+				  seg_len, DMA_BIDIRECTIONAL,
+				  DMA_ATTR_SKIP_CPU_SYNC);
 	if (dma_mapping_error(c->dev, base)) {
 		kfree(pm);
 		goto fail;
@@ -772,7 +782,8 @@ miss:
 		 * failed.
 		 */
 		atomic64_sub(seg_len, &c->covered);
-		dma_unmap_page(c->dev, base, pm->size, DMA_BIDIRECTIONAL);
+		dma_unmap_page_attrs(c->dev, base, pm->size, DMA_BIDIRECTIONAL,
+				     DMA_ATTR_SKIP_CPU_SYNC);
 		kfree(pm);
 		if (!xa_is_err(old) && atomic_inc_not_zero(&old->refs)) {
 			rcu_read_unlock();
@@ -2357,7 +2368,17 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 						       chunk,
 						       folio_size(folio),
 						       &src_dma);
-				if (!pm) {
+				if (pm) {
+					/* A standing mapping is synced by
+					 * nobody but us: hand the chunk to
+					 * the device, since the CPU may have
+					 * written the folio since the mapping
+					 * was made.
+					 */
+					dma_sync_single_for_device(dev, src_dma,
+								   chunk,
+								   DMA_TO_DEVICE);
+				} else {
 					src_dma = dma_map_page(dev, &folio->page,
 							       offset + copied,
 							       chunk, DMA_TO_DEVICE);
@@ -2805,7 +2826,14 @@ static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
 							  doff, plen,
 							  folio_size(folio),
 							  &d) : NULL;
-				if (!pm) {
+				if (pm) {
+					/* The device is about to write it;
+					 * it owns the piece until the wait
+					 * below hands it back.
+					 */
+					dma_sync_single_for_device(dev, d, plen,
+								   DMA_FROM_DEVICE);
+				} else {
 					d = dma_map_page(dev,
 							 folio_page(folio, 0),
 							 doff, plen,
@@ -2900,6 +2928,12 @@ collect_done:
 	 */
 	for (i = 0; i < nr_dst; i++) {
 		if (dsts[i].pm) {
+			/* The device wrote it, or on a wedge may have:
+			 * hand the piece back to the CPU before the folio
+			 * is unlocked or leaked.
+			 */
+			dma_sync_single_for_cpu(dev, dsts[i].dma, dsts[i].len,
+						DMA_FROM_DEVICE);
 			/* On a wedge the cached mapping must not stay
 			 * device-writable, so displace it; the unmap
 			 * happens when the last reference drops, which
