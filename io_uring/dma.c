@@ -18,6 +18,7 @@
 #include <linux/debugfs.h>
 #include <linux/task_work.h>
 #include "io_uring.h"
+#include "pfn_mrc.h"
 #include "rsrc.h"
 #include "refs.h"
 
@@ -131,6 +132,8 @@ struct io_pfn_cache {
 	u32			prev_ratio;	/* hit % at the last tick */
 	u32			parked_ticks;	/* ticks spent parked */
 	unsigned long		next_adapt;	/* jiffies */
+
+	struct io_pfn_mrc	*mrc;		/* reuse-time sampler, or NULL */
 };
 
 #define IO_PFN_CACHE_DEVS	16
@@ -194,6 +197,13 @@ static u32 io_dma_pfn_cache_auto_budget_mb __read_mostly = 16384;
 
 /* Registered per-device caches; slots are never released. */
 static atomic_t io_pfn_cache_nr;
+
+/*
+ * Reuse-time sampling for the miss ratio curve: 1 in 2^shift segment
+ * touches per cache, 0 off. Measurement only; the histogram is read
+ * through pfn_cache_rtd and solved offline.
+ */
+static u32 io_dma_pfn_mrc_shift __read_mostly;
 
 /* Ghost growth per hit and decay per quiet 2s tick (eff >> shift). */
 #define IO_PFN_GHOST_GROW_SEGS	8
@@ -306,11 +316,14 @@ static struct io_pfn_cache *io_pfn_cache_get(struct device *dev)
 	spin_lock_init(&c->lock);
 	c->dev = dev;
 	c->quantum = io_dma_map_quantum(dev);
+	if (READ_ONCE(io_dma_pfn_mrc_shift))
+		c->mrc = io_pfn_mrc_alloc(GFP_NOWAIT | __GFP_NOWARN);
 
 	spin_lock(&io_pfn_cache_reg_lock);
 	for (i = 0; i < IO_PFN_CACHE_DEVS; i++) {
 		if (io_pfn_cache_devs[i] == dev) {	/* We lost an insert race. */
 			spin_unlock(&io_pfn_cache_reg_lock);
+			io_pfn_mrc_free(c->mrc);
 			kfree(c);
 			return io_pfn_caches[i];
 		}
@@ -332,6 +345,7 @@ static struct io_pfn_cache *io_pfn_cache_get(struct device *dev)
 		}
 	}
 	spin_unlock(&io_pfn_cache_reg_lock);
+	io_pfn_mrc_free(c->mrc);
 	kfree(c);	/* The registry is full, so this device runs uncached. */
 	return NULL;
 }
@@ -644,11 +658,16 @@ out:
  *
  * @map_len is the known physically contiguous extent from the folio
  * head, which is folio_size() for page-cache folios.
+ *
+ * @touch says this chunk is the op's first on its segment; later
+ * chunks of the same segment are the same access for the reuse-time
+ * sampler and are not counted again.
  */
 static struct io_pfn_map *io_pfn_map_lookup(struct io_pfn_cache *c,
 					    struct folio *folio,
 					    size_t offset, size_t len,
-					    size_t map_len, dma_addr_t *dma)
+					    size_t map_len, bool touch,
+					    dma_addr_t *dma)
 {
 	u64 cap = (u64)READ_ONCE(io_dma_pfn_cache_cap_mb) << 20;
 	size_t seg_base, seg_len, rel;
@@ -666,6 +685,23 @@ static struct io_pfn_map *io_pfn_map_lookup(struct io_pfn_cache *c,
 	 */
 	io_pfn_cache_evict(c, cap);
 
+	seg_base = offset & ~(c->quantum - 1);
+	seg_len = min_t(size_t, c->quantum, map_len - seg_base);
+	rel = offset - seg_base;
+	pfn = folio_pfn(folio) + (seg_base >> PAGE_SHIFT);
+
+	/*
+	 * Sample the access before the cache decides anything about
+	 * it: the curve describes the stream, parked or not.
+	 */
+	if (touch) {
+		struct io_pfn_mrc *mrc = READ_ONCE(c->mrc);
+		unsigned int shift = READ_ONCE(io_dma_pfn_mrc_shift);
+
+		if (mrc && shift)
+			io_pfn_mrc_touch(mrc, pfn, shift);
+	}
+
 	/*
 	 * Parked: the utility check found the pattern uncacheable, so
 	 * skip straight to the caller's plain per-chunk map instead of
@@ -675,15 +711,10 @@ static struct io_pfn_map *io_pfn_map_lookup(struct io_pfn_cache *c,
 	 */
 	if (!io_pfn_cache_target(c, cap))
 		return NULL;
-
-	seg_base = offset & ~(c->quantum - 1);
-	seg_len = min_t(size_t, c->quantum, map_len - seg_base);
-	rel = offset - seg_base;
 	if (unlikely(rel + len > seg_len)) {
 		atomic64_inc(&c->range_fallbacks);
 		return NULL;
 	}
-	pfn = folio_pfn(folio) + (seg_base >> PAGE_SHIFT);
 
 	rcu_read_lock();
 	pm = xa_load(&c->xa, pfn);
@@ -973,6 +1004,117 @@ static int io_pfn_cache_cap_set(void *data, u64 val)
 }
 DEFINE_DEBUGFS_ATTRIBUTE(io_pfn_cache_cap_fops, io_pfn_cache_cap_get,
 			 io_pfn_cache_cap_set, "%llu\n");
+
+/*
+ * Reuse-time export: one section per cache, a comment line of cache
+ * state followed by a libmrc .rtd histogram. A write resets every
+ * sampler, so a measurement covers exactly one workload.
+ */
+static int io_pfn_cache_rtd_show(struct seq_file *m, void *p)
+{
+	unsigned int shift = READ_ONCE(io_dma_pfn_mrc_shift);
+	u64 hard = (u64)READ_ONCE(io_dma_pfn_cache_cap_mb) << 20;
+	int i;
+
+	seq_printf(m, "# io_uring pfn_cache rtd shift %u cap_mb %u auto %u budget_mb %u\n",
+		   shift, READ_ONCE(io_dma_pfn_cache_cap_mb),
+		   READ_ONCE(io_dma_pfn_cache_auto),
+		   READ_ONCE(io_dma_pfn_cache_auto_budget_mb));
+	for (i = 0; i < IO_PFN_CACHE_DEVS; i++) {
+		struct io_pfn_cache *c;
+		struct io_pfn_mrc *mrc;
+
+		if (!smp_load_acquire(&io_pfn_cache_devs[i]))
+			break;
+		c = io_pfn_caches[i];
+		seq_printf(m, "# dev %s quantum_kb %zu covered_kb %lld target_mb %llu hits %lld misses %lld inserts %lld evictions %lld ghost_hits %lld\n",
+			   dev_name(c->dev), c->quantum >> 10,
+			   atomic64_read(&c->covered),
+			   io_pfn_cache_target(c, hard) >> 20,
+			   atomic64_read(&c->hits), atomic64_read(&c->misses),
+			   atomic64_read(&c->inserts),
+			   atomic64_read(&c->evictions),
+			   atomic64_read(&c->ghost_hits));
+		mrc = READ_ONCE(c->mrc);
+		if (mrc)
+			io_pfn_mrc_show(m, mrc, shift);
+		else
+			seq_puts(m, "# no sampler\n");
+	}
+	return 0;
+}
+
+static int io_pfn_cache_rtd_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, io_pfn_cache_rtd_show, NULL);
+}
+
+static ssize_t io_pfn_cache_rtd_write(struct file *file,
+				      const char __user *ubuf,
+				      size_t len, loff_t *ppos)
+{
+	int i;
+
+	for (i = 0; i < IO_PFN_CACHE_DEVS; i++) {
+		struct io_pfn_mrc *mrc;
+
+		if (!smp_load_acquire(&io_pfn_cache_devs[i]))
+			break;
+		mrc = READ_ONCE(io_pfn_caches[i]->mrc);
+		if (mrc)
+			io_pfn_mrc_reset(mrc);
+	}
+	return len;
+}
+
+static const struct file_operations io_pfn_cache_rtd_fops = {
+	.owner		= THIS_MODULE,
+	.open		= io_pfn_cache_rtd_open,
+	.read		= seq_read,
+	.write		= io_pfn_cache_rtd_write,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
+static int io_pfn_mrc_shift_get(void *data, u64 *val)
+{
+	*val = READ_ONCE(io_dma_pfn_mrc_shift);
+	return 0;
+}
+
+/*
+ * Turning sampling on gives every registered cache a sampler here,
+ * where allocation may sleep; caches registered later allocate their
+ * own at creation, non-blocking, and run unsampled if that fails.
+ */
+static int io_pfn_mrc_shift_set(void *data, u64 val)
+{
+	int i;
+
+	if (val > 40)
+		return -ERANGE;
+	WRITE_ONCE(io_dma_pfn_mrc_shift, val);
+	if (!val)
+		return 0;
+	for (i = 0; i < IO_PFN_CACHE_DEVS; i++) {
+		struct io_pfn_cache *c;
+		struct io_pfn_mrc *m;
+
+		if (!smp_load_acquire(&io_pfn_cache_devs[i]))
+			break;
+		c = io_pfn_caches[i];
+		if (READ_ONCE(c->mrc))
+			continue;
+		m = io_pfn_mrc_alloc(GFP_KERNEL);
+		if (!m)
+			return -ENOMEM;
+		if (cmpxchg(&c->mrc, NULL, m))
+			io_pfn_mrc_free(m);
+	}
+	return 0;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(io_pfn_mrc_shift_fops, io_pfn_mrc_shift_get,
+			 io_pfn_mrc_shift_set, "%llu\n");
 
 /*
  * Busy-poll budget in microseconds for draining in-flight DMA
@@ -1716,6 +1858,10 @@ void io_dma_debugfs_init(void)
 			   &io_dma_pfn_cache_max_age_ms);
 	debugfs_create_file("pfn_cache_flush", 0200, dir, NULL,
 			    &io_pfn_cache_flush_fops);
+	debugfs_create_file("pfn_cache_rtd", 0644, dir, NULL,
+			    &io_pfn_cache_rtd_fops);
+	debugfs_create_file_unsafe("pfn_cache_mrc_shift", 0644, dir, NULL,
+				   &io_pfn_mrc_shift_fops);
 }
 
 /* Datapath allocation takes from the pool first and then falls back
@@ -2373,6 +2519,9 @@ ssize_t io_dma_filemap_read(struct io_kiocb *req, struct kiocb *iocb,
 						       offset + copied,
 						       chunk,
 						       folio_size(folio),
+						       !copied ||
+						       !((offset + copied) &
+							 (map_quantum - 1)),
 						       &src_dma);
 				if (pm) {
 					/* A standing mapping is synced by
@@ -2695,8 +2844,9 @@ static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
 	/* Clamp the write chunks, and so the transient dst-folio maps, to
 	 * the IOVA-rcache-served quantum.
 	 */
+	size_t map_quantum = io_dma_map_quantum(dev);
 	size_t max_chunk = min_t(size_t, mapping_max_folio_size(mapping),
-				 io_dma_map_quantum(dev));
+				 map_quantum);
 	struct io_pfn_cache *pfn_cache =
 		io_pfn_cache_usable() ? io_pfn_cache_get(dev) : NULL;
 	struct io_dma_fmw_dst *cur_dst = NULL;
@@ -2831,6 +2981,8 @@ static ssize_t io_dma_fmw_group(struct io_kiocb *req, struct kiocb *iocb,
 					io_pfn_map_lookup(pfn_cache, folio,
 							  doff, plen,
 							  folio_size(folio),
+							  (!collected && !sub) ||
+							  !(doff & (map_quantum - 1)),
 							  &d) : NULL;
 				if (pm) {
 					/* The device is about to write it;
