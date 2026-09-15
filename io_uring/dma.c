@@ -155,10 +155,17 @@ struct io_pfn_cache {
 	unsigned int		nslots;		/* 0: no reservation */
 	unsigned int		quantum_shift;
 	unsigned long		*slots;		/* used-slot bitmap */
+	unsigned long		*dirty;		/* retired, still linked */
+	struct io_pfn_map	**by_slot;	/* the entry holding each slot */
+	unsigned int		nr_dirty;
 	unsigned int		slot_hint;	/* next slot to try */
+	unsigned int		slot_hand;	/* CLOCK hand over the ring */
 	spinlock_t		slot_lock;
+	atomic_t		gc_busy;
 	atomic64_t		slot_links;	/* entries linked into the range */
 	atomic64_t		slot_fails;	/* range full or link failed */
+	atomic64_t		unlink_runs;	/* dma_iova_unlink() calls */
+	atomic64_t		unlink_slots;	/* slots those covered */
 	atomic64_t		waits;		/* hits taken after waiting for
 						 * another CPU's insert
 						 */
@@ -360,11 +367,15 @@ static void io_pfn_cache_reserve(struct io_pfn_cache *c, gfp_t gfp)
 	if (!nslots || nslots > UINT_MAX)
 		return;
 	c->slots = bitmap_zalloc(nslots, gfp);
-	if (!c->slots)
-		return;
-	if (!dma_iova_try_alloc(c->dev, &c->iova, 0, bytes)) {
+	c->dirty = bitmap_zalloc(nslots, gfp);
+	c->by_slot = kvcalloc(nslots, sizeof(*c->by_slot), gfp);
+	if (!c->slots || !c->dirty || !c->by_slot ||
+	    !dma_iova_try_alloc(c->dev, &c->iova, 0, bytes)) {
 		bitmap_free(c->slots);
-		c->slots = NULL;
+		bitmap_free(c->dirty);
+		kvfree(c->by_slot);
+		c->slots = c->dirty = NULL;
+		c->by_slot = NULL;
 		return;
 	}
 	spin_lock_init(&c->slot_lock);
@@ -376,6 +387,8 @@ static void io_pfn_cache_unreserve(struct io_pfn_cache *c)
 	if (c->nslots)
 		dma_iova_free(c->dev, &c->iova);
 	bitmap_free(c->slots);
+	bitmap_free(c->dirty);
+	kvfree(c->by_slot);
 }
 
 static struct io_pfn_cache *__io_pfn_cache_get(struct device *dev, gfp_t gfp)
@@ -455,34 +468,111 @@ void io_pfn_cache_prepare(struct device *dev)
 	__io_pfn_cache_get(dev, GFP_KERNEL);
 }
 
+/*
+ * Retired slots stay linked until this collector unlinks them, in runs
+ * of adjacent slots with one IOTLB flush per run. dma_iova_unlink()
+ * cannot queue its flush the way a plain unmap on a flush-queue domain
+ * does, so unlinking every retirement on its own cost the thrashing
+ * cache a third of its throughput. Slots are handed out sequentially
+ * and the sweep retires them in ring order, so runs are long.
+ */
+#define IO_PFN_GC_MIN_DIRTY	64
+#define IO_PFN_GC_RUNS		16
+#define IO_PFN_GC_RUN_MAX	1024	/* slots per unlink: 128 MB */
+
+static void io_pfn_slots_gc(struct io_pfn_cache *c, unsigned int min_dirty)
+{
+	struct { unsigned int start, len; } runs[IO_PFN_GC_RUNS];
+	unsigned int n, i, pos;
+
+	if (!c->nslots || READ_ONCE(c->nr_dirty) < min_dirty)
+		return;
+	if (atomic_cmpxchg(&c->gc_busy, 0, 1))
+		return;		/* another collector is at it */
+	do {
+		n = 0;
+		pos = 0;
+		spin_lock(&c->slot_lock);
+		while (n < IO_PFN_GC_RUNS) {
+			unsigned int start, end;
+
+			start = find_next_bit(c->dirty, c->nslots, pos);
+			if (start >= c->nslots)
+				break;
+			end = find_next_zero_bit(c->dirty, c->nslots, start);
+			if (end - start > IO_PFN_GC_RUN_MAX)
+				end = start + IO_PFN_GC_RUN_MAX;
+			bitmap_clear(c->dirty, start, end - start);
+			c->nr_dirty -= end - start;
+			runs[n].start = start;
+			runs[n].len = end - start;
+			n++;
+			pos = end;
+		}
+		spin_unlock(&c->slot_lock);
+		for (i = 0; i < n; i++) {
+			dma_iova_unlink(c->dev, &c->iova,
+					(size_t)runs[i].start << c->quantum_shift,
+					(size_t)runs[i].len << c->quantum_shift,
+					DMA_BIDIRECTIONAL, DMA_ATTR_SKIP_CPU_SYNC);
+			atomic64_inc(&c->unlink_runs);
+			atomic64_add(runs[i].len, &c->unlink_slots);
+		}
+		/* Only now are the slots free to hand out again. */
+		spin_lock(&c->slot_lock);
+		for (i = 0; i < n; i++)
+			bitmap_clear(c->slots, runs[i].start, runs[i].len);
+		spin_unlock(&c->slot_lock);
+	} while (n == IO_PFN_GC_RUNS && READ_ONCE(c->nr_dirty) >= min_dirty);
+	atomic_set(&c->gc_busy, 0);
+}
+
 static int io_pfn_slot_get(struct io_pfn_cache *c)
 {
 	unsigned int slot;
+	bool collected = false;
 
 	if (!c->nslots)
 		return -1;
+again:
 	spin_lock(&c->slot_lock);
 	slot = find_next_zero_bit(c->slots, c->nslots, c->slot_hint);
 	if (slot >= c->nslots)
 		slot = find_first_zero_bit(c->slots, c->nslots);
 	if (slot >= c->nslots) {
 		spin_unlock(&c->slot_lock);
+		if (!collected) {
+			collected = true;
+			io_pfn_slots_gc(c, 1);
+			goto again;
+		}
 		return -1;
 	}
 	__set_bit(slot, c->slots);
 	/* Sequential handout keeps entries inserted together adjacent in
-	 * the range, which is IOMMU page-table locality and lets retirements
-	 * of neighbours coalesce later.
+	 * the range: IOMMU page-table locality, and the runs the
+	 * collector unlinks.
 	 */
 	c->slot_hint = slot + 1 < c->nslots ? slot + 1 : 0;
 	spin_unlock(&c->slot_lock);
 	return slot;
 }
 
+/* A slot whose link failed: nothing to unlink, free it outright. */
 static void io_pfn_slot_put(struct io_pfn_cache *c, int slot)
 {
 	spin_lock(&c->slot_lock);
 	__clear_bit(slot, c->slots);
+	spin_unlock(&c->slot_lock);
+}
+
+/* A retired entry's slot: mark it for the collector. */
+static void io_pfn_slot_retire(struct io_pfn_cache *c, int slot)
+{
+	spin_lock(&c->slot_lock);
+	WRITE_ONCE(c->by_slot[slot], NULL);
+	__set_bit(slot, c->dirty);
+	c->nr_dirty++;
 	spin_unlock(&c->slot_lock);
 }
 
@@ -514,6 +604,7 @@ static dma_addr_t io_pfn_map_segment(struct io_pfn_cache *c,
 		}
 		if (!err) {
 			pm->slot = slot;
+			WRITE_ONCE(c->by_slot[slot], pm);
 			atomic64_inc(&c->slot_links);
 			return c->iova.addr + off;
 		}
@@ -535,10 +626,7 @@ static void io_pfn_map_unmap(struct io_pfn_map *pm)
 	struct io_pfn_cache *c = pm->cache;
 
 	if (pm->slot >= 0) {
-		dma_iova_unlink(pm->dev, &c->iova,
-				(size_t)pm->slot << c->quantum_shift, pm->size,
-				DMA_BIDIRECTIONAL, DMA_ATTR_SKIP_CPU_SYNC);
-		io_pfn_slot_put(c, pm->slot);
+		io_pfn_slot_retire(c, pm->slot);
 	} else {
 		dma_unmap_page_attrs(pm->dev, pm->dma_base, pm->size,
 				     DMA_BIDIRECTIONAL, DMA_ATTR_SKIP_CPU_SYNC);
@@ -645,6 +733,87 @@ static struct io_pfn_map *io_pfn_map_hit(struct io_pfn_cache *c,
  * chance, since an idle entry's reference bit only records that it was
  * used at some point in the past, not recently.
  */
+/*
+ * Take @pm out of the cache and drop its bias. Identity-checked:
+ * io_pfn_map_lookup() displaces outgrown entries without the cache
+ * lock, so between a walk handing us @pm and the removal another CPU
+ * can take it out, drop the bias and insert a replacement under the
+ * same key. Only the remover that actually took an entry out may
+ * retire it. Returns false when someone else got there first.
+ */
+static bool io_pfn_cache_retire(struct io_pfn_cache *c, struct io_pfn_map *pm,
+				bool aged)
+{
+	if (xa_cmpxchg(&c->xa, pm->pfn, pm, NULL,
+		       GFP_NOWAIT | __GFP_NOWARN) != pm)
+		return false;
+	atomic64_sub(pm->size, &c->covered);
+	atomic64_inc(&c->evictions);
+	if (aged) {
+		atomic64_inc(&c->age_evictions);
+	} else if (READ_ONCE(io_dma_pfn_cache_auto)) {
+		/*
+		 * Cap pressure took a live-looking entry. Remember its key
+		 * so a near-term re-read can prove the target too small.
+		 * Values carry the eviction time for the purge.
+		 */
+		void *gv = xa_mk_value(jiffies & (LONG_MAX >> 1));
+
+		if (!xa_is_err(xa_store(&c->ghost, pm->pfn, gv,
+					GFP_NOWAIT | __GFP_NOWARN)))
+			atomic64_inc(&c->ghost_count);
+	}
+	io_pfn_map_put(pm);	/* Drop the cache bias. */
+	return true;
+}
+
+/*
+ * The cap walk over the reserved range: the CLOCK hand goes round the
+ * slot ring in insertion order, which is the canonical CLOCK and what
+ * makes retirements adjacent for the collector. Called under c->lock
+ * with RCU held. Returns with *over updated.
+ */
+static void io_pfn_cache_sweep_ring(struct io_pfn_cache *c, u64 target,
+				    bool *over, int *budget, int *unmaps)
+{
+	unsigned int slot = c->slot_hand;
+	bool wrapped = false;
+
+	while (*over) {
+		struct io_pfn_map *pm;
+
+		slot = find_next_bit(c->slots, c->nslots, slot);
+		if (slot >= c->nslots) {
+			if (wrapped)
+				break;
+			wrapped = true;
+			slot = 0;
+			continue;
+		}
+		pm = READ_ONCE(c->by_slot[slot]);
+		slot++;
+		if (!pm)
+			continue;	/* retired, or still linking */
+		if (--*budget <= 0)
+			break;
+		if (atomic_read(&pm->refs) > 1) {
+			atomic64_inc(&c->ref_skips);
+			continue;
+		}
+		if (READ_ONCE(pm->referenced)) {
+			WRITE_ONCE(pm->referenced, false);
+			continue;
+		}
+		if (!io_pfn_cache_retire(c, pm, false))
+			continue;
+		*over = atomic64_read(&c->covered) >
+			(s64)(target + ((u64)c->quantum << 2));
+		if (--*unmaps <= 0)
+			break;
+	}
+	c->slot_hand = slot < c->nslots ? slot : 0;
+}
+
 static void io_pfn_cache_evict(struct io_pfn_cache *c, u64 cap)
 {
 	unsigned long max_age = READ_ONCE(io_dma_pfn_cache_max_age_ms);
@@ -653,8 +822,10 @@ static void io_pfn_cache_evict(struct io_pfn_cache *c, u64 cap)
 	unsigned long index, age_before = 0;
 	int budget = IO_PFN_EVICT_BUDGET;
 	int unmaps = IO_PFN_EVICT_UNMAP_MAX;
-	bool over, aging;
+	bool over, aging, xa_over;
 	int pass;
+
+	io_pfn_slots_gc(c, IO_PFN_GC_MIN_DIRTY);
 
 	/* A dead-band of a few segments over the target parks the sweep
 	 * when a fitting working set sits at its converged size; without
@@ -800,10 +971,22 @@ static void io_pfn_cache_evict(struct io_pfn_cache *c, u64 cap)
 		}
 	}
 
+	if (over && c->nslots)
+		io_pfn_cache_sweep_ring(c, target, &over, &budget, &unmaps);
+	/*
+	 * The xarray walk retires aged entries, and carries cap pressure
+	 * only for a cache without a ring: mixing the ring's insertion
+	 * order with the tree's PFN order would undo the runs. A ring
+	 * cache's plain-mapped remainder, entries that found the ring
+	 * full, is retired by age.
+	 */
+	xa_over = over && !c->nslots;
 	for (pass = 0; pass < 2; pass++) {
 		unsigned long start = pass ? 0 : c->hand;
 
-		if (!over && !aging)
+		if (!xa_over && !aging)
+			break;
+		if (budget <= 0 || unmaps <= 0)
 			break;
 
 		xa_for_each_start(&c->xa, index, pm, start) {
@@ -822,54 +1005,22 @@ static void io_pfn_cache_evict(struct io_pfn_cache *c, u64 cap)
 				continue;
 			}
 			if (!aged) {
-				if (!over)
+				if (!xa_over)
 					continue;
 				if (READ_ONCE(pm->referenced)) {
 					WRITE_ONCE(pm->referenced, false);
 					continue;
 				}
 			}
-			/*
-			 * Identity-checked: io_pfn_map_lookup() displaces
-			 * outgrown entries without this lock, so between
-			 * the walk handing us @pm and the removal another
-			 * CPU can take it out, drop the bias and insert a
-			 * replacement under the same key. An unconditional
-			 * erase would then evict the replacement without
-			 * dropping its bias and retire @pm a second time,
-			 * unmapping and freeing it under its users. Only
-			 * the remover that actually took an entry out may
-			 * drop its bias.
-			 */
-			if (xa_cmpxchg(&c->xa, index, pm, NULL,
-				       GFP_NOWAIT | __GFP_NOWARN) != pm)
+			if (!io_pfn_cache_retire(c, pm, aged))
 				continue;
-			atomic64_sub(pm->size, &c->covered);
-			atomic64_inc(&c->evictions);
-			if (aged) {
-				atomic64_inc(&c->age_evictions);
-			} else if (READ_ONCE(io_dma_pfn_cache_auto)) {
-				/*
-				 * Cap pressure took a live-looking entry.
-				 * Remember its key so a near-term re-read
-				 * can prove the target too small. Values
-				 * carry the eviction time for the purge.
-				 */
-				void *gv = xa_mk_value(jiffies &
-						       (LONG_MAX >> 1));
-
-				if (!xa_is_err(xa_store(&c->ghost, index, gv,
-						GFP_NOWAIT | __GFP_NOWARN)))
-					atomic64_inc(&c->ghost_count);
-			}
-			io_pfn_map_put(pm);	/* Drop the cache bias. */
-			over = atomic64_read(&c->covered) >
+			xa_over = atomic64_read(&c->covered) >
 				(s64)(target + ((u64)c->quantum << 2));
 			if (--unmaps <= 0) {
 				c->hand = index + 1;
 				goto out;
 			}
-			if (!over && !aging) {
+			if (!xa_over && !aging) {
 				c->hand = index + 1;
 				goto out;
 			}
@@ -1152,6 +1303,7 @@ static void io_pfn_cache_flush(struct io_pfn_cache *c)
 		io_pfn_map_put(pm);
 	}
 	rcu_read_unlock();
+	io_pfn_slots_gc(c, 1);
 
 	spin_lock(&c->lock);
 	c->hand = 0;
@@ -1194,13 +1346,16 @@ static int io_pfn_cache_stats_show(struct seq_file *m, void *p)
 			break;
 		c = io_pfn_caches[i];
 		seq_printf(m,
-			   "dev %s quantum_kb %zu iova_mb %llu slots_used %u links %lld link_fails %lld covered_kb %lld hits %lld waits %lld wait_timeouts %lld misses %lld inserts %lld insert_fails %lld range_fallbacks %lld short_fallbacks %lld evictions %lld age_evictions %lld ref_skips %lld ghost_hits %lld ghost_count %lld eff_cap_mb %llu\n",
+			   "dev %s quantum_kb %zu iova_mb %llu slots_used %u dirty %u links %lld link_fails %lld unlink_runs %lld unlink_slots %lld covered_kb %lld hits %lld waits %lld wait_timeouts %lld misses %lld inserts %lld insert_fails %lld range_fallbacks %lld short_fallbacks %lld evictions %lld age_evictions %lld ref_skips %lld ghost_hits %lld ghost_count %lld eff_cap_mb %llu\n",
 			   dev_name(c->dev),
 			   c->quantum >> 10,
 			   ((u64)c->nslots << c->quantum_shift) >> 20,
 			   c->nslots ? bitmap_weight(c->slots, c->nslots) : 0,
+			   READ_ONCE(c->nr_dirty),
 			   atomic64_read(&c->slot_links),
 			   atomic64_read(&c->slot_fails),
+			   atomic64_read(&c->unlink_runs),
+			   atomic64_read(&c->unlink_slots),
 			   atomic64_read(&c->covered) >> 10,
 			   atomic64_read(&c->hits),
 			   atomic64_read(&c->waits),
