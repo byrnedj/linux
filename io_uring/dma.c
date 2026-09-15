@@ -830,11 +830,13 @@ static void io_pfn_cache_flush(struct io_pfn_cache *c)
 	struct io_pfn_map *pm;
 	unsigned long index;
 
-	spin_lock(&c->lock);
-	/* Entries are freed with kfree_rcu() and the walk hands them back
-	 * outside any read-side section; under preemptible RCU c->lock is
-	 * not one, so take an explicit read lock here and let only the
-	 * remover that took an entry out retire it.
+	/* The walk runs without c->lock: removals are identity-checked,
+	 * so a concurrent sweep and this flush retire disjoint entries,
+	 * and a spinlock held across an unmap per entry would put the
+	 * whole cache's unmaps in one non-preemptible section. Entries
+	 * are freed with kfree_rcu() and the walk hands them back outside
+	 * any read-side section, so take the read lock, which under
+	 * preemptible RCU the spinlock never was.
 	 */
 	rcu_read_lock();
 	xa_for_each(&c->xa, index, pm) {
@@ -845,6 +847,8 @@ static void io_pfn_cache_flush(struct io_pfn_cache *c)
 		io_pfn_map_put(pm);
 	}
 	rcu_read_unlock();
+
+	spin_lock(&c->lock);
 	c->hand = 0;
 	{
 		void *gv;
