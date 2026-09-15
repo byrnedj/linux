@@ -2517,6 +2517,16 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 	}
 	ctx->dma.chan = ctx->dma.chans[0];
 	ctx->dma.stripe_rr = 0;
+	/* Create the devices' PFN caches here, where their IOVA reservation
+	 * and slot bitmap can be allocated with GFP_KERNEL; the datapath
+	 * only finds them.
+	 */
+	{
+		unsigned int i;
+
+		for (i = 0; i < ctx->dma.nr_chans; i++)
+			io_pfn_cache_prepare(ctx->dma.chans[i]->device->dev);
+	}
 	{
 		char names[IO_DMA_RING_CHANS * 16];
 		unsigned int i;

@@ -19,6 +19,7 @@
 #include <linux/task_work.h>
 #include "io_uring.h"
 #include "pfn_mrc.h"
+#include <linux/bitmap.h>
 #include "rsrc.h"
 #include "refs.h"
 
@@ -87,6 +88,11 @@ struct io_pfn_map {
 	bool			referenced;	/* CLOCK second-chance bit */
 	unsigned long		last_used;	/* jiffies, for age-based retire */
 	struct device		*dev;		/* unmap handle */
+	struct io_pfn_cache	*cache;
+	int			slot;		/* slot in the cache's reserved
+						 * IOVA range, or -1 for a plain
+						 * per-entry mapping
+						 */
 	struct rcu_head		rcu;
 };
 
@@ -134,6 +140,25 @@ struct io_pfn_cache {
 	unsigned long		next_adapt;	/* jiffies */
 
 	struct io_pfn_mrc	*mrc;		/* reuse-time sampler, or NULL */
+
+	/*
+	 * Reserved IOVA range. One allocation for the life of the cache;
+	 * entries are linked in at slot * quantum and unlinked on retire.
+	 * Standing mappings then never touch the IOVA allocator: no fill
+	 * ever walks its rbtree, and no flush or eviction parks a range in
+	 * its rcache depot, which is where a burst of frees left a million
+	 * free-but-cached nodes for every later allocation to walk. With
+	 * no reservation (no IOMMU, or the range could not be had) entries
+	 * fall back to per-entry maps.
+	 */
+	struct dma_iova_state	iova;
+	unsigned int		nslots;		/* 0: no reservation */
+	unsigned int		quantum_shift;
+	unsigned long		*slots;		/* used-slot bitmap */
+	unsigned int		slot_hint;	/* next slot to try */
+	spinlock_t		slot_lock;
+	atomic64_t		slot_links;	/* entries linked into the range */
+	atomic64_t		slot_fails;	/* range full or link failed */
 };
 
 #define IO_PFN_CACHE_DEVS	16
@@ -204,6 +229,15 @@ static atomic_t io_pfn_cache_nr;
  * through pfn_cache_rtd and solved offline.
  */
 static u32 io_dma_pfn_mrc_shift __read_mostly;
+
+/*
+ * IOVA reserved per cache, in MiB, taken when the cache is created; 0
+ * leaves the cache on per-entry maps. Reservation is address space
+ * only, page tables are built as entries link in, so on a 56-bit device
+ * the default costs nothing until used. A cap above the reservation
+ * still works: entries past the range take plain maps.
+ */
+static u32 io_dma_pfn_iova_reserve_mb __read_mostly = 65536;
 
 /* Ghost growth per hit and decay per quiet 2s tick (eff >> shift). */
 #define IO_PFN_GHOST_GROW_SEGS	8
@@ -295,7 +329,33 @@ static size_t io_dma_map_quantum(struct device *dev)
 	return rounddown_pow_of_two(q);
 }
 
-static struct io_pfn_cache *io_pfn_cache_get(struct device *dev)
+static void io_pfn_cache_reserve(struct io_pfn_cache *c, gfp_t gfp)
+{
+	u64 bytes = (u64)READ_ONCE(io_dma_pfn_iova_reserve_mb) << 20;
+	u64 nslots = bytes >> c->quantum_shift;
+
+	if (!nslots || nslots > UINT_MAX)
+		return;
+	c->slots = bitmap_zalloc(nslots, gfp);
+	if (!c->slots)
+		return;
+	if (!dma_iova_try_alloc(c->dev, &c->iova, 0, bytes)) {
+		bitmap_free(c->slots);
+		c->slots = NULL;
+		return;
+	}
+	spin_lock_init(&c->slot_lock);
+	c->nslots = nslots;
+}
+
+static void io_pfn_cache_unreserve(struct io_pfn_cache *c)
+{
+	if (c->nslots)
+		dma_iova_free(c->dev, &c->iova);
+	bitmap_free(c->slots);
+}
+
+static struct io_pfn_cache *__io_pfn_cache_get(struct device *dev, gfp_t gfp)
 {
 	struct io_pfn_cache *c;
 	int i;
@@ -308,7 +368,7 @@ static struct io_pfn_cache *io_pfn_cache_get(struct device *dev)
 			break;
 	}
 
-	c = kzalloc(sizeof(*c), GFP_NOWAIT | __GFP_NOWARN);
+	c = kzalloc(sizeof(*c), gfp);
 	if (!c)
 		return NULL;
 	xa_init(&c->xa);
@@ -316,14 +376,17 @@ static struct io_pfn_cache *io_pfn_cache_get(struct device *dev)
 	spin_lock_init(&c->lock);
 	c->dev = dev;
 	c->quantum = io_dma_map_quantum(dev);
+	c->quantum_shift = ilog2(c->quantum);
+	io_pfn_cache_reserve(c, gfp);
 	if (READ_ONCE(io_dma_pfn_mrc_shift))
-		c->mrc = io_pfn_mrc_alloc(GFP_NOWAIT | __GFP_NOWARN);
+		c->mrc = io_pfn_mrc_alloc(gfp);
 
 	spin_lock(&io_pfn_cache_reg_lock);
 	for (i = 0; i < IO_PFN_CACHE_DEVS; i++) {
 		if (io_pfn_cache_devs[i] == dev) {	/* We lost an insert race. */
 			spin_unlock(&io_pfn_cache_reg_lock);
 			io_pfn_mrc_free(c->mrc);
+			io_pfn_cache_unreserve(c);
 			kfree(c);
 			return io_pfn_caches[i];
 		}
@@ -346,8 +409,117 @@ static struct io_pfn_cache *io_pfn_cache_get(struct device *dev)
 	}
 	spin_unlock(&io_pfn_cache_reg_lock);
 	io_pfn_mrc_free(c->mrc);
+	io_pfn_cache_unreserve(c);
 	kfree(c);	/* The registry is full, so this device runs uncached. */
 	return NULL;
+}
+
+/* Datapath lookup: non-blocking, and a cache created here may have to
+ * run without a reservation if the bitmap cannot be had.
+ */
+static struct io_pfn_cache *io_pfn_cache_get(struct device *dev)
+{
+	return __io_pfn_cache_get(dev, GFP_NOWAIT | __GFP_NOWARN);
+}
+
+/*
+ * Create the device's cache from a context that may sleep, so its
+ * reservation and bitmap are allocated where they can be. Ring setup
+ * calls this for every device in the ring's stripe set.
+ */
+void io_pfn_cache_prepare(struct device *dev)
+{
+	__io_pfn_cache_get(dev, GFP_KERNEL);
+}
+
+static int io_pfn_slot_get(struct io_pfn_cache *c)
+{
+	unsigned int slot;
+
+	if (!c->nslots)
+		return -1;
+	spin_lock(&c->slot_lock);
+	slot = find_next_zero_bit(c->slots, c->nslots, c->slot_hint);
+	if (slot >= c->nslots)
+		slot = find_first_zero_bit(c->slots, c->nslots);
+	if (slot >= c->nslots) {
+		spin_unlock(&c->slot_lock);
+		return -1;
+	}
+	__set_bit(slot, c->slots);
+	/* Sequential handout keeps entries inserted together adjacent in
+	 * the range, which is IOMMU page-table locality and lets retirements
+	 * of neighbours coalesce later.
+	 */
+	c->slot_hint = slot + 1 < c->nslots ? slot + 1 : 0;
+	spin_unlock(&c->slot_lock);
+	return slot;
+}
+
+static void io_pfn_slot_put(struct io_pfn_cache *c, int slot)
+{
+	spin_lock(&c->slot_lock);
+	__clear_bit(slot, c->slots);
+	spin_unlock(&c->slot_lock);
+}
+
+/* Map a segment for a new entry: into the reserved range when a slot is
+ * free, else a plain per-entry mapping. Returns the device address or 0.
+ */
+static dma_addr_t io_pfn_map_segment(struct io_pfn_cache *c,
+				     struct io_pfn_map *pm,
+				     struct folio *folio, size_t seg_base,
+				     size_t seg_len)
+{
+	dma_addr_t base;
+	int slot = io_pfn_slot_get(c);
+
+	if (slot >= 0) {
+		size_t off = (size_t)slot << c->quantum_shift;
+		int err;
+
+		err = dma_iova_link(c->dev, &c->iova,
+				    PFN_PHYS(folio_pfn(folio)) + seg_base, off,
+				    seg_len, DMA_BIDIRECTIONAL,
+				    DMA_ATTR_SKIP_CPU_SYNC);
+		if (!err) {
+			err = dma_iova_sync(c->dev, &c->iova, off, seg_len);
+			if (err)
+				dma_iova_unlink(c->dev, &c->iova, off, seg_len,
+						DMA_BIDIRECTIONAL,
+						DMA_ATTR_SKIP_CPU_SYNC);
+		}
+		if (!err) {
+			pm->slot = slot;
+			atomic64_inc(&c->slot_links);
+			return c->iova.addr + off;
+		}
+		io_pfn_slot_put(c, slot);
+	}
+	if (c->nslots)
+		atomic64_inc(&c->slot_fails);
+	pm->slot = -1;
+	base = dma_map_page_attrs(c->dev, folio_page(folio, 0), seg_base,
+				  seg_len, DMA_BIDIRECTIONAL,
+				  DMA_ATTR_SKIP_CPU_SYNC);
+	if (dma_mapping_error(c->dev, base))
+		return 0;
+	return base;
+}
+
+static void io_pfn_map_unmap(struct io_pfn_map *pm)
+{
+	struct io_pfn_cache *c = pm->cache;
+
+	if (pm->slot >= 0) {
+		dma_iova_unlink(pm->dev, &c->iova,
+				(size_t)pm->slot << c->quantum_shift, pm->size,
+				DMA_BIDIRECTIONAL, DMA_ATTR_SKIP_CPU_SYNC);
+		io_pfn_slot_put(c, pm->slot);
+	} else {
+		dma_unmap_page_attrs(pm->dev, pm->dma_base, pm->size,
+				     DMA_BIDIRECTIONAL, DMA_ATTR_SKIP_CPU_SYNC);
+	}
 }
 
 /* Drop one reference. The last dropper unmaps and frees. */
@@ -355,8 +527,7 @@ static void io_pfn_map_put(struct io_pfn_map *pm)
 {
 	if (!atomic_dec_and_test(&pm->refs))
 		return;
-	dma_unmap_page_attrs(pm->dev, pm->dma_base, pm->size, DMA_BIDIRECTIONAL,
-			     DMA_ATTR_SKIP_CPU_SYNC);
+	io_pfn_map_unmap(pm);
 	kfree_rcu(pm, rcu);
 }
 
@@ -780,10 +951,9 @@ miss:
 	pm = kmalloc_obj(*pm, GFP_NOWAIT | __GFP_NOWARN);
 	if (!pm)
 		goto fail;
-	base = dma_map_page_attrs(c->dev, folio_page(folio, 0), seg_base,
-				  seg_len, DMA_BIDIRECTIONAL,
-				  DMA_ATTR_SKIP_CPU_SYNC);
-	if (dma_mapping_error(c->dev, base)) {
+	pm->cache = c;
+	base = io_pfn_map_segment(c, pm, folio, seg_base, seg_len);
+	if (!base) {
 		kfree(pm);
 		goto fail;
 	}
@@ -813,8 +983,7 @@ miss:
 		 * failed.
 		 */
 		atomic64_sub(seg_len, &c->covered);
-		dma_unmap_page_attrs(c->dev, base, pm->size, DMA_BIDIRECTIONAL,
-				     DMA_ATTR_SKIP_CPU_SYNC);
+		io_pfn_map_unmap(pm);
 		kfree(pm);
 		if (!xa_is_err(old) && atomic_inc_not_zero(&old->refs)) {
 			rcu_read_unlock();
@@ -920,9 +1089,13 @@ static int io_pfn_cache_stats_show(struct seq_file *m, void *p)
 			break;
 		c = io_pfn_caches[i];
 		seq_printf(m,
-			   "dev %s quantum_kb %zu covered_kb %lld hits %lld misses %lld inserts %lld insert_fails %lld range_fallbacks %lld evictions %lld age_evictions %lld ref_skips %lld ghost_hits %lld ghost_count %lld eff_cap_mb %llu\n",
+			   "dev %s quantum_kb %zu iova_mb %llu slots_used %u links %lld link_fails %lld covered_kb %lld hits %lld misses %lld inserts %lld insert_fails %lld range_fallbacks %lld evictions %lld age_evictions %lld ref_skips %lld ghost_hits %lld ghost_count %lld eff_cap_mb %llu\n",
 			   dev_name(c->dev),
 			   c->quantum >> 10,
+			   ((u64)c->nslots << c->quantum_shift) >> 20,
+			   c->nslots ? bitmap_weight(c->slots, c->nslots) : 0,
+			   atomic64_read(&c->slot_links),
+			   atomic64_read(&c->slot_fails),
 			   atomic64_read(&c->covered) >> 10,
 			   atomic64_read(&c->hits),
 			   atomic64_read(&c->misses),
@@ -1862,6 +2035,8 @@ void io_dma_debugfs_init(void)
 			    &io_pfn_cache_rtd_fops);
 	debugfs_create_file_unsafe("pfn_cache_mrc_shift", 0644, dir, NULL,
 				   &io_pfn_mrc_shift_fops);
+	debugfs_create_u32("pfn_cache_iova_reserve_mb", 0644, dir,
+			   &io_dma_pfn_iova_reserve_mb);
 }
 
 /* Datapath allocation takes from the pool first and then falls back
