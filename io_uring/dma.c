@@ -264,7 +264,7 @@ static u32 io_dma_pfn_iova_reserve_mb __read_mostly = 65536;
 static u32 io_dma_pfn_wait_us __read_mostly = 20;
 
 /* Ghost growth per hit and decay per quiet 2s tick (eff >> shift). */
-#define IO_PFN_GHOST_GROW_SEGS	8
+#define IO_PFN_GHOST_GROW_SEGS	64
 #define IO_PFN_ADAPT_DECAY_SHIFT 3
 #define IO_PFN_ADAPT_TICK	(2 * HZ)
 
@@ -304,7 +304,7 @@ static u64 io_pfn_cache_ceiling(struct io_pfn_cache *c, u64 hard)
 
 static u64 io_pfn_cache_floor(u64 ceil)
 {
-	return min(ceil, clamp(ceil >> 3, (u64)SZ_64M, (u64)SZ_2G));
+	return min(ceil, clamp(ceil >> 3, (u64)SZ_64M, (u64)SZ_8G));
 }
 
 /*
@@ -314,11 +314,15 @@ static u64 io_pfn_cache_floor(u64 ceil)
 #define IO_PFN_EFF_PARKED	1
 #define IO_PFN_PARK_PROBE_TICKS	8
 /*
- * A tick with this many inserts, no ghost hit, and about as many
- * evictions as inserts is a streaming pattern: nothing inserted was
- * reused before it left. Two in a row park the cache.
+ * A tick with this many inserts, no ghost hit, about as many evictions
+ * as inserts, and a low chunk hit ratio is a streaming pattern: nothing
+ * inserted was reused before it left, not even by the later chunks of
+ * its own segment. Two in a row park the cache. The ratio guard keeps
+ * a cache that serves thirty-one of every thirty-two chunk lookups of
+ * a small-block stream engaged even though no segment ever repeats.
  */
 #define IO_PFN_DEAD_MIN_INSERTS	1024
+#define IO_PFN_DEAD_MAX_RATIO	75
 
 static u64 io_pfn_cache_target(struct io_pfn_cache *c, u64 hard)
 {
@@ -944,6 +948,7 @@ static void io_pfn_cache_evict(struct io_pfn_cache *c, u64 cap)
 					} else if (!ghosting &&
 						   di >= IO_PFN_DEAD_MIN_INSERTS &&
 						   de * 2 >= di &&
+						   ratio < IO_PFN_DEAD_MAX_RATIO &&
 						   ++c->dead_ticks >= 2) {
 						/*
 						 * Streaming: the tick retired
@@ -959,7 +964,8 @@ static void io_pfn_cache_evict(struct io_pfn_cache *c, u64 cap)
 						c->dead_ticks = 0;
 					} else if (!ghosting) {
 						if (di < IO_PFN_DEAD_MIN_INSERTS ||
-						    de * 2 < di)
+						    de * 2 < di ||
+						    ratio >= IO_PFN_DEAD_MAX_RATIO)
 							c->dead_ticks = 0;
 						eff -= eff >>
 						    IO_PFN_ADAPT_DECAY_SHIFT;
