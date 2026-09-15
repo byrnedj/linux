@@ -316,14 +316,18 @@ enum {
 
 struct iou_ctx {};
 
-#define IO_DMA_RING_CHANS	4
+/* Devices a ring can stripe over: one channel per device in the pool. */
+#define IO_DMA_RING_CHANS	16
 
 struct io_dma_channel {
 	struct dma_chan		*chan;		/* primary; equals chans[0].
 						 * The write path, the gates,
 						 * and teardown key on it.
 						 */
-	struct dma_chan		*chans[IO_DMA_RING_CHANS];
+	struct dma_chan		*chans[IO_DMA_RING_CHANS];	/* one per device,
+						 * in the pool's canonical
+						 * device order
+						 */
 	unsigned int		nr_chans;
 	unsigned int		stripe_rr;	/* next stripe channel; only
 						 * the submitter under

@@ -2185,7 +2185,7 @@ static __cold void io_req_caches_free(struct io_ring_ctx *ctx)
 	__io_req_caches_free(ctx);
 }
 
-static void io_dma_shared_put(struct dma_chan *chan);
+static void io_dma_pool_put(struct dma_chan *chan);
 
 static void io_release_dma_chan(struct io_ring_ctx *ctx)
 {
@@ -2281,167 +2281,153 @@ static void io_release_dma_chan(struct io_ring_ctx *ctx)
 		pr_info("io_uring DMA: releasing channel %s requester=%s[%d] tgid=%d ctx=%p\n",
 			dma_chan_name(ctx->dma.chan), current->comm,
 			task_pid_nr(current), task_tgid_nr(current), ctx);
-		io_dma_shared_put(ctx->dma.chan);
+		io_dma_pool_put(ctx->dma.chan);
 		/* chans[0] is the primary released above. */
 		for (c = 1; c < ctx->dma.nr_chans; c++)
-			io_dma_shared_put(ctx->dma.chans[c]);
+			io_dma_pool_put(ctx->dma.chans[c]);
 	}
 	ctx->dma.chan = NULL;
 	ctx->dma.nr_chans = 0;
 }
 
-#define IO_DMA_MAX_DEVS	16
-
-struct io_dma_chan_filter {
-	int node;		/* required device node, or NUMA_NO_NODE */
-	int target_dev;		/* ordinal (among matches) of the device to accept */
-	int seen_devs;
-	struct dma_device *last_dev;
-};
-
-static bool io_dma_chan_filter_fn(struct dma_chan *chan, void *param)
-{
-	struct io_dma_chan_filter *f = param;
-
-	if (f->node != NUMA_NO_NODE &&
-	    dev_to_node(chan->device->dev) != f->node)
-		return false;
-	/* Candidates arrive grouped by device, so we count device transitions. */
-	if (chan->device != f->last_dev) {
-		f->last_dev = chan->device;
-		f->seen_devs++;
-	}
-	return f->seen_devs - 1 == f->target_dev;
-}
-
-static struct dma_chan *io_dma_request_spread(dma_cap_mask_t *mask, int node)
-{
-	static atomic_t io_dma_chan_rr;
-	unsigned int rr = atomic_inc_return(&io_dma_chan_rr);
-	struct io_dma_chan_filter count = { .node = node, .target_dev = -1 };
-	struct dma_chan *chan;
-	int ndevs, i;
-
-	/*
-	 * Count the matching devices before rotating. The rotation must
-	 * run modulo the real device count: taken modulo a fixed maximum,
-	 * every ordinal past the real count fails to match and the retry
-	 * loop wraps to ordinal zero, which aimed three quarters of all
-	 * acquisitions at the first device and stacked every ring of a
-	 * workload onto it. The counting request never matches, so it
-	 * only tallies device transitions.
-	 */
-	dma_request_channel(*mask, io_dma_chan_filter_fn, &count);
-	ndevs = count.seen_devs;
-	if (!ndevs)
-		return NULL;
-
-	/* Round-robin across the devices that actually matched. */
-	for (i = 0; i < ndevs; i++) {
-		struct io_dma_chan_filter f = {
-			.node = node,
-			.target_dev = (int)((rr + i) % ndevs),
-		};
-
-		chan = dma_request_channel(*mask, io_dma_chan_filter_fn, &f);
-		if (chan)
-			return chan;
-	}
-	return NULL;
-}
-
 /*
- * Shared-channel pool.  Rings no longer own a dmaengine channel
- * exclusively.  One channel can carry descriptors from many rings and a
- * full WQ surfaces as a failed descriptor allocation at prep time, which
- * the submitter handles by falling back to the CPU copy.  Allocation is
- * first-come first-served.  Each ring grabs a fresh channel while the
- * engine still has one, with device-spread and node-local channels
- * preferred.  Once the engine is exhausted, later rings share existing
- * channels round-robin.  Entries are refcounted and the dmaengine
- * channel is released when the last ring detaches.
+ * Per-device channel pool.
+ *
+ * Rings do not own dmaengine channels. A channel carries descriptors
+ * from many rings, a full WQ surfaces as a failed descriptor allocation
+ * at prep time, and the submitter falls back to the CPU copy. The pool
+ * is indexed by device, in the order discovery appended them, and every
+ * ring takes one channel per device in that order: the file-position
+ * stripe then sends a region to the same device from every ring, which
+ * is what keeps the per-device PFN caches from re-duplicating a shared
+ * working set. Within a device the pool hands out fresh channels while
+ * the device still has one and then shares the least-referenced.
+ * Channel entries are refcounted and the dmaengine channel is released
+ * when the last ring detaches; device entries are never removed, so the
+ * order stays canonical for the life of the machine.
  */
-#define IO_DMA_SHARED_MAX	64
-struct io_dma_shared_chan {
-	struct dma_chan *chan;
-	int refcnt;
+#define IO_DMA_POOL_DEVS	IO_DMA_RING_CHANS
+#define IO_DMA_POOL_CHANS	16	/* per device */
+
+struct io_dma_pool_chan {
+	struct dma_chan		*chan;
+	int			refcnt;
 };
-static struct io_dma_shared_chan io_dma_shared[IO_DMA_SHARED_MAX];
-static int io_dma_shared_cnt;
-static unsigned int io_dma_shared_rr;
-static DEFINE_MUTEX(io_dma_shared_mutex);
 
-static struct dma_chan *io_dma_shared_pick(int node)
-{
-	int i, idx;
+struct io_dma_pool_dev {
+	struct dma_device	*ddev;	/* identity only, never dereferenced */
+	int			node;
+	unsigned int		rr;	/* tie-break rotation when sharing */
+	int			nr;
+	struct io_dma_pool_chan	chans[IO_DMA_POOL_CHANS];
+};
 
-	for (i = 0; i < io_dma_shared_cnt; i++) {
-		idx = (io_dma_shared_rr + i) % io_dma_shared_cnt;
-		if (node == NUMA_NO_NODE ||
-		    dev_to_node(io_dma_shared[idx].chan->device->dev) == node) {
-			io_dma_shared_rr = idx + 1;
-			io_dma_shared[idx].refcnt++;
-			return io_dma_shared[idx].chan;
-		}
-	}
-	return NULL;
-}
+static struct io_dma_pool_dev io_dma_pool[IO_DMA_POOL_DEVS];
+static int io_dma_pool_ndevs;
+static unsigned int io_dma_pool_ring_rr;
+static DEFINE_MUTEX(io_dma_pool_mutex);
 
-static struct dma_chan *io_dma_shared_get(dma_cap_mask_t *mask, int node)
-{
-	struct dma_chan *chan;
-
-	mutex_lock(&io_dma_shared_mutex);
-
-	/* 1) fresh node-local channel */
-	if (io_dma_shared_cnt < IO_DMA_SHARED_MAX) {
-		chan = io_dma_request_spread(mask, node);
-		if (chan)
-			goto register_fresh;
-	}
-	/* 2) share a node-local channel round-robin */
-	chan = io_dma_shared_pick(node);
-	if (chan)
-		goto out;
-	/* 3) fresh channel on any node */
-	if (io_dma_shared_cnt < IO_DMA_SHARED_MAX) {
-		chan = io_dma_request_spread(mask, NUMA_NO_NODE);
-		if (chan)
-			goto register_fresh;
-	}
-	/* 4) share any channel, any node */
-	chan = io_dma_shared_pick(NUMA_NO_NODE);
-	goto out;
-
-register_fresh:
-	io_dma_shared[io_dma_shared_cnt++] =
-		(struct io_dma_shared_chan){ .chan = chan, .refcnt = 1 };
-out:
-	mutex_unlock(&io_dma_shared_mutex);
-	return chan;
-}
-
-static void io_dma_shared_put(struct dma_chan *chan)
+static bool io_dma_pool_filter_new(struct dma_chan *chan, void *param)
 {
 	int i;
 
-	mutex_lock(&io_dma_shared_mutex);
-	for (i = 0; i < io_dma_shared_cnt; i++) {
-		if (io_dma_shared[i].chan != chan)
+	for (i = 0; i < io_dma_pool_ndevs; i++)
+		if (io_dma_pool[i].ddev == chan->device)
+			return false;
+	return true;
+}
+
+static bool io_dma_pool_filter_dev(struct dma_chan *chan, void *param)
+{
+	return chan->device == param;
+}
+
+/*
+ * Append every capable device not yet in the table. This runs on each
+ * ring creation, so a device whose queues are enabled after the first
+ * ring joins the table then; rings created before it keep their
+ * narrower set until they go away.
+ */
+static void io_dma_pool_discover(dma_cap_mask_t *mask)
+{
+	lockdep_assert_held(&io_dma_pool_mutex);
+
+	while (io_dma_pool_ndevs < IO_DMA_POOL_DEVS) {
+		struct io_dma_pool_dev *pd;
+		struct dma_chan *chan;
+
+		chan = dma_request_channel(*mask, io_dma_pool_filter_new, NULL);
+		if (IS_ERR_OR_NULL(chan))
+			break;
+		pd = &io_dma_pool[io_dma_pool_ndevs++];
+		pd->ddev = chan->device;
+		pd->node = dev_to_node(chan->device->dev);
+		/* Discovery only identifies the device; rings take their
+		 * channels through io_dma_pool_get().
+		 */
+		dma_release_channel(chan);
+	}
+}
+
+static struct dma_chan *io_dma_pool_get(struct io_dma_pool_dev *pd,
+					dma_cap_mask_t *mask)
+{
+	struct io_dma_pool_chan *best = NULL;
+	struct dma_chan *chan;
+	int i;
+
+	lockdep_assert_held(&io_dma_pool_mutex);
+
+	/* A fresh channel while the device still has one. */
+	if (pd->nr < IO_DMA_POOL_CHANS) {
+		chan = dma_request_channel(*mask, io_dma_pool_filter_dev,
+					   pd->ddev);
+		if (!IS_ERR_OR_NULL(chan)) {
+			pd->chans[pd->nr++] = (struct io_dma_pool_chan){
+				.chan = chan, .refcnt = 1 };
+			return chan;
+		}
+	}
+	/* Otherwise share the least-referenced one; ties rotate. */
+	for (i = 0; i < pd->nr; i++) {
+		struct io_dma_pool_chan *pc = &pd->chans[(pd->rr + i) % pd->nr];
+
+		if (!best || pc->refcnt < best->refcnt)
+			best = pc;
+	}
+	if (!best)
+		return NULL;
+	pd->rr++;
+	best->refcnt++;
+	return best->chan;
+}
+
+static void io_dma_pool_put(struct dma_chan *chan)
+{
+	int d, i;
+
+	mutex_lock(&io_dma_pool_mutex);
+	for (d = 0; d < io_dma_pool_ndevs; d++) {
+		struct io_dma_pool_dev *pd = &io_dma_pool[d];
+
+		if (pd->ddev != chan->device)
 			continue;
-		if (--io_dma_shared[i].refcnt == 0) {
-			/* Drained by teardown; free its stats slot before
-			 * the channel can be recycled.
-			 */
-			io_dma_qstat_forget(chan);
-			dma_release_channel(chan);
-			io_dma_shared[i] = io_dma_shared[--io_dma_shared_cnt];
-			if (io_dma_shared_rr > (unsigned int)io_dma_shared_cnt)
-				io_dma_shared_rr = 0;
+		for (i = 0; i < pd->nr; i++) {
+			if (pd->chans[i].chan != chan)
+				continue;
+			if (--pd->chans[i].refcnt == 0) {
+				/* Drained by teardown; free its stats slot
+				 * before the channel can be recycled.
+				 */
+				io_dma_qstat_forget(chan);
+				dma_release_channel(chan);
+				pd->chans[i] = pd->chans[--pd->nr];
+			}
+			break;
 		}
 		break;
 	}
-	mutex_unlock(&io_dma_shared_mutex);
+	mutex_unlock(&io_dma_pool_mutex);
 }
 
 static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
@@ -2477,105 +2463,76 @@ static int io_allocate_dma_chan(struct io_ring_ctx *ctx,
 	atomic_set(&ctx->dma.diag_refs_dropped, 0);
 	init_waitqueue_head(&ctx->dma.inflight_wq);
 
-	/* Prefer a channel whose DSA device sits on the caller's NUMA
-	 * node.  A cross-socket engine pays UPI hops on every descriptor
-	 * fetch and data move, which shows up as bimodal throughput
-	 * depending on which channel the ring happened to win.  Fresh
-	 * channels are handed out first-come first-served.  Once the
-	 * engine is exhausted, rings share channels round-robin.
+	/*
+	 * One channel per device, in the pool's canonical order, so this
+	 * ring agrees with every other on which device a file region
+	 * stripes to. Devices on the caller's NUMA node when it has any:
+	 * a cross-socket engine pays UPI hops on every descriptor fetch
+	 * and data move, which showed up as bimodal throughput depending
+	 * on which channel a ring happened to win. Fresh channels while a
+	 * device has them, shared least-referenced after; a shortfall
+	 * just narrows the stripe.
 	 */
-	ctx->dma.chan = io_dma_shared_get(&mask, node);
-	if (IS_ERR_OR_NULL(ctx->dma.chan)) {
-		rc = ctx->dma.chan ? PTR_ERR(ctx->dma.chan) : -ENODEV;
+	{
+		unsigned int want = min_t(unsigned int,
+					  READ_ONCE(io_dma_stripe_chans),
+					  IO_DMA_RING_CHANS);
+		int devs[IO_DMA_POOL_DEVS];
+		unsigned int n = 0, start = 0, i;
+
+		mutex_lock(&io_dma_pool_mutex);
+		io_dma_pool_discover(&mask);
+		for (i = 0; i < io_dma_pool_ndevs; i++)
+			if (io_dma_pool[i].node == node)
+				devs[n++] = i;
+		if (!n)
+			for (i = 0; i < io_dma_pool_ndevs; i++)
+				devs[n++] = i;
+		if (want > n)
+			want = n;
+		/*
+		 * A ring taking fewer devices than its node offers cannot
+		 * agree with its peers on which device owns a region:
+		 * stripe_chans below the device count trades the dedup for
+		 * spread, so start those rings at a rotating device.
+		 */
+		if (want && want < n)
+			start = io_dma_pool_ring_rr++ % n;
+		for (i = 0; i < want; i++) {
+			struct dma_chan *c = io_dma_pool_get(
+				&io_dma_pool[devs[(start + i) % n]], &mask);
+
+			if (!c)
+				break;
+			ctx->dma.chans[ctx->dma.nr_chans++] = c;
+		}
+		mutex_unlock(&io_dma_pool_mutex);
+	}
+	if (!ctx->dma.nr_chans) {
+		rc = -ENODEV;
 		pr_err("io_uring DMA: no channel available: %d requester=%s[%d] tgid=%d\n",
 		       rc, current->comm,
 		       task_pid_nr(current), task_tgid_nr(current));
-		ctx->dma.chan = NULL;
 		goto failed;
 	}
-
-	dev_info(ctx->dma.chan->device->dev,
-		 "io_uring DMA: acquired channel %s (node %d, caller node %d, pool %d chans) requester=%s[%d] tgid=%d ctx=%p\n",
-		 dma_chan_name(ctx->dma.chan),
-		 dev_to_node(ctx->dma.chan->device->dev), node,
-		 io_dma_shared_cnt,
-		 current->comm, task_pid_nr(current), task_tgid_nr(current), ctx);
-
-	/* Stripe channels. Reads of a single stream on one channel reach
-	 * only that channel's device, four engines of sixteen; extra
-	 * channels, landed on distinct devices by the acquisition
-	 * rotation, let one op's batches spread across devices. The
-	 * primary stays chans[0], and shortfall just narrows the stripe.
-	 */
-	ctx->dma.chans[0] = ctx->dma.chan;
-	ctx->dma.nr_chans = 1;
+	ctx->dma.chan = ctx->dma.chans[0];
 	ctx->dma.stripe_rr = 0;
 	{
-		unsigned int want = READ_ONCE(io_dma_stripe_chans);
+		char names[IO_DMA_RING_CHANS * 16];
+		unsigned int i;
+		int len = 0;
 
-		if (want > IO_DMA_RING_CHANS)
-			want = IO_DMA_RING_CHANS;
-		unsigned int tries = 2 * IO_DMA_RING_CHANS;
-
-		while (ctx->dma.nr_chans < want && tries--) {
-			struct dma_chan *c = io_dma_shared_get(&mask, node);
-			unsigned int k;
-			bool dup = false;
-
-			if (IS_ERR_OR_NULL(c))
-				break;
-			/*
-			 * Keep the stripe set on distinct devices. Two
-			 * channels of one device add no engine-group
-			 * bandwidth, and a ring whose set diverges from
-			 * its peers' device sets re-duplicates the
-			 * position-deterministic caches. Put duplicates
-			 * back; the pool rotation advances, so retries
-			 * reach the other devices.
-			 */
-			for (k = 0; k < ctx->dma.nr_chans; k++) {
-				if (ctx->dma.chans[k]->device->dev ==
-				    c->device->dev) {
-					dup = true;
-					break;
-				}
-			}
-			if (dup) {
-				io_dma_shared_put(c);
-				continue;
-			}
-			ctx->dma.chans[ctx->dma.nr_chans++] = c;
-		}
+		for (i = 0; i < ctx->dma.nr_chans; i++)
+			len += scnprintf(names + len, sizeof(names) - len,
+					 "%s%s", i ? " " : "",
+					 dma_chan_name(ctx->dma.chans[i]));
+		dev_info(ctx->dma.chan->device->dev,
+			 "io_uring DMA: ring %p stripe set (%u of %d devices, node %d, caller node %d): %s requester=%s[%d] tgid=%d\n",
+			 ctx, ctx->dma.nr_chans, io_dma_pool_ndevs,
+			 dev_to_node(ctx->dma.chan->device->dev), node, names,
+			 current->comm, task_pid_nr(current),
+			 task_tgid_nr(current));
 	}
-
-	/*
-	 * Canonicalize the stripe order across rings. The file-position
-	 * stripe sends a given region's batches to chans[i] for the
-	 * same i on every ring, but the acquisition rotation fills the
-	 * array in a per-ring order: without a shared order, rings
-	 * disagree on which device owns a region and their per-device
-	 * PFN caches re-duplicate the working set. Sorting by device
-	 * makes every ring on the same devices agree. The primary
-	 * follows the sort; nothing has used it yet.
-	 */
-	{
-		unsigned int a, b;
-
-		for (a = 1; a < ctx->dma.nr_chans; a++) {
-			for (b = a; b > 0 &&
-			     ctx->dma.chans[b]->device->dev <
-			     ctx->dma.chans[b - 1]->device->dev; b--)
-				swap(ctx->dma.chans[b],
-				     ctx->dma.chans[b - 1]);
-		}
-		ctx->dma.chan = ctx->dma.chans[0];
-	}
-	pr_info("io_uring DMA: ring %p stripe set (%u): %s %s %s %s\n",
-		ctx, ctx->dma.nr_chans,
-		dma_chan_name(ctx->dma.chans[0]),
-		ctx->dma.nr_chans > 1 ? dma_chan_name(ctx->dma.chans[1]) : "-",
-		ctx->dma.nr_chans > 2 ? dma_chan_name(ctx->dma.chans[2]) : "-",
-		ctx->dma.nr_chans > 3 ? dma_chan_name(ctx->dma.chans[3]) : "-");
 
 	io_dma_init_freelist(ctx, p);
 

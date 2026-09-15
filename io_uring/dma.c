@@ -1017,9 +1017,11 @@ static unsigned int io_dma_batch_min __read_mostly = 8;
  */
 static unsigned int io_dma_slot_wait_us __read_mostly;
 /*
- * Channels acquired per ring for read striping. One channel reaches one
- * device, four engines of sixteen; a single-stream op striped across
- * distinct devices reaches them all. Read at ring creation.
+ * Devices a ring stripes over, one channel each. One channel reaches one
+ * device, four engines of sixteen; a single-stream op striped across the
+ * devices reaches them all. The default takes every device on the ring's
+ * node; a value below that count trades the cross-ring cache dedup for
+ * spread and exists for experiments. Read at ring creation.
  */
 unsigned int io_dma_stripe_chans __read_mostly = IO_DMA_RING_CHANS;
 /*
