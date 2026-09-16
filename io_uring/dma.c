@@ -193,14 +193,16 @@ static struct device *io_pfn_cache_devs[IO_PFN_CACHE_DEVS];
 static DEFINE_SPINLOCK(io_pfn_cache_reg_lock);
 
 /*
- * Covered-bytes cap in MiB, where 0 disables the cache entirely.  A cap
- * under a cycling working set makes the sweep thrash with an evict and
- * remap per I/O, which is worse than no cache, so a deployment that
- * wants the cache should size this above its source working set.  The
- * default is deliberately modest rather than generous, because every
- * mapped byte is a byte the device can read until the entry is retired.
+ * Covered-bytes cap in MiB, where 0 disables the cache entirely.  This
+ * is the hard bound on the standing window, the bytes the device can
+ * reach until an entry is retired; the adaptive target sizes itself
+ * below it from the workload's reuse and parks on streaming, so the
+ * cap need not be tuned to the working set.  It defaults to the IOVA
+ * reservation, which is what the adaptive ceiling is anyway: a cap
+ * above the reservation only spills entries to per-entry maps, and one
+ * below it forgoes coverage the reservation already paid for.
  */
-static u32 io_dma_pfn_cache_cap_mb __read_mostly = 1024;
+static u32 io_dma_pfn_cache_cap_mb __read_mostly = 65536;
 
 /*
  * Age at which an idle entry is retired even though the cache is under
