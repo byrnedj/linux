@@ -655,13 +655,32 @@ int idxd_wq_init_percpu_ref(struct idxd_wq *wq)
 }
 EXPORT_SYMBOL_NS_GPL(idxd_wq_init_percpu_ref, "IDXD");
 
-void __idxd_wq_quiesce(struct idxd_wq *wq)
+/*
+ * Kill wq_active and wait for the last submitter to drop its reference.
+ * Every killer runs under wq_lock and waits before it unlocks, so a
+ * reference found dying here was killed and waited out by an earlier
+ * caller, such as a halt flush that did not revive the queue. Killing
+ * it again would drop the count below zero and wait forever. A
+ * reference that percpu_ref_exit() released reads as dying too, so a
+ * queue the device re-enabled behind an unbind is skipped as well.
+ * Returns whether this call killed the reference.
+ */
+bool idxd_wq_kill(struct idxd_wq *wq)
 {
 	lockdep_assert_held(&wq->wq_lock);
+	if (percpu_ref_is_dying(&wq->wq_active))
+		return false;
 	reinit_completion(&wq->wq_resurrect);
 	percpu_ref_kill(&wq->wq_active);
-	complete_all(&wq->wq_resurrect);
 	wait_for_completion(&wq->wq_dead);
+	return true;
+}
+
+void __idxd_wq_quiesce(struct idxd_wq *wq)
+{
+	idxd_wq_kill(wq);
+	/* Let parked submitters retry and fail on the dead reference. */
+	complete_all(&wq->wq_resurrect);
 }
 EXPORT_SYMBOL_NS_GPL(__idxd_wq_quiesce, "IDXD");
 
@@ -1680,7 +1699,7 @@ int idxd_device_load_config(struct idxd_device *idxd)
 }
 
 static void idxd_flush_pending_descs(struct idxd_irq_entry *ie,
-				     bool quarantine)
+				     bool keep_callbacks, bool quarantine)
 {
 	struct idxd_wq *wq = ie_to_wq(ie);
 	struct idxd_desc *desc, *itr;
@@ -1696,6 +1715,28 @@ static void idxd_flush_pending_descs(struct idxd_irq_entry *ie,
 			list_add_tail(&desc->list, &ie->work_list);
 	}
 
+	/*
+	 * A halt flush that delivers the callbacks of a dmaengine queue
+	 * leaves its descriptors to the interrupt thread, which runs them
+	 * without wq_lock, as it runs every completion. A callback may
+	 * terminate the channel, which takes that lock, and the halt flush
+	 * holds it. The halted device writes no record any more, so one it
+	 * never finished is marked aborted for the thread to complete.
+	 */
+	if (keep_callbacks && idxd_wq_has_txd(wq)) {
+		bool wake = false;
+
+		list_for_each_entry(desc, &ie->work_list, list) {
+			if (!desc->completion->status)
+				desc->completion->status = IDXD_COMP_DESC_ABORT;
+			wake = true;
+		}
+		spin_unlock(&ie->list_lock);
+		if (wake)
+			irq_wake_thread(ie->vector, ie);
+		return;
+	}
+
 	list_for_each_entry_safe(desc, itr, &ie->work_list, list)
 		list_move_tail(&desc->list, &flist);
 	spin_unlock(&ie->list_lock);
@@ -1706,10 +1747,26 @@ static void idxd_flush_pending_descs(struct idxd_irq_entry *ie,
 		list_del(&desc->list);
 		ctype = desc->completion->status ? IDXD_COMPLETE_NORMAL : IDXD_COMPLETE_ABORT;
 		/*
-		 * wq is being disabled. Any remaining descriptors are
-		 * likely to be stuck and can be dropped. callback could
-		 * point to code that is no longer accessible, for example
-		 * if dmatest module has been unloaded.
+		 * Another driver's descriptor carries that driver's request
+		 * in place of a txd, and a client may still wait for it, so it
+		 * goes back through that driver's completion. The completion
+		 * reads the outcome from the record, which the device never
+		 * wrote for an unfinished descriptor. Only a dmaengine channel
+		 * terminates, so nothing of such a queue is quarantined.
+		 */
+		if (!idxd_wq_has_txd(wq)) {
+			if (ctype == IDXD_COMPLETE_ABORT)
+				desc->completion->status = IDXD_COMP_DESC_ABORT;
+			idxd_desc_complete(desc, ctype, true);
+			continue;
+		}
+		/*
+		 * wq is being disabled or terminated. Any remaining
+		 * descriptors are likely to be stuck and can be dropped.
+		 * With no client left the callback could point to code that
+		 * is no longer accessible (dmatest unloaded), and a client's
+		 * own terminate must not get it, so it is stripped. A halt
+		 * that delivers the callbacks left them to the thread above.
 		 */
 		tx = &desc->txd;
 		tx->callback = NULL;
@@ -1733,7 +1790,14 @@ static void idxd_flush_pending_descs(struct idxd_irq_entry *ie,
 			list_add_tail(&desc->list, &qlist);
 			continue;
 		}
-		idxd_dma_complete_txd(desc, ctype, true, NULL, NULL);
+		/*
+		 * The abort type keeps a record that reports a revoked
+		 * interrupt handle from being resubmitted. The device is done
+		 * with it, and with the handle kept across a terminate the
+		 * copy would run once the client may have freed its memory.
+		 */
+		idxd_dma_complete_txd(desc, IDXD_COMPLETE_ABORT, true, NULL,
+				      NULL);
 	}
 
 	if (list_empty(&qlist))
@@ -1784,14 +1848,15 @@ void idxd_wq_quarantine_free(struct idxd_wq *wq, struct list_head *list)
 
 /*
  * A halt killed every descriptor the device held: the quarantined slots
- * are free, and the fence a failed drain raised can be lifted. Under
- * wq_lock, since an unbind racing the halt may free the pool.
+ * are free, and the fence a failed drain raised can be lifted. The halt
+ * flush calls this under wq_lock, since an unbind racing the halt may
+ * free the pool.
  */
 void idxd_wq_halt_release(struct idxd_wq *wq)
 {
 	LIST_HEAD(dead_descs);
 
-	guard(mutex)(&wq->wq_lock);
+	lockdep_assert_held(&wq->wq_lock);
 
 	if (wq->state != IDXD_WQ_ENABLED || wq->type != IDXD_WQT_KERNEL)
 		return;
@@ -1830,7 +1895,7 @@ void idxd_wq_free_irq(struct idxd_wq *wq)
 		return;
 
 	free_irq(ie->vector, ie);
-	idxd_flush_pending_descs(ie, false);
+	idxd_flush_pending_descs(ie, false, false);
 
 	/* FLR revokes every handle; the halt path marks them invalid. */
 	if (ie->int_handle == INVALID_INT_HANDLE)
@@ -1851,16 +1916,24 @@ void idxd_wq_free_irq(struct idxd_wq *wq)
 }
 
 /*
+ * @keep_callbacks: deliver the flushed descriptors' completions to the
+ * client, aborted, or with their hardware status where the device had
+ * already finished them. A client's own terminate_all must not get them
+ * (the dmaengine contract); a device halt with a client still holding the
+ * channel must, or the client waits for them forever. The interrupt
+ * thread delivers them, outside wq_lock.
  * @quarantine: the device keeps running, so the slots of the descriptors
  * it has not finished stay out of use until a drain covers them. A halt
  * has killed them and frees their slots at once.
+ * The caller holds wq_lock.
  */
-void idxd_wq_flush_descs(struct idxd_wq *wq, bool quarantine)
+void __idxd_wq_flush_descs(struct idxd_wq *wq, bool keep_callbacks,
+			   bool quarantine)
 {
 	struct idxd_irq_entry *ie = &wq->ie;
 	bool killed = false;
 
-	guard(mutex)(&wq->wq_lock);
+	lockdep_assert_held(&wq->wq_lock);
 
 	if (wq->state != IDXD_WQ_ENABLED || wq->type != IDXD_WQT_KERNEL)
 		return;
@@ -1871,17 +1944,20 @@ void idxd_wq_flush_descs(struct idxd_wq *wq, bool quarantine)
 	 * descriptor in the device, where the drain that frees the
 	 * quarantine covers it. A halt flush has done this itself.
 	 */
-	if (quarantine && !percpu_ref_is_dying(&wq->wq_active)) {
-		reinit_completion(&wq->wq_resurrect);
-		percpu_ref_kill(&wq->wq_active);
-		wait_for_completion(&wq->wq_dead);
-		killed = true;
-	}
-	idxd_flush_pending_descs(ie, quarantine);
+	if (quarantine)
+		killed = idxd_wq_kill(wq);
+	idxd_flush_pending_descs(ie, keep_callbacks, quarantine);
 	if (killed) {
 		percpu_ref_reinit(&wq->wq_active);
 		complete_all(&wq->wq_resurrect);
 	}
+}
+
+void idxd_wq_flush_descs(struct idxd_wq *wq, bool keep_callbacks,
+			 bool quarantine)
+{
+	guard(mutex)(&wq->wq_lock);
+	__idxd_wq_flush_descs(wq, keep_callbacks, quarantine);
 }
 
 int idxd_wq_request_irq(struct idxd_wq *wq)

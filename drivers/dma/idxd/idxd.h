@@ -248,6 +248,9 @@ struct idxd_wq {
 				 * time, so no slot is reused until a later
 				 * drain completes or a halt kills them
 				 */
+	u16 terminate_gen;	/* bumps on every terminate_all, under
+				 * wq_lock before its kill
+				 */
 	struct list_head quarantine;	/* descriptors a terminate_all took
 					 * off the lists while the device
 					 * still held them. Their slots, with
@@ -489,6 +492,9 @@ struct idxd_desc {
 	int id;
 	int cpu;
 	u16 gen;
+	u16 terminate_gen;	/* the queue's terminate_gen at an
+				 * interrupt-armed submit
+				 */
 	u32 epoch;		/* the device reset_epoch at submit */
 	struct idxd_wq *wq;
 	struct idxd_batch *batch;
@@ -803,6 +809,16 @@ void idxd_dma_complete_txd(struct idxd_desc *desc,
 			   enum idxd_complete_type comp_type,
 			   bool free_desc, void *ctx, u32 *status);
 
+/*
+ * Whether the queue's descriptors are dmaengine transactions. Another
+ * driver, such as iaa_crypto, keeps its own context where they keep
+ * their txd.
+ */
+static inline bool idxd_wq_has_txd(struct idxd_wq *wq)
+{
+	return wq->desc_complete == idxd_dma_complete_txd;
+}
+
 static inline void idxd_desc_complete(struct idxd_desc *desc,
 				      enum idxd_complete_type comp_type,
 				      bool free_desc)
@@ -812,8 +828,8 @@ static inline void idxd_desc_complete(struct idxd_desc *desc,
 	u32 status;
 
 	/*
-	 * Read once: the resubmit worker and the revoke's abort run without
-	 * wq_lock, unordered against the teardown that clears the copy.
+	 * Read once: the resubmit worker runs without wq_lock, unordered
+	 * against the teardown that clears the copy.
 	 */
 	complete = READ_ONCE(wq->desc_complete);
 	if (complete)
@@ -870,12 +886,16 @@ int idxd_wq_map_portal(struct idxd_wq *wq);
 void idxd_wq_unmap_portal(struct idxd_wq *wq);
 int idxd_wq_set_pasid(struct idxd_wq *wq, int pasid);
 int idxd_wq_disable_pasid(struct idxd_wq *wq);
+bool idxd_wq_kill(struct idxd_wq *wq);
 void __idxd_wq_quiesce(struct idxd_wq *wq);
 void idxd_wq_quiesce(struct idxd_wq *wq);
 int idxd_wq_init_percpu_ref(struct idxd_wq *wq);
 void idxd_wq_free_irq(struct idxd_wq *wq);
 int idxd_wq_request_irq(struct idxd_wq *wq);
-void idxd_wq_flush_descs(struct idxd_wq *wq, bool quarantine);
+void __idxd_wq_flush_descs(struct idxd_wq *wq, bool keep_callbacks,
+			   bool quarantine);
+void idxd_wq_flush_descs(struct idxd_wq *wq, bool keep_callbacks,
+			 bool quarantine);
 void idxd_wq_quarantine_take(struct idxd_wq *wq, struct list_head *list);
 void idxd_wq_quarantine_put_back(struct idxd_wq *wq, struct list_head *list);
 void idxd_wq_quarantine_free(struct idxd_wq *wq, struct list_head *list);
@@ -883,6 +903,7 @@ void idxd_wq_halt_release(struct idxd_wq *wq);
 
 /* submission */
 int idxd_submit_desc(struct idxd_wq *wq, struct idxd_desc *desc);
+int idxd_resubmit_desc(struct idxd_wq *wq, struct idxd_desc *desc);
 struct idxd_desc *idxd_alloc_desc(struct idxd_wq *wq, enum idxd_op_type optype);
 int idxd_enqcmds(struct idxd_wq *wq, void __iomem *portal, const void *desc);
 

@@ -115,6 +115,11 @@ static void idxd_abort_invalid_int_handle_descs(struct idxd_irq_entry *ie)
 	struct idxd_desc *d, *t;
 	struct llist_node *head;
 
+	/*
+	 * An unbind frees the descriptors and the allocator under
+	 * wq_lock, so they are completed under it as well.
+	 */
+	lockdep_assert_held(&ie_to_wq(ie)->wq_lock);
 	spin_lock(&ie->list_lock);
 	head = llist_del_all(&ie->pending_llist);
 	if (head) {
@@ -142,6 +147,7 @@ static void idxd_int_handle_revoke(struct work_struct *work)
 	struct pci_dev *pdev = idxd->pdev;
 	struct device *dev = &pdev->dev;
 	int i, new_handle, rc;
+	bool killed;
 
 	if (!idxd->request_int_handles) {
 		kfree(revoke);
@@ -166,15 +172,31 @@ static void idxd_int_handle_revoke(struct work_struct *work)
 			continue;
 
 		rc = idxd_device_request_int_handle(idxd, i, &new_handle, IDXD_IRQ_MSIX);
-		if (rc < 0) {
+		if (rc < 0)
 			dev_warn(dev, "get int handle %d failed: %d\n", i, rc);
+
+		/*
+		 * The request runs without wq_lock, so that a reset can end
+		 * it, and the queue may have been unbound meanwhile. An
+		 * unbind invalidates the handle in the same wq_lock hold
+		 * that unmaps the portal and frees the descriptors, so a
+		 * handle still valid under the lock means that the queue
+		 * still has its portal, its descriptors and its completion
+		 * handler. Everything below, the drain included, stays in
+		 * this hold.
+		 */
+		guard(mutex)(&wq->wq_lock);
+		if (ie->int_handle == INVALID_INT_HANDLE)
+			continue;
+
+		if (rc < 0) {
 			/*
 			 * Failed to acquire new interrupt handle. Kill the WQ
 			 * and release all the pending submitters. The submitters will
 			 * get error return code and handle appropriately.
 			 */
 			ie->int_handle = INVALID_INT_HANDLE;
-			idxd_wq_quiesce(wq);
+			__idxd_wq_quiesce(wq);
 			idxd_abort_invalid_int_handle_descs(ie);
 			continue;
 		}
@@ -193,21 +215,20 @@ static void idxd_int_handle_revoke(struct work_struct *work)
 			continue;
 		}
 
-		mutex_lock(&wq->wq_lock);
-		reinit_completion(&wq->wq_resurrect);
-
-		/* Kill percpu_ref to pause additional descriptor submissions */
-		percpu_ref_kill(&wq->wq_active);
-
-		/* Wait for all submitters quiesce before we change interrupt handle */
-		wait_for_completion(&wq->wq_dead);
+		/*
+		 * Kill percpu_ref to pause additional descriptor submissions
+		 * and wait for all submitters to quiesce before we change
+		 * the interrupt handle. A queue a halt already killed and did
+		 * not revive is left dead.
+		 */
+		killed = idxd_wq_kill(wq);
 
 		ie->int_handle = new_handle;
 
 		/* Revive percpu ref and wake up all the waiting submitters */
-		percpu_ref_reinit(&wq->wq_active);
+		if (killed)
+			percpu_ref_reinit(&wq->wq_active);
 		complete_all(&wq->wq_resurrect);
-		mutex_unlock(&wq->wq_lock);
 
 		/*
 		 * The delay here is to wait for all possible MOVDIR64B that
@@ -422,15 +443,74 @@ static void idxd_device_flr(struct work_struct *work)
 		dev_err(&idxd->pdev->dev, "FLR failed\n");
 }
 
-static void idxd_wqs_flush_descs(struct idxd_device *idxd)
+/*
+ * Complete what the halted engines will never finish, or a client waiting
+ * on one of those descriptors waits forever. The flush hands descriptors
+ * back, so no submitter may still own one: a submitter that passed the
+ * state check before the halt can hold a descriptor on the pending list
+ * while its ENQCMDS retries, and it aborts and frees that descriptor
+ * itself when the submit fails. Killing wq_active and waiting for the
+ * last submitter to drop its reference orders the flush after that.
+ * Each queue is handled in one hold of wq_lock, from the state check
+ * through the revive. A driver remove that quiesces the queue in one
+ * hold and disables it in another, as iaa_crypto's does, would otherwise
+ * find the reference dying between the kill and the revive, skip its
+ * own kill, and have the revive undo its quiesce before its disable
+ * frees the queue.
+ * @resurrect: revive the queues afterwards for a reset that keeps them.
+ */
+static void idxd_wqs_halt_flush(struct idxd_device *idxd, bool resurrect)
 {
+	bool killed;
 	int i;
 
 	for (i = 0; i < idxd->max_wqs; i++) {
 		struct idxd_wq *wq = idxd->wqs[i];
 
-		idxd_wq_flush_descs(wq, false);
+		mutex_lock(&wq->wq_lock);
+		if (wq->state != IDXD_WQ_ENABLED || wq->type != IDXD_WQT_KERNEL) {
+			mutex_unlock(&wq->wq_lock);
+			continue;
+		}
+		/*
+		 * A queue unbound with live clients is already quiesced
+		 * for good. Its descriptors died with the halt like any
+		 * other, but it is not resurrected for submitters.
+		 */
+		if (wq->deferred_unbind) {
+			__idxd_wq_flush_descs(wq, idxd_wq_refcount(wq) > 0,
+					      false);
+			idxd_wq_halt_release(wq);
+			mutex_unlock(&wq->wq_lock);
+			continue;
+		}
+		killed = idxd_wq_kill(wq);
+		__idxd_wq_flush_descs(wq, idxd_wq_refcount(wq) > 0, false);
 		idxd_wq_halt_release(wq);
+
+		if (resurrect) {
+			/*
+			 * Revive only what this flush killed, and only if no
+			 * failed interrupt handle revoke killed it for good,
+			 * which leaves the handle invalid. The unbind flag
+			 * checked above cannot change under the lock. The
+			 * state changes without it only to enabled, in the
+			 * reinit of an earlier halt, or on a queue that an FLR
+			 * recovery has unbound, whose reference reads as
+			 * dying, so this flush did not kill it. A reference
+			 * an earlier halt left dead stays dead, since that
+			 * halt's recovery unbinds the queue. The revive has
+			 * to stay in this hold: moved to the reinit, it would
+			 * reopen the window described above.
+			 */
+			if (killed && wq->ie.int_handle != INVALID_INT_HANDLE)
+				percpu_ref_reinit(&wq->wq_active);
+			complete_all(&wq->wq_resurrect);
+		} else {
+			/* Let blocked submitters retry and fail on the state. */
+			complete_all(&wq->wq_resurrect);
+		}
+		mutex_unlock(&wq->wq_lock);
 	}
 }
 
@@ -450,6 +530,8 @@ static irqreturn_t idxd_halt(struct idxd_device *idxd)
 		 */
 		WRITE_ONCE(idxd->reset_epoch, idxd->reset_epoch + 1);
 		if (gensts.reset_type == IDXD_DEVICE_RESET_SOFTWARE) {
+			/* The reinit below re-enables the queues, so revive them. */
+			idxd_wqs_halt_flush(idxd, true);
 			/*
 			 * If we need a software reset, we will throw the work
 			 * on a system workqueue in order to allow interrupts
@@ -468,7 +550,7 @@ static irqreturn_t idxd_halt(struct idxd_device *idxd)
 			 * device command; they are requested again when a work
 			 * queue is re-enabled after the reset.
 			 */
-			idxd_wqs_flush_descs(idxd);
+			idxd_wqs_halt_flush(idxd, false);
 			for (i = 0; i < idxd->max_wqs; i++) {
 				struct idxd_wq *wq = idxd->wqs[i];
 
@@ -482,7 +564,8 @@ static irqreturn_t idxd_halt(struct idxd_device *idxd)
 
 		} else {
 			idxd->state = IDXD_DEV_HALTED;
-			idxd_wqs_quiesce(idxd);
+			/* Same as above: nothing in flight will ever complete. */
+			idxd_wqs_halt_flush(idxd, false);
 			idxd_wqs_unmap_portal(idxd);
 			idxd_device_clear_state(idxd);
 			dev_err(&idxd->pdev->dev,
@@ -618,22 +701,27 @@ static void idxd_int_handle_resubmit_work(struct work_struct *work)
 	int rc;
 
 	desc->completion->status = 0;
-	rc = idxd_submit_desc(wq, desc);
+	rc = idxd_resubmit_desc(wq, desc);
 	if (rc < 0) {
 		dev_dbg(&wq->idxd->pdev->dev, "Failed to resubmit desc %d to wq %d.\n",
 			desc->id, wq->id);
 		/*
-		 * If the error is not -EAGAIN, it means the submission failed due to wq
-		 * has been killed instead of ENQCMDS failure. Here the driver needs to
-		 * notify the submitter of the failure by reporting abort status.
-		 *
-		 * -EAGAIN comes from ENQCMDS failure. idxd_submit_desc() will handle the
-		 * abort.
+		 * The submission failed because the device is not enabled,
+		 * because the wq has been killed or because ENQCMDS failed,
+		 * and in each case the descriptor is on no list. Here the
+		 * driver needs to notify the submitter of the failure by
+		 * reporting abort status. The submit has dropped its
+		 * wq_active reference by now, so a callback that submits or
+		 * terminates does not wait for it. A descriptor submitted
+		 * before a terminate_all, which cancels its resubmission,
+		 * gets no callback, since its client terminated it.
 		 */
-		if (rc != -EAGAIN) {
-			desc->completion->status = IDXD_COMP_DESC_ABORT;
-			idxd_desc_complete(desc, IDXD_COMPLETE_ABORT, false);
+		if (desc->terminate_gen != READ_ONCE(wq->terminate_gen)) {
+			desc->txd.callback = NULL;
+			desc->txd.callback_result = NULL;
 		}
+		desc->completion->status = IDXD_COMP_DESC_ABORT;
+		idxd_desc_complete(desc, IDXD_COMPLETE_ABORT, false);
 		idxd_free_desc(wq, desc);
 	}
 	kfree(irw);
@@ -659,31 +747,39 @@ static void irq_process_pending_llist(struct idxd_irq_entry *irq_entry)
 {
 	struct idxd_desc *desc, *t;
 	struct llist_node *head;
+	LIST_HEAD(flist);
 
-	head = llist_del_all(&irq_entry->pending_llist);
-	if (!head)
+	if (llist_empty(&irq_entry->pending_llist))
 		return;
 
+	/*
+	 * Sort under the list lock, as the submit abort does. A descriptor
+	 * still waiting on the hardware reaches the work list within the
+	 * same hold, so the abort of a failed submission, which searches
+	 * both lists under the lock, always finds its own descriptor.
+	 */
+	spin_lock(&irq_entry->list_lock);
+	head = llist_del_all(&irq_entry->pending_llist);
 	llist_for_each_entry_safe(desc, t, head, llnode) {
 		u8 status = desc->completion->status & DSA_COMP_STATUS_MASK;
 
-		if (status) {
-			/*
-			 * Check against the original status as ABORT is software defined
-			 * and 0xff, which DSA_COMP_STATUS_MASK can mask out.
-			 */
-			if (unlikely(desc->completion->status == IDXD_COMP_DESC_ABORT)) {
-				idxd_desc_complete(desc, IDXD_COMPLETE_ABORT, true);
-				continue;
-			}
+		if (status)
+			list_add_tail(&desc->list, &flist);
+		else
+			list_add_tail(&desc->list, &irq_entry->work_list);
+	}
+	spin_unlock(&irq_entry->list_lock);
 
+	list_for_each_entry_safe(desc, t, &flist, list) {
+		list_del(&desc->list);
+		/*
+		 * Check against the original status as ABORT is software
+		 * defined and 0xff, which DSA_COMP_STATUS_MASK can mask out.
+		 */
+		if (unlikely(desc->completion->status == IDXD_COMP_DESC_ABORT))
+			idxd_desc_complete(desc, IDXD_COMPLETE_ABORT, true);
+		else
 			idxd_desc_complete(desc, IDXD_COMPLETE_NORMAL, true);
-		} else {
-			spin_lock(&irq_entry->list_lock);
-			list_add_tail(&desc->list,
-				      &irq_entry->work_list);
-			spin_unlock(&irq_entry->list_lock);
-		}
 	}
 }
 
@@ -735,18 +831,19 @@ irqreturn_t idxd_wq_thread(int irq, void *data)
 	 * submmiter adds all the submitted descriptor after sending it to
 	 * the workqueue. It's a lockless singly linked list. The work_list
 	 * is the common linux double linked list. We are in a scenario of
-	 * multiple producers and a single consumer. The producers are all
-	 * the kernel submitters of descriptors, and the consumer is the
-	 * kernel irq handler thread for the msix vector when using threaded
-	 * irq. To work with the restrictions of llist to remain lockless,
-	 * we are doing the following steps:
+	 * multiple producers and several consumers. The producers are all
+	 * the kernel submitters of descriptors, and they add to the llist
+	 * without a lock. The consumers are the kernel irq handler thread
+	 * for the msix vector when using threaded irq, the abort of a
+	 * failed submission, the interrupt handle abort and the flushes,
+	 * and each empties the llist under the list lock. The thread does
+	 * so in these steps:
 	 * 1. Iterate through the work_list and process any completed
 	 *    descriptor. Delete the completed entries during iteration.
-	 * 2. llist_del_all() from the pending list.
-	 * 3. Iterate through the llist that was deleted from the pending list
-	 *    and process the completed entries.
-	 * 4. If the entry is still waiting on hardware, list_add_tail() to
-	 *    the work_list.
+	 * 2. Under the list lock, llist_del_all() from the pending list and
+	 *    move each entry still waiting on hardware to the work_list and
+	 *    each completed one to a private list.
+	 * 3. Process the entries of the private list outside the lock.
 	 */
 	irq_process_work_list(irq_entry);
 	irq_process_pending_llist(irq_entry);

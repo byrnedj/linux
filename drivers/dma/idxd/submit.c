@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Copyright(c) 2019 Intel Corporation. All rights rsvd. */
 #include <linux/init.h>
+#include <linux/interrupt.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/pci.h>
@@ -69,6 +70,21 @@ struct idxd_desc *idxd_alloc_desc(struct idxd_wq *wq, enum idxd_op_type optype)
 		return get_desc_live(wq, idx, cpu);
 	}
 
+	/*
+	 * A dying reference whose resurrect has completed belongs to a
+	 * queue quiesced for good: no kill in progress will revive it, and
+	 * every submission fails. Waiting for a slot there gains nothing
+	 * and may never end. The teardown flush and the interrupt thread
+	 * free the slot of each descriptor they complete only when its
+	 * completion returns, and iaa_crypto's verify of a compression
+	 * allocates from inside one. The two reads are not atomic, so an
+	 * allocation that races a revive can fail like a request the kill
+	 * caught.
+	 */
+	if (data_race(percpu_ref_is_dying(&wq->wq_active)) &&
+	    completion_done(&wq->wq_resurrect))
+		return ERR_PTR(-ENXIO);
+
 	ws = &sbq->ws[0];
 	for (;;) {
 		sbitmap_prepare_to_wait(sbq, ws, &wait, TASK_INTERRUPTIBLE);
@@ -110,23 +126,16 @@ static struct idxd_desc *list_abort_desc(struct idxd_wq *wq, struct idxd_irq_ent
 		}
 	}
 
-	/*
-	 * At this point, the desc needs to be aborted is held by the completion
-	 * handler where it has taken it off the pending list but has not added to the
-	 * work list. It will be cleaned up by the interrupt handler when it sees the
-	 * IDXD_COMP_DESC_ABORT for completion status.
-	 */
 	return NULL;
 }
 
 static void llist_abort_desc(struct idxd_wq *wq, struct idxd_irq_entry *ie,
-			     struct idxd_desc *desc)
+			     struct idxd_desc *desc, bool submitter_cleans)
 {
 	struct idxd_desc *d, *t, *found = NULL;
 	struct llist_node *head;
-	LIST_HEAD(flist);
+	bool wake = false;
 
-	desc->completion->status = IDXD_COMP_DESC_ABORT;
 	/*
 	 * Grab the list lock so it will block the irq thread handler. This allows the
 	 * abort code to locate the descriptor need to be aborted.
@@ -140,10 +149,19 @@ static void llist_abort_desc(struct idxd_wq *wq, struct idxd_irq_entry *ie,
 				continue;
 			}
 
+			/*
+			 * A completion runs a client's callback or another
+			 * driver's handler, and either may submit or terminate
+			 * and so wait for a killer, which waits for this
+			 * submitter's wq_active reference. iaa_crypto's verify
+			 * of a compression may also wait for a free descriptor
+			 * while this submitter holds one. A finished
+			 * descriptor therefore goes on the work list for the
+			 * interrupt thread, as one still in flight does.
+			 */
 			if (d->completion->status)
-				list_add_tail(&d->list, &flist);
-			else
-				list_add_tail(&d->list, &ie->work_list);
+				wake = true;
+			list_add_tail(&d->list, &ie->work_list);
 		}
 	}
 
@@ -151,19 +169,45 @@ static void llist_abort_desc(struct idxd_wq *wq, struct idxd_irq_entry *ie,
 		found = list_abort_desc(wq, ie, desc);
 	spin_unlock(&ie->list_lock);
 
-	if (found)
-		idxd_dma_complete_txd(found, IDXD_COMPLETE_ABORT, false,
-				      NULL, NULL);
+	/*
+	 * Their interrupts may have run the thread before they reached the
+	 * work list, so it is woken again.
+	 */
+	if (wake)
+		irq_wake_thread(ie->vector, ie);
 
 	/*
-	 * completing the descriptor will return desc to allocator and
-	 * the desc can be acquired by a different process and the
-	 * desc->list can be modified.  Delete desc from list so the
-	 * list traversing does not get corrupted by the other process.
+	 * The device never took the descriptor, so its record is still
+	 * clear. While this submitter holds wq_active, only the interrupt
+	 * thread and another submitter's abort may take descriptors off
+	 * the lists, and both sort them under the list lock and leave one
+	 * with a clear record on a list. A flush takes them all, so every
+	 * flusher must kill wq_active and wait for this reference before
+	 * it takes the lists, and nothing may revive the reference before
+	 * the flush runs. The error path of iaa_crypto_probe() breaks the
+	 * rule: it disables a queue it has already published without a
+	 * quiesce. Otherwise the search finds the descriptor, and once off
+	 * the lists it is the submitter's alone. Marking it aborted before
+	 * that would let another context that saw the mark on a list
+	 * complete and free it, and the caller frees it as well.
 	 */
-	list_for_each_entry_safe(d, t, &flist, list) {
-		list_del_init(&d->list);
-		idxd_dma_complete_txd(d, IDXD_COMPLETE_ABORT, true,
+	WARN_ON_ONCE(!found);
+	/*
+	 * When the failing submission is a client's tx_submit(), the
+	 * client learns of it from the return value and owns the cleanup,
+	 * and a callback on top of that would complete the descriptor
+	 * twice. A dmaengine descriptor then only has its cookie completed
+	 * and its unmap data released here, with the callbacks stripped.
+	 * Nothing reads its record before the caller frees it, so it is
+	 * not marked. An internal resubmission reports the abort through
+	 * the callback, which its worker runs once the submit has dropped
+	 * its reference. Another driver's submitter cleans up all of its
+	 * own, and only dmaengine descriptors are resubmitted.
+	 */
+	if (found && submitter_cleans && idxd_wq_has_txd(wq)) {
+		desc->txd.callback = NULL;
+		desc->txd.callback_result = NULL;
+		idxd_dma_complete_txd(desc, IDXD_COMPLETE_ABORT, false,
 				      NULL, NULL);
 	}
 }
@@ -192,7 +236,8 @@ int idxd_enqcmds(struct idxd_wq *wq, void __iomem *portal, const void *desc)
 	return rc;
 }
 
-int idxd_submit_desc(struct idxd_wq *wq, struct idxd_desc *desc)
+static int __idxd_submit_desc(struct idxd_wq *wq, struct idxd_desc *desc,
+			      bool submitter_cleans)
 {
 	struct idxd_device *idxd = wq->idxd;
 	struct idxd_irq_entry *ie = NULL;
@@ -209,6 +254,35 @@ int idxd_submit_desc(struct idxd_wq *wq, struct idxd_desc *desc)
 			return -ENXIO;
 	}
 
+	/*
+	 * A software-reset halt revives wq_active before its reinit enables
+	 * the device again. A submitter that passed the check above before
+	 * the halt and got its reference after the revive would post to the
+	 * halted device, which drops the descriptor, and nothing would
+	 * complete an interrupt-armed one. The halt stores the state before
+	 * its kill and revives the reference after the wait. The barrier
+	 * pairs with the release in percpu_ref_reinit() and orders this
+	 * read after the tryget that saw the revive.
+	 */
+	smp_rmb();
+	if (idxd->state != IDXD_DEV_ENABLED) {
+		percpu_ref_put(&wq->wq_active);
+		return -EIO;
+	}
+	/*
+	 * A resubmission of a descriptor first submitted before a
+	 * terminate_all is cancelled. The terminate bumps the generation
+	 * before its kill, so the barrier above orders this read too. A
+	 * resubmission that read the old one is on the pending list when
+	 * the terminate's flush runs, since the kill waits for it, or has
+	 * failed with its stamp unchanged.
+	 */
+	if (!submitter_cleans &&
+	    desc->terminate_gen != READ_ONCE(wq->terminate_gen)) {
+		percpu_ref_put(&wq->wq_active);
+		return -ECANCELED;
+	}
+
 	portal = idxd_wq_portal_addr(wq);
 
 	/*
@@ -218,6 +292,12 @@ int idxd_submit_desc(struct idxd_wq *wq, struct idxd_desc *desc)
 	if (desc_flags & IDXD_OP_FLAG_RCI) {
 		ie = &wq->ie;
 		desc->hw->int_handle = ie->int_handle;
+		/*
+		 * A resubmission keeps the stamp of the client's submit, so
+		 * the resubmit work sees every terminate since then.
+		 */
+		if (submitter_cleans)
+			desc->terminate_gen = READ_ONCE(wq->terminate_gen);
 		llist_add(&desc->llnode, &ie->pending_llist);
 	}
 
@@ -233,10 +313,18 @@ int idxd_submit_desc(struct idxd_wq *wq, struct idxd_desc *desc)
 	} else {
 		rc = idxd_enqcmds(wq, portal, desc->hw);
 		if (rc < 0) {
-			percpu_ref_put(&wq->wq_active);
-			/* abort operation frees the descriptor */
+			/*
+			 * Abort before dropping the reference: a halt flush
+			 * waits for wq_active to die before it takes the
+			 * pending descriptors, and this one must not still be
+			 * listed when it does. The abort takes the descriptor
+			 * off the lists and runs no callback, which could wait
+			 * for this reference to die. The caller completes or
+			 * frees the descriptor.
+			 */
 			if (ie)
-				llist_abort_desc(wq, ie, desc);
+				llist_abort_desc(wq, ie, desc, submitter_cleans);
+			percpu_ref_put(&wq->wq_active);
 			return rc;
 		}
 	}
@@ -244,4 +332,15 @@ int idxd_submit_desc(struct idxd_wq *wq, struct idxd_desc *desc)
 	percpu_ref_put(&wq->wq_active);
 	return 0;
 }
+/* A client submission: on failure the return value is the notification. */
+int idxd_submit_desc(struct idxd_wq *wq, struct idxd_desc *desc)
+{
+	return __idxd_submit_desc(wq, desc, true);
+}
 EXPORT_SYMBOL_NS_GPL(idxd_submit_desc, "IDXD");
+
+/* The driver's own resubmission: a failure must still call the client back. */
+int idxd_resubmit_desc(struct idxd_wq *wq, struct idxd_desc *desc)
+{
+	return __idxd_submit_desc(wq, desc, false);
+}
