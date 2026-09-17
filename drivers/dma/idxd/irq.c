@@ -417,14 +417,54 @@ static void idxd_device_flr(struct work_struct *work)
 		dev_err(&idxd->pdev->dev, "FLR failed\n");
 }
 
-static void idxd_wqs_flush_descs(struct idxd_device *idxd)
+/*
+ * Complete what the halted engines will never finish, or a client waiting
+ * on one of those descriptors waits forever. The flush hands descriptors
+ * back, so no submitter may still own one: a submitter that passed the
+ * state check before the halt can hold a descriptor on the pending list
+ * while its ENQCMDS retries, and it aborts and frees that descriptor
+ * itself when the submit fails. Killing wq_active and waiting for the
+ * last submitter to drop its reference orders the flush after that.
+ * @resurrect: revive the queues afterwards for a reset that keeps them.
+ */
+static void idxd_wqs_halt_flush(struct idxd_device *idxd, bool resurrect)
 {
 	int i;
 
 	for (i = 0; i < idxd->max_wqs; i++) {
 		struct idxd_wq *wq = idxd->wqs[i];
 
-		idxd_wq_flush_descs(wq);
+		mutex_lock(&wq->wq_lock);
+		if (wq->state != IDXD_WQ_ENABLED || wq->type != IDXD_WQT_KERNEL) {
+			mutex_unlock(&wq->wq_lock);
+			continue;
+		}
+		/*
+		 * A queue unbound with live clients is already quiesced
+		 * for good. Its descriptors died with the halt like any
+		 * other, but it is not resurrected for submitters.
+		 */
+		if (wq->deferred_unbind) {
+			mutex_unlock(&wq->wq_lock);
+			idxd_wq_flush_descs(wq, idxd_wq_refcount(wq) > 0);
+			continue;
+		}
+		reinit_completion(&wq->wq_resurrect);
+		percpu_ref_kill(&wq->wq_active);
+		wait_for_completion(&wq->wq_dead);
+		mutex_unlock(&wq->wq_lock);
+
+		idxd_wq_flush_descs(wq, idxd_wq_refcount(wq) > 0);
+
+		if (resurrect) {
+			mutex_lock(&wq->wq_lock);
+			percpu_ref_reinit(&wq->wq_active);
+			complete_all(&wq->wq_resurrect);
+			mutex_unlock(&wq->wq_lock);
+		} else {
+			/* Let blocked submitters retry and fail on the state. */
+			complete_all(&wq->wq_resurrect);
+		}
 	}
 }
 
@@ -444,6 +484,8 @@ static irqreturn_t idxd_halt(struct idxd_device *idxd)
 		 */
 		WRITE_ONCE(idxd->reset_epoch, idxd->reset_epoch + 1);
 		if (gensts.reset_type == IDXD_DEVICE_RESET_SOFTWARE) {
+			/* The reinit below re-enables the queues, so revive them. */
+			idxd_wqs_halt_flush(idxd, true);
 			/*
 			 * If we need a software reset, we will throw the work
 			 * on a system workqueue in order to allow interrupts
@@ -452,13 +494,23 @@ static irqreturn_t idxd_halt(struct idxd_device *idxd)
 			INIT_WORK(&idxd->work, idxd_device_reinit);
 			queue_work(idxd->wq, &idxd->work);
 		} else if (gensts.reset_type == IDXD_DEVICE_RESET_FLR) {
+			int i;
+
 			idxd->state = IDXD_DEV_HALTED;
 			idxd_mask_error_interrupts(idxd);
-			/* Flush all pending descriptors, and disable
-			 * interrupts, they will be re-enabled when FLR
-			 * concludes.
+			/*
+			 * Flush all pending descriptors. The FLR revokes every
+			 * interrupt handle, so mark them invalid here without a
+			 * device command; they are requested again when a work
+			 * queue is re-enabled after the reset.
 			 */
-			idxd_wqs_flush_descs(idxd);
+			idxd_wqs_halt_flush(idxd, false);
+			for (i = 0; i < idxd->max_wqs; i++) {
+				struct idxd_wq *wq = idxd->wqs[i];
+
+				if (wq->type == IDXD_WQT_KERNEL)
+					WRITE_ONCE(wq->ie.int_handle, INVALID_INT_HANDLE);
+			}
 			dev_dbg(&idxd->pdev->dev,
 				"idxd halted, doing FLR. After FLR, configs are restored\n");
 			INIT_WORK(&idxd->work, idxd_device_flr);
@@ -466,7 +518,8 @@ static irqreturn_t idxd_halt(struct idxd_device *idxd)
 
 		} else {
 			idxd->state = IDXD_DEV_HALTED;
-			idxd_wqs_quiesce(idxd);
+			/* Same as above: nothing in flight will ever complete. */
+			idxd_wqs_halt_flush(idxd, false);
 			idxd_wqs_unmap_portal(idxd);
 			idxd_device_clear_state(idxd);
 			dev_err(&idxd->pdev->dev,
@@ -602,7 +655,7 @@ static void idxd_int_handle_resubmit_work(struct work_struct *work)
 	int rc;
 
 	desc->completion->status = 0;
-	rc = idxd_submit_desc(wq, desc);
+	rc = idxd_resubmit_desc(wq, desc);
 	if (rc < 0) {
 		dev_dbg(&wq->idxd->pdev->dev, "Failed to resubmit desc %d to wq %d.\n",
 			desc->id, wq->id);

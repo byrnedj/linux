@@ -58,6 +58,8 @@ void idxd_dma_complete_txd(struct idxd_desc *desc,
 	}
 
 	tx = &desc->txd;
+	/* Status was read above; pairs with the callback strip before an abort status store. */
+	smp_rmb();
 	if (complete && tx->cookie) {
 		dma_cookie_complete(tx);
 		dma_descriptor_unmap(tx);
@@ -556,7 +558,7 @@ static int idxd_dma_terminate_all(struct dma_chan *c)
 	 */
 	if (READ_ONCE(wq->dead))
 		return 0;
-	idxd_wq_flush_descs(wq);
+	idxd_wq_flush_descs(wq, false);
 
 	return 0;
 }
