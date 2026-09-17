@@ -98,12 +98,26 @@ static struct idxd_desc *list_abort_desc(struct idxd_wq *wq, struct idxd_irq_ent
 }
 
 static void llist_abort_desc(struct idxd_wq *wq, struct idxd_irq_entry *ie,
-			     struct idxd_desc *desc)
+			     struct idxd_desc *desc, bool submitter_cleans)
 {
 	struct idxd_desc *d, *t, *found = NULL;
 	struct llist_node *head;
 	LIST_HEAD(flist);
 
+	/*
+	 * When the failing submission is a client's tx_submit(), the client
+	 * learns of it from the return value and owns the cleanup; a
+	 * callback on top of that would complete the descriptor twice.
+	 * Strip the callbacks before the status store that lets the irq
+	 * thread complete it. An internal resubmission has no such return
+	 * path: its abort must reach the client through the callback.
+	 */
+	if (submitter_cleans) {
+		desc->txd.callback = NULL;
+		desc->txd.callback_result = NULL;
+		/* Publish the strip before the status store below. */
+		smp_wmb();
+	}
 	desc->completion->status = IDXD_COMP_DESC_ABORT;
 	/*
 	 * Grab the list lock so it will block the irq thread handler. This allows the
@@ -170,7 +184,8 @@ int idxd_enqcmds(struct idxd_wq *wq, void __iomem *portal, const void *desc)
 	return rc;
 }
 
-int idxd_submit_desc(struct idxd_wq *wq, struct idxd_desc *desc)
+static int __idxd_submit_desc(struct idxd_wq *wq, struct idxd_desc *desc,
+			      bool submitter_cleans)
 {
 	struct idxd_device *idxd = wq->idxd;
 	struct idxd_irq_entry *ie = NULL;
@@ -214,7 +229,7 @@ int idxd_submit_desc(struct idxd_wq *wq, struct idxd_desc *desc)
 			percpu_ref_put(&wq->wq_active);
 			/* abort operation frees the descriptor */
 			if (ie)
-				llist_abort_desc(wq, ie, desc);
+				llist_abort_desc(wq, ie, desc, submitter_cleans);
 			return rc;
 		}
 	}
@@ -222,4 +237,15 @@ int idxd_submit_desc(struct idxd_wq *wq, struct idxd_desc *desc)
 	percpu_ref_put(&wq->wq_active);
 	return 0;
 }
+/* A client submission: on failure the return value is the notification. */
+int idxd_submit_desc(struct idxd_wq *wq, struct idxd_desc *desc)
+{
+	return __idxd_submit_desc(wq, desc, true);
+}
 EXPORT_SYMBOL_NS_GPL(idxd_submit_desc, "IDXD");
+
+/* The driver's own resubmission: a failure must still call the client back. */
+int idxd_resubmit_desc(struct idxd_wq *wq, struct idxd_desc *desc)
+{
+	return __idxd_submit_desc(wq, desc, false);
+}

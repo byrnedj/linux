@@ -419,7 +419,7 @@ static void idxd_wqs_flush_descs(struct idxd_device *idxd)
 	for (i = 0; i < idxd->max_wqs; i++) {
 		struct idxd_wq *wq = idxd->wqs[i];
 
-		idxd_wq_flush_descs(wq);
+		idxd_wq_flush_descs(wq, idxd_wq_refcount(wq) > 0);
 	}
 }
 
@@ -431,6 +431,12 @@ static irqreturn_t idxd_halt(struct idxd_device *idxd)
 	if (gensts.state == IDXD_DEVICE_STATE_HALT) {
 		idxd->state = IDXD_DEV_HALTED;
 		if (gensts.reset_type == IDXD_DEVICE_RESET_SOFTWARE) {
+			/*
+			 * Complete what the engines will never finish, as
+			 * the FLR path does: a client waiting on a
+			 * descriptor that is silently dropped waits forever.
+			 */
+			idxd_wqs_flush_descs(idxd);
 			/*
 			 * If we need a software reset, we will throw the work
 			 * on a system workqueue in order to allow interrupts
@@ -453,6 +459,8 @@ static irqreturn_t idxd_halt(struct idxd_device *idxd)
 
 		} else {
 			idxd->state = IDXD_DEV_HALTED;
+			/* Same as above: nothing in flight will ever complete. */
+			idxd_wqs_flush_descs(idxd);
 			idxd_wqs_quiesce(idxd);
 			idxd_wqs_unmap_portal(idxd);
 			idxd_device_clear_state(idxd);
@@ -579,7 +587,7 @@ static void idxd_int_handle_resubmit_work(struct work_struct *work)
 	int rc;
 
 	desc->completion->status = 0;
-	rc = idxd_submit_desc(wq, desc);
+	rc = idxd_resubmit_desc(wq, desc);
 	if (rc < 0) {
 		dev_dbg(&wq->idxd->pdev->dev, "Failed to resubmit desc %d to wq %d.\n",
 			desc->id, wq->id);

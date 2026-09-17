@@ -1374,7 +1374,8 @@ int idxd_device_load_config(struct idxd_device *idxd)
 	return 0;
 }
 
-static void idxd_flush_pending_descs(struct idxd_irq_entry *ie)
+static void idxd_flush_pending_descs(struct idxd_irq_entry *ie,
+				     bool keep_callbacks)
 {
 	struct idxd_desc *desc, *itr;
 	struct llist_node *head;
@@ -1399,13 +1400,17 @@ static void idxd_flush_pending_descs(struct idxd_irq_entry *ie)
 		ctype = desc->completion->status ? IDXD_COMPLETE_NORMAL : IDXD_COMPLETE_ABORT;
 		/*
 		 * wq is being disabled. Any remaining descriptors are
-		 * likely to be stuck and can be dropped. callback could
-		 * point to code that is no longer accessible, for example
-		 * if dmatest module has been unloaded.
+		 * likely to be stuck and can be dropped. With no client
+		 * left the callback could point to code that is no longer
+		 * accessible (dmatest unloaded), so it is stripped; with a
+		 * client still holding the channel it must be delivered,
+		 * or that client waits for the completion forever.
 		 */
 		tx = &desc->txd;
-		tx->callback = NULL;
-		tx->callback_result = NULL;
+		if (!keep_callbacks) {
+			tx->callback = NULL;
+			tx->callback_result = NULL;
+		}
 		idxd_dma_complete_txd(desc, ctype, true, NULL, NULL);
 	}
 }
@@ -1439,7 +1444,7 @@ void idxd_wq_free_irq(struct idxd_wq *wq)
 		return;
 
 	free_irq(ie->vector, ie);
-	idxd_flush_pending_descs(ie);
+	idxd_flush_pending_descs(ie, false);
 
 	/* The interrupt might have been already released by FLR */
 	if (ie->int_handle == INVALID_INT_HANDLE)
@@ -1453,7 +1458,13 @@ void idxd_wq_free_irq(struct idxd_wq *wq)
 	ie->pasid = IOMMU_PASID_INVALID;
 }
 
-void idxd_wq_flush_descs(struct idxd_wq *wq)
+/*
+ * @keep_callbacks: deliver the flushed descriptors' completions (as
+ * aborted) to the client. A client's own terminate_all must not get them
+ * (the dmaengine contract); a device halt with a client still holding the
+ * channel must, or the client waits for them forever.
+ */
+void idxd_wq_flush_descs(struct idxd_wq *wq, bool keep_callbacks)
 {
 	struct idxd_irq_entry *ie = &wq->ie;
 
@@ -1462,7 +1473,7 @@ void idxd_wq_flush_descs(struct idxd_wq *wq)
 	if (wq->state != IDXD_WQ_ENABLED || wq->type != IDXD_WQT_KERNEL)
 		return;
 
-	idxd_flush_pending_descs(ie);
+	idxd_flush_pending_descs(ie, keep_callbacks);
 }
 
 int idxd_wq_request_irq(struct idxd_wq *wq)
