@@ -41,6 +41,7 @@ enum {
 	dma_debug_coherent,
 	dma_debug_noncoherent,
 	dma_debug_phy,
+	dma_debug_iova,
 };
 
 enum map_err_types {
@@ -146,6 +147,7 @@ static const char *type2name[] = {
 	[dma_debug_coherent] = "coherent",
 	[dma_debug_noncoherent] = "noncoherent",
 	[dma_debug_phy] = "phy",
+	[dma_debug_iova] = "iova",
 };
 
 static const char *dir2name[] = {
@@ -493,6 +495,12 @@ static int active_cacheline_insert(struct dma_debug_entry *entry,
 	if (entry->direction == DMA_TO_DEVICE)
 		return 0;
 
+	/* An IOVA range has no CPU address, so it covers no cachelines.
+	 * Every range would otherwise count as an overlap of cacheline 0.
+	 */
+	if (entry->type == dma_debug_iova)
+		return 0;
+
 	spin_lock_irqsave(&radix_lock, flags);
 	rc = radix_tree_insert(&dma_active_cacheline, cln, entry);
 	if (rc == -EEXIST) {
@@ -519,7 +527,8 @@ static void active_cacheline_remove(struct dma_debug_entry *entry)
 	unsigned long flags;
 
 	/* ...mirror the insert case */
-	if (entry->direction == DMA_TO_DEVICE)
+	if (entry->direction == DMA_TO_DEVICE ||
+	    entry->type == dma_debug_iova)
 		return;
 
 	spin_lock_irqsave(&radix_lock, flags);
@@ -1347,6 +1356,54 @@ void debug_dma_unmap_phys(struct device *dev, dma_addr_t dma_addr, size_t size,
 		.size           = size,
 		.direction      = direction,
 		.attrs          = attrs,
+	};
+
+	if (unlikely(dma_debug_disabled()))
+		return;
+	check_unmap(&ref);
+}
+
+/*
+ * A range allocated with dma_iova_try_alloc() and filled with
+ * dma_iova_link(). The links are page-table operations with no debug
+ * entry of their own, so the range is tracked as one allocation: a sync
+ * against any address inside it is legitimate while it stands, and the
+ * direction, which is per link, is not checked. The range shares no
+ * cache lines with anything, so the cache-line overlap check is skipped.
+ */
+void debug_dma_alloc_iova(struct device *dev, dma_addr_t dma_addr,
+			  size_t size)
+{
+	struct dma_debug_entry *entry;
+
+	if (unlikely(dma_debug_disabled()))
+		return;
+
+	entry = dma_entry_alloc();
+	if (!entry)
+		return;
+
+	entry->dev       = dev;
+	entry->type      = dma_debug_iova;
+	entry->paddr     = 0;
+	entry->dev_addr  = dma_addr;
+	entry->size      = size;
+	entry->direction = DMA_BIDIRECTIONAL;
+	entry->map_err_type = MAP_ERR_CHECK_NOT_APPLICABLE;
+	entry->attrs     = DMA_ATTR_SKIP_CPU_SYNC;
+
+	add_dma_entry(entry);
+}
+
+void debug_dma_free_iova(struct device *dev, dma_addr_t dma_addr, size_t size)
+{
+	struct dma_debug_entry ref = {
+		.type           = dma_debug_iova,
+		.dev            = dev,
+		.dev_addr       = dma_addr,
+		.size           = size,
+		.direction      = DMA_BIDIRECTIONAL,
+		.attrs          = DMA_ATTR_SKIP_CPU_SYNC,
 	};
 
 	if (unlikely(dma_debug_disabled()))
