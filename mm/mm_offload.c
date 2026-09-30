@@ -3,7 +3,7 @@
 #include <linux/jump_label.h>
 #include <linux/kstrtox.h>
 #include <linux/migrate.h>
-#include <linux/migrate_copy_offload.h>
+#include <linux/mm_offload.h>
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/slab.h>
@@ -12,29 +12,29 @@
 #include <linux/string.h>
 #include <linux/sysfs.h>
 
-DEFINE_STATIC_KEY_FALSE(migrate_offload_enabled);
-DEFINE_SRCU(migrate_offload_srcu);
-DEFINE_STATIC_CALL(migrate_offload_batch_copy_fn, migrate_folios_mc_copy);
+DEFINE_STATIC_KEY_FALSE(mm_offload_copy_folios_enabled);
+DEFINE_SRCU(mm_offload_srcu);
+DEFINE_STATIC_CALL(mm_offload_copy_folios_fn, migrate_folios_mc_copy);
 
-static DEFINE_MUTEX(migrator_mutex);
-static const struct migrator *active_migrator;
+static DEFINE_MUTEX(provider_mutex);
+static const struct mm_offload_provider *active_provider;
 
 /*
- * The active migrator's reason mask. This is the single source of truth
+ * The active provider's migration reason mask. This is the single source of truth
  * for which reasons are offloaded.
  */
 static unsigned long active_reason_mask;
 
 bool migrate_should_offload(int reason)
 {
-	if (!static_branch_unlikely(&migrate_offload_enabled))
+	if (!static_branch_unlikely(&mm_offload_copy_folios_enabled))
 		return false;
 
 	return READ_ONCE(active_reason_mask) & BIT(reason);
 }
 
 /**
- * migrate_offload_reason_mask_parse - parse migration reason mask.
+ * mm_offload_reason_mask_parse - parse migration reason mask.
  * @buf: input string, either a number (hex/decimal, e.g. "0x101") or a
  *	comma-separated list of reason names (see migrate_reason_names[]),
  *	e.g. "compaction,demotion". The tokens "all" and "none" select
@@ -43,7 +43,7 @@ bool migrate_should_offload(int reason)
  *
  * Return: 0 on success, -EINVAL on an unknown name, -ENOMEM on OOM.
  */
-int migrate_offload_reason_mask_parse(const char *buf, unsigned long *maskp)
+int mm_offload_reason_mask_parse(const char *buf, unsigned long *maskp)
 {
 	unsigned long mask;
 	char *copy, *p, *tok;
@@ -87,10 +87,10 @@ done:
 	*maskp = mask & MIGRATE_OFFLOAD_REASONS_ALLOWED;
 	return 0;
 }
-EXPORT_SYMBOL_GPL(migrate_offload_reason_mask_parse);
+EXPORT_SYMBOL_GPL(mm_offload_reason_mask_parse);
 
 /**
- * migrate_offload_reason_mask_format - render a reason mask as names.
+ * mm_offload_reason_mask_format - render a reason mask as names.
  * @buf: output buffer from kernel_param_ops get.
  * @mask: reason mask to render.
  *
@@ -98,7 +98,7 @@ EXPORT_SYMBOL_GPL(migrate_offload_reason_mask_parse);
  *
  * Return: number of bytes written to @buf.
  */
-int migrate_offload_reason_mask_format(char *buf, unsigned long mask)
+int mm_offload_reason_mask_format(char *buf, unsigned long mask)
 {
 	int len = 0, i;
 
@@ -111,10 +111,10 @@ int migrate_offload_reason_mask_format(char *buf, unsigned long mask)
 	len += sysfs_emit_at(buf, len, "\n");
 	return len;
 }
-EXPORT_SYMBOL_GPL(migrate_offload_reason_mask_format);
+EXPORT_SYMBOL_GPL(mm_offload_reason_mask_format);
 
 /*
- * Hand the batch to the registered migrator. The migrator may decline
+ * Hand the batch to the registered provider. The provider may decline
  * (typically based on batch size), in which case the move phase falls
  * back to per-folio CPU copy.
  */
@@ -123,90 +123,91 @@ int migrate_offload_batch_copy(struct list_head *dst_batch,
 {
 	int idx, rc;
 
-	idx = srcu_read_lock(&migrate_offload_srcu);
-	rc = static_call(migrate_offload_batch_copy_fn)(dst_batch, src_batch, nr_batch);
-	srcu_read_unlock(&migrate_offload_srcu, idx);
+	idx = srcu_read_lock(&mm_offload_srcu);
+	rc = static_call(mm_offload_copy_folios_fn)(dst_batch, src_batch, nr_batch);
+	srcu_read_unlock(&mm_offload_srcu, idx);
 	return rc;
 }
 
 /**
- * migrate_offload_set_reason_mask - update the active migrator's reason mask.
- * @m: migrator (must be the currently active one).
+ * mm_offload_set_migrate_reason_mask - update the active provider's migration reason mask.
+ * @p: provider (must be the currently active one).
  * @mask: new reason mask.
  *
- * Return: 0 on success, -EINVAL if @m is NULL or not the active migrator.
+ * Return: 0 on success, -EINVAL if @p is NULL or not the active provider.
  */
-int migrate_offload_set_reason_mask(const struct migrator *m, unsigned long mask)
+int mm_offload_set_migrate_reason_mask(const struct mm_offload_provider *p, unsigned long mask)
 {
-	if (!m)
+	if (!p)
 		return -EINVAL;
 
 	mask &= MIGRATE_OFFLOAD_REASONS_ALLOWED;
 
-	mutex_lock(&migrator_mutex);
-	if (active_migrator != m) {
-		mutex_unlock(&migrator_mutex);
+	mutex_lock(&provider_mutex);
+	if (active_provider != p) {
+		mutex_unlock(&provider_mutex);
 		return -EINVAL;
 	}
 	WRITE_ONCE(active_reason_mask, mask);
-	mutex_unlock(&migrator_mutex);
+	mutex_unlock(&provider_mutex);
 	return 0;
 }
-EXPORT_SYMBOL_GPL(migrate_offload_set_reason_mask);
+EXPORT_SYMBOL_GPL(mm_offload_set_migrate_reason_mask);
 
 /**
- * migrate_offload_register - register a batch-copy provider for page migration.
- * @m: migrator to install.
- * @reason_mask: initial set of BIT(MR_*) reasons to offload, can be changed
- *	later via migrate_offload_set_reason_mask().
+ * mm_offload_register - register an offload provider.
+ * @p: provider to install.
+ * @migrate_reason_mask: initial set of BIT(MR_*) migration reasons to
+ *	offload, can be changed later via mm_offload_set_migrate_reason_mask().
  *
- * Only one provider can be active at a time, returns -EBUSY if another migrator
- * is already registered.
+ * Only one provider can be active at a time, returns -EBUSY if another
+ * provider is already registered.
  *
  * Return: 0 on success, negative errno on failure.
  */
-int migrate_offload_register(const struct migrator *m, unsigned long reason_mask)
+int mm_offload_register(const struct mm_offload_provider *p,
+			unsigned long migrate_reason_mask)
 {
 	unsigned long mask;
 	int ret = 0;
 
-	if (!m || !m->offload_copy)
+	if (!p || !p->copy_folios)
 		return -EINVAL;
 
-	mask = reason_mask & MIGRATE_OFFLOAD_REASONS_ALLOWED;
+	mask = migrate_reason_mask & MIGRATE_OFFLOAD_REASONS_ALLOWED;
 
-	mutex_lock(&migrator_mutex);
-	if (active_migrator) {
+	mutex_lock(&provider_mutex);
+	if (active_provider) {
 		ret = -EBUSY;
 		goto unlock;
 	}
 
 	/* @owner is NULL for built-in (=y) drivers; nothing to ref. */
-	if (m->owner && !try_module_get(m->owner)) {
+	if (p->owner && !try_module_get(p->owner)) {
 		ret = -ENODEV;
 		goto unlock;
 	}
 
 	WRITE_ONCE(active_reason_mask, mask);
-	static_call_update(migrate_offload_batch_copy_fn, m->offload_copy);
-	active_migrator = m;
-	static_branch_enable(&migrate_offload_enabled);
+	static_call_update(mm_offload_copy_folios_fn, p->copy_folios);
+	active_provider = p;
+	static_branch_enable(&mm_offload_copy_folios_enabled);
 
 unlock:
-	mutex_unlock(&migrator_mutex);
+	mutex_unlock(&provider_mutex);
 
 	if (ret)
-		pr_err("migrate_offload: %s: failed to register (%d)\n", m->name, ret);
+		pr_err("mm_offload: %s: failed to register (%d)\n", p->name, ret);
 	else
-		pr_info("migrate_offload: enabled by %s (reason_mask=0x%lx)\n",
-			m->name, mask);
+		pr_info("mm_offload: enabled by %s (reason_mask=0x%lx)\n",
+			p->name, mask);
 	return ret;
 }
-EXPORT_SYMBOL_GPL(migrate_offload_register);
+EXPORT_SYMBOL_GPL(mm_offload_register);
 
 /**
- * migrate_offload_unregister - unregister the active batch-copy provider.
- * @m: migrator to remove (must be the currently active one).
+ * mm_offload_unregister - unregister the active offload provider.
+ * @p: provider to remove (must be the currently active one).
  *
  * Reverts static_call targets and waits for SRCU grace period so that
  * no in-flight migration is still calling the driver functions before
@@ -214,16 +215,16 @@ EXPORT_SYMBOL_GPL(migrate_offload_register);
  *
  * Return: 0 on success, negative errno on failure.
  */
-int migrate_offload_unregister(const struct migrator *m)
+int mm_offload_unregister(const struct mm_offload_provider *p)
 {
 	struct module *owner;
 
-	if (!m)
+	if (!p)
 		return -EINVAL;
 
-	mutex_lock(&migrator_mutex);
-	if (active_migrator != m) {
-		mutex_unlock(&migrator_mutex);
+	mutex_lock(&provider_mutex);
+	if (active_provider != p) {
+		mutex_unlock(&provider_mutex);
 		return -EINVAL;
 	}
 
@@ -231,19 +232,19 @@ int migrate_offload_unregister(const struct migrator *m)
 	 * Disable the static branch first so new migrate_pages_batch() calls
 	 * cannot enter the batch path.
 	 */
-	static_branch_disable(&migrate_offload_enabled);
+	static_branch_disable(&mm_offload_copy_folios_enabled);
 	WRITE_ONCE(active_reason_mask, 0);
-	static_call_update(migrate_offload_batch_copy_fn, migrate_folios_mc_copy);
-	owner = active_migrator->owner;
-	active_migrator = NULL;
-	mutex_unlock(&migrator_mutex);
+	static_call_update(mm_offload_copy_folios_fn, migrate_folios_mc_copy);
+	owner = active_provider->owner;
+	active_provider = NULL;
+	mutex_unlock(&provider_mutex);
 
 	/* Wait for all in-flight callers to finish before module_put(). */
-	synchronize_srcu(&migrate_offload_srcu);
+	synchronize_srcu(&mm_offload_srcu);
 	if (owner)
 		module_put(owner);
 
-	pr_info("migrate_offload: disabled by %s\n", m->name);
+	pr_info("mm_offload: disabled by %s\n", p->name);
 	return 0;
 }
-EXPORT_SYMBOL_GPL(migrate_offload_unregister);
+EXPORT_SYMBOL_GPL(mm_offload_unregister);

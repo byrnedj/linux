@@ -43,7 +43,7 @@
 #include <linux/sched/sysctl.h>
 #include <linux/memory-tiers.h>
 #include <linux/pagewalk.h>
-#include <linux/migrate_copy_offload.h>
+#include <linux/mm_offload.h>
 
 #include <asm/tlbflush.h>
 
