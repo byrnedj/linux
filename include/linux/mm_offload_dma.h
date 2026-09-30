@@ -57,5 +57,10 @@ unsigned long mm_offload_dma_claim(unsigned int want, int nid,
 unsigned long mm_offload_dma_claim_spread(unsigned int want, int nid);
 struct device *mm_offload_dma_chan_dev(unsigned int idx);
 void mm_offload_dma_release(unsigned long mask);
+int mm_offload_dma_admit(unsigned int idx, unsigned int nr, bool wait);
+void mm_offload_dma_retire(unsigned int idx, unsigned int nr);
+void mm_offload_dma_complete(unsigned int idx, unsigned int nr);
+int mm_offload_dma_prep_wait(unsigned int idx);
+bool mm_offload_dma_shared(void);
 
 #endif /* _LINUX_MM_OFFLOAD_DMA_H */

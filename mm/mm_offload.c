@@ -240,7 +240,10 @@ int mm_offload_clear_folio(struct folio *folio, unsigned long addr_hint)
  * !@allow_pagefault and the source was not fully present (nothing was
  * copied, caller retries with faults allowed); other negative errno
  * when the provider declined or failed, in which case the destination
- * is unspecified and the caller copies on the CPU.
+ * is unspecified and the caller copies on the CPU. -ETIMEDOUT is the
+ * exception: the provider gave up on an engine that may still write
+ * @dst, and holds @dst alive until it does; the caller must drop its
+ * own references without filling, mapping or reusing the pages.
  */
 int mm_offload_copy_user_pages(struct page *dst, unsigned long nr_pages,
 			       const void __user *src, bool allow_pagefault)

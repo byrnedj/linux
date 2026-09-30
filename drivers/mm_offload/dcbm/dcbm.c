@@ -38,6 +38,13 @@
  * most this many descriptors before waiting for completions.
  */
 #define DCBM_MAX_INFLIGHT_DEFAULT	32
+#define DCBM_SG_ELEMS_MAX		1024
+/* A refused prep is retried this often while the channel drains. */
+#define DCBM_PREP_RETRIES		3
+/* Batches at least this large wait for channel budget instead of falling back. */
+#define DCBM_ADMIT_WAIT_BYTES		SZ_8M
+/* How often to say so while a completion is overdue. */
+#define DCBM_WAIT_WARN_MS		10000
 /* Matches FOLIO_ZERO_LOCALITY_RADIUS in mm/memory.c */
 #define DCBM_WARM_RADIUS	2
 /*
@@ -65,6 +72,7 @@
 static atomic_long_t folios_migrated;
 static atomic_long_t folios_failures;
 static atomic_long_t batches_refused;
+static atomic_long_t admit_failures;	/* channel budget never freed up */
 static atomic_long_t folios_cleared;
 static atomic_long_t clear_failures;
 static atomic_long_t folios_gated;
@@ -100,16 +108,33 @@ struct dcbm_copy {
 	size_t len;
 };
 
+/*
+ * What a completion callback gets: the work it belongs to and the channel
+ * whose admission slot it returns. Copy works keep an array of these in
+ * the plan; the clear path allocates one per descriptor and the callback
+ * frees it.
+ */
+struct dcbm_desc {
+	struct dma_work *work;
+	unsigned int chan;
+	bool free_me;
+};
+
 struct dma_work {
 	struct dma_chan *chan;
+	unsigned int chan_idx;
 	struct device *dev;
 	wait_queue_head_t waitq;	/* throttle only */
 	struct completion done;		/* the last descriptor landed */
-	atomic_t pending;
+	atomic_t pending;		/* lifetime: submitter + every descriptor */
+	atomic_t inflight;		/* throttle: descriptors not yet completed */
 	atomic_t error;
 	/* Slice of the plan's descriptor array belonging to this channel. */
 	struct dcbm_copy *copies;
 	unsigned int nr_copies;
+	struct dcbm_desc *descs;	/* one per submission, same slice */
+	unsigned int nr_descs;
+	bool admit_wait;		/* sleep for channel budget, or give up */
 	bool submitted;
 };
 
@@ -610,6 +635,7 @@ struct dcbm_plan {
 	struct dcbm_copy *copies;
 	unsigned int nr_copies;
 	unsigned int max_copies;
+	struct dcbm_desc *descs;	/* parallel to copies */
 	struct dcbm_dev *devs;		/* planning scratch, one per channel */
 	unsigned long chan_mask;
 };
@@ -629,22 +655,30 @@ struct dcbm_plan {
 static void dma_completion_callback(void *data,
 				    const struct dmaengine_result *result)
 {
-	struct dma_work *work = data;
-	bool last;
+	struct dcbm_desc *desc = data;
+	struct dma_work *work = desc->work;
+	unsigned int chan = desc->chan;
+
+	if (desc->free_me)
+		kfree(desc);
+	mm_offload_dma_complete(chan, 1);
 
 	if (!result || result->result != DMA_TRANS_NOERROR)
 		atomic_set(&work->error, -EIO);
 
 	/*
-	 * The waiter is released by the completion and by nothing else:
-	 * waking it on the count alone would let it return, and its caller
-	 * free the work, while this callback still had the wait queue to
-	 * touch. The throttle wake is safe here because a throttled
-	 * submitter cannot free the work it is submitting to.
+	 * Two counts. The throttle count is what the submitter sleeps on,
+	 * and it is woken here while this callback still holds a lifetime
+	 * reference, so the work cannot go away under the wake. The
+	 * lifetime reference is dropped last: with several channels
+	 * completing into one work, another completer (or the submitter's
+	 * own release) may take the count to zero the moment this one lets
+	 * go, and the waiter then frees the work - nothing below the drop
+	 * may touch it.
 	 */
-	last = atomic_dec_and_test(&work->pending);
+	atomic_dec(&work->inflight);
 	wake_up(&work->waitq);
-	if (last)
+	if (atomic_dec_and_test(&work->pending))
 		complete(&work->done);
 }
 
@@ -654,15 +688,13 @@ static void dma_work_init(struct dma_work *work)
 	init_completion(&work->done);
 	/* Submission reference, dropped by dma_work_done_submitting(). */
 	atomic_set(&work->pending, 1);
+	atomic_set(&work->inflight, 0);
 	atomic_set(&work->error, 0);
 }
 
 static void dma_work_done_submitting(struct dma_work *work)
 {
-	bool last = atomic_dec_and_test(&work->pending);
-
-	wake_up(&work->waitq);
-	if (last)
+	if (atomic_dec_and_test(&work->pending))
 		complete(&work->done);
 }
 
@@ -672,15 +704,18 @@ static void dma_work_done_submitting(struct dma_work *work)
  */
 static void dma_work_throttle(struct dma_work *work)
 {
-	/*
-	 * Signed, and at least one descriptor beyond the submission
-	 * reference, so the condition stays reachable whatever
-	 * max_inflight is set to - including 0 and UINT_MAX.
-	 */
+	/* Signed and clamped so the condition is reachable for any setting. */
 	int limit = (int)clamp_t(unsigned int, READ_ONCE(max_inflight),
-				 1u, (unsigned int)INT_MAX - 1) + 1;
+				 1u, (unsigned int)INT_MAX - 1);
+	unsigned int overdue = 0;
 
-	wait_event(work->waitq, atomic_read(&work->pending) < limit);
+	while (!wait_event_timeout(work->waitq,
+				   atomic_read(&work->inflight) < limit,
+				   msecs_to_jiffies(DCBM_WAIT_WARN_MS))) {
+		overdue++;
+		pr_warn_ratelimited("dcbm: throttled %u s waiting for completions, still waiting\n",
+				    overdue * (DCBM_WAIT_WARN_MS / 1000));
+	}
 }
 
 
@@ -779,9 +814,21 @@ static void plan_unmap(struct dcbm_plan *plan)
  */
 static int dma_work_wait(struct dma_work *work)
 {
+	unsigned int overdue = 0;
+
 	if (!work->submitted)
 		return 0;
-	wait_for_completion(&work->done);
+	/*
+	 * Untimed by design (see above), but not silent: a descriptor the
+	 * engine dropped without a callback would otherwise be an invisible
+	 * D-state task.
+	 */
+	while (!wait_for_completion_timeout(&work->done,
+					    msecs_to_jiffies(DCBM_WAIT_WARN_MS))) {
+		overdue++;
+		pr_warn_ratelimited("dcbm: DMA completion overdue (%u s), still waiting\n",
+				    overdue * (DCBM_WAIT_WARN_MS / 1000));
+	}
 	return atomic_read(&work->error);
 }
 
@@ -791,24 +838,38 @@ static void plan_free(struct dcbm_plan *plan)
 	kfree(plan->works);
 	kvfree(plan->maps);
 	kvfree(plan->copies);
+	kvfree(plan->descs);
 	kfree(plan->devs);
 	plan->works = NULL;
 	plan->maps = NULL;
 	plan->copies = NULL;
+	plan->descs = NULL;
 	plan->devs = NULL;
 }
 
-static int submit_one(struct dma_work *work, struct dma_async_tx_descriptor *tx)
+/*
+ * Submit a prepared descriptor whose channel slot @desc already holds.
+ * On failure the slot is returned here; on success the completion
+ * callback returns it.
+ */
+static int submit_one(struct dma_work *work, struct dma_async_tx_descriptor *tx,
+		      struct dcbm_desc *desc)
 {
 	dma_cookie_t cookie;
 
 	tx->callback_result = dma_completion_callback;
-	tx->callback_param = work;
+	tx->callback_param = desc;
+	atomic_inc(&work->inflight);
 	atomic_inc(&work->pending);
 
 	cookie = dmaengine_submit(tx);
 	if (dma_submit_error(cookie)) {
+		/* Never queued, so no callback will run for it. */
+		atomic_dec(&work->inflight);
 		atomic_dec(&work->pending);
+		mm_offload_dma_retire(desc->chan, 1);
+		if (desc->free_me)
+			kfree(desc);
 		return -EIO;
 	}
 	/*
@@ -824,6 +885,26 @@ static int submit_one(struct dma_work *work, struct dma_async_tx_descriptor *tx)
 }
 
 /*
+ * Take one admission slot on the work's channel and the context that
+ * will return it. NULL if the channel stayed over budget for
+ * admit_timeout_ms: the rest of the batch is the CPU's.
+ */
+static struct dcbm_desc *work_admit(struct dma_work *work)
+{
+	struct dcbm_desc *desc;
+
+	if (mm_offload_dma_admit(work->chan_idx, 1, work->admit_wait)) {
+		atomic_long_inc(&admit_failures);
+		return NULL;
+	}
+	desc = &work->descs[work->nr_descs++];
+	desc->work = work;
+	desc->chan = work->chan_idx;
+	desc->free_me = false;
+	return desc;
+}
+
+/*
  * Hand the copies to the provider as scatter-gather transactions of
  * up to sg_elems folios each. A batch-capable engine such as DSA
  * executes one transaction as one hardware batch descriptor, so the
@@ -834,11 +915,14 @@ static int submit_one(struct dma_work *work, struct dma_async_tx_descriptor *tx)
 static int submit_sg_transfers(struct dma_work *work, unsigned long flags)
 {
 	struct scatterlist *src_sg, *dst_sg;
-	unsigned int elems = READ_ONCE(sg_elems);
+	struct dcbm_desc *desc;
+	unsigned int elems = clamp(READ_ONCE(sg_elems), 1u, DCBM_SG_ELEMS_MAX);
+	unsigned int retries = 0;
 	unsigned int done = 0;
 	int ret = 0;
 
-	src_sg = kmalloc_array(2 * elems, sizeof(*src_sg), GFP_KERNEL);
+	/* Up to 64 KB, and the device never reads it: no need for it contiguous. */
+	src_sg = kvmalloc_array(2 * elems, sizeof(*src_sg), GFP_KERNEL);
 	if (!src_sg)
 		return -ENOMEM;
 	dst_sg = src_sg + elems;
@@ -860,19 +944,31 @@ static int submit_sg_transfers(struct dma_work *work, unsigned long flags)
 		}
 
 		dma_work_throttle(work);
+		desc = work_admit(work);
+		if (!desc) {
+			ret = -EBUSY;
+			break;
+		}
 		tx = dmaengine_prep_dma_memcpy_sg(work->chan, dst_sg, n,
 						  src_sg, n, flags);
 		if (!tx) {
+			mm_offload_dma_retire(desc->chan, 1);
+			work->nr_descs--;
+			/* Ring full behind the budget: let it drain, try again. */
+			if (work->admit_wait && retries++ < DCBM_PREP_RETRIES &&
+			    !mm_offload_dma_prep_wait(work->chan_idx))
+				continue;
 			ret = -EIO;
 			break;
 		}
-		ret = submit_one(work, tx);
+		ret = submit_one(work, tx, desc);
 		if (ret)
 			break;
 		done += n;
+		retries = 0;
 	}
 
-	kfree(src_sg);
+	kvfree(src_sg);
 	return ret;
 }
 
@@ -898,14 +994,27 @@ static int submit_dma_transfers(struct dma_work *work)
 
 	for (i = 0; i < work->nr_copies; i++) {
 		struct dcbm_copy *copy = &work->copies[i];
+		struct dcbm_desc *desc;
+		unsigned int retries = 0;
 
-		dma_work_throttle(work);
-		tx = dmaengine_prep_dma_memcpy(work->chan, copy->dst, copy->src,
-					       copy->len, flags);
-		if (!tx)
-			return -EIO;
+		for (;;) {
+			dma_work_throttle(work);
+			desc = work_admit(work);
+			if (!desc)
+				return -EBUSY;
+			tx = dmaengine_prep_dma_memcpy(work->chan, copy->dst,
+						       copy->src, copy->len,
+						       flags);
+			if (tx)
+				break;
+			mm_offload_dma_retire(desc->chan, 1);
+			work->nr_descs--;
+			if (!work->admit_wait || retries++ >= DCBM_PREP_RETRIES ||
+			    mm_offload_dma_prep_wait(work->chan_idx))
+				return -EIO;
+		}
 
-		ret = submit_one(work, tx);
+		ret = submit_one(work, tx, desc);
 		if (ret)
 			return ret;
 	}
@@ -1081,9 +1190,12 @@ static int plan_build(struct dcbm_plan *plan, struct dcbm_pair *pairs,
 			c++;
 
 			work->chan = mm_offload_dma_chan(idx);
+			work->chan_idx = idx;
 			work->dev = devs[d].dev;
 			work->copies = &plan->copies[plan->nr_copies];
 			work->nr_copies = 0;
+			work->descs = &plan->descs[plan->nr_copies];
+			work->nr_descs = 0;
 			nwork++;
 
 			for (m = first_map; m < plan->nr_maps && cstart < cend; m++) {
@@ -1186,8 +1298,9 @@ static int copy_pairs_dma(struct dcbm_pair *pairs, unsigned int nr)
 	 */
 	plan.maps = kvcalloc(max_maps, sizeof(*plan.maps), GFP_KERNEL);
 	plan.copies = kvcalloc(max_copies, sizeof(*plan.copies), GFP_KERNEL);
+	plan.descs = kvcalloc(max_copies, sizeof(*plan.descs), GFP_KERNEL);
 	plan.devs = kcalloc(nchan, sizeof(*plan.devs), GFP_KERNEL);
-	if (!plan.works || !plan.maps || !plan.copies ||
+	if (!plan.works || !plan.maps || !plan.copies || !plan.descs ||
 	    !plan.devs) {
 		ret = -ENOMEM;
 		goto out;
@@ -1196,6 +1309,15 @@ static int copy_pairs_dma(struct dcbm_pair *pairs, unsigned int nr)
 	ret = plan_build(&plan, pairs, nr, total);
 	if (ret)
 		goto out;
+
+	for (i = 0; i < plan.nr_works; i++) {
+		/*
+		 * A bulk migration is worth sleeping for channel budget; a
+		 * single folio moved from a fault (NUMA hinting) is not, and
+		 * its caller may hold locks - it goes to the CPU at once.
+		 */
+		plan.works[i].admit_wait = total >= DCBM_ADMIT_WAIT_BYTES;
+	}
 
 	for (i = 0; i < plan.nr_works; i++) {
 		if (!plan.works[i].nr_copies)
@@ -1213,7 +1335,12 @@ out:
 	plan_free(&plan);
 	mm_offload_dma_release(plan.chan_mask);
 
-	if (ret) {
+	if (ret == -EBUSY) {
+		/*
+		 * Refused, not failed: no channel (batches_refused)
+		 * or no budget (admit_failures).
+		 */
+	} else if (ret) {
 		atomic_long_add(nr, &folios_failures);
 		pr_warn_ratelimited("dcbm: DMA copy failed (%d), falling back to CPU\n",
 				    ret);
@@ -1312,13 +1439,33 @@ static int submit_clear_range(struct dma_work *work, unsigned long chan_mask,
 		struct dma_async_tx_descriptor *tx;
 		int ret;
 
+		struct dcbm_desc *desc;
+
 		dma_work_throttle(work);
+		desc = kmalloc(sizeof(*desc), GFP_KERNEL);
+		if (!desc)
+			return -ENOMEM;
+		/*
+		 * A clear runs in the fault path under mmap_lock; better to
+		 * clear on the CPU than to sleep for budget holding it.
+		 */
+		if (mm_offload_dma_admit(idx, 1, false)) {
+			atomic_long_inc(&admit_failures);
+			kfree(desc);
+			return -EBUSY;
+		}
+		desc->work = work;
+		desc->chan = idx;
+		desc->free_me = true;
 		tx = dmaengine_prep_dma_memset(mm_offload_dma_chan(idx), addr, 0,
 					       this_len, flags);
-		if (!tx)
+		if (!tx) {
+			mm_offload_dma_retire(idx, 1);
+			kfree(desc);
 			return -EIO;
+		}
 
-		ret = submit_one(work, tx);
+		ret = submit_one(work, tx, desc);
 		if (ret)
 			return ret;
 
@@ -1519,7 +1666,7 @@ static int folio_clear_dma(struct folio *folio, unsigned long addr_hint)
 	 */
 	dma_work_done_submitting(&work);
 	work.submitted = true;
-	ret |= dma_work_wait(&work);
+	ret = dma_work_wait(&work) ? : ret;
 
 	if (nsegs) {
 		for (i = 0; i < nsegs; i++) {
@@ -1544,9 +1691,12 @@ static int folio_clear_dma(struct folio *folio, unsigned long addr_hint)
 
 out_release:
 	mm_offload_dma_release(chan_mask);
-	atomic_long_inc(&clear_failures);
-	pr_warn_ratelimited("dcbm: DMA clear failed (%d), falling back to CPU\n",
-			    ret);
+	/* No channel budget is a refusal (counted in admit_failures), not a failure. */
+	if (ret != -EBUSY) {
+		atomic_long_inc(&clear_failures);
+		pr_warn_ratelimited("dcbm: DMA clear failed (%d), falling back to CPU\n",
+				    ret);
+	}
 	return ret;
 }
 
@@ -1731,6 +1881,24 @@ static const struct kernel_param_ops batches_refused_param_ops = {
 };
 module_param_cb(batches_refused, &batches_refused_param_ops, NULL, 0644);
 MODULE_PARM_DESC(batches_refused, "Batches refused because all channels were busy (write to reset)");
+
+static int admit_failures_param_set(const char *val, const struct kernel_param *kp)
+{
+	atomic_long_set(&admit_failures, 0);
+	return 0;
+}
+
+static int admit_failures_param_get(char *buffer, const struct kernel_param *kp)
+{
+	return sysfs_emit(buffer, "%ld\n", atomic_long_read(&admit_failures));
+}
+
+static const struct kernel_param_ops admit_failures_param_ops = {
+	.set = admit_failures_param_set,
+	.get = admit_failures_param_get,
+};
+module_param_cb(admit_failures, &admit_failures_param_ops, NULL, 0644);
+MODULE_PARM_DESC(admit_failures, "Submissions handed to the CPU because a channel stayed over budget (write to reset)");
 
 static int folios_cleared_param_set(const char *val, const struct kernel_param *kp)
 {

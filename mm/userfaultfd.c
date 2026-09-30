@@ -1025,7 +1025,7 @@ static int mfill_batch_copy_retry(struct mfill_state *state, struct page *page,
 	mfill_put_vma(state);
 
 	err = mm_offload_copy_user_pages(page, nr, (const void __user *)src, true);
-	if (err)
+	if (err && err != -ETIMEDOUT)
 		err = mfill_batch_copy_cpu(page, nr, src, true);
 	if (err)
 		return err;
@@ -1199,10 +1199,18 @@ static ssize_t mfill_atomic_copy_batch(struct mfill_state *state,
 	}
 
 	err = mm_offload_copy_user_pages(page, nr, (const void __user *)src, false);
-	if (err && err != -EFAULT)
+	if (err && err != -EFAULT && err != -ETIMEDOUT)
 		err = mfill_batch_copy_cpu(page, nr, src, false);
 	if (err == -EFAULT)
 		err = mfill_batch_copy_retry(state, page, nr, src);
+	/*
+	 * The provider gave up on an engine that may still write these
+	 * pages: they must not be filled on the CPU, mapped, or reused.
+	 * Drop them - the provider holds them alive - and let the
+	 * per-page path start over with fresh ones.
+	 */
+	if (err == -ETIMEDOUT)
+		err = -EOPNOTSUPP;
 	if (err)
 		goto free;
 

@@ -7519,6 +7519,14 @@ long copy_folio_from_user(struct folio *dst_folio,
 			return 0;
 		if (rc == -EFAULT && !allow_pagefault)
 			return ret_val;
+		/*
+		 * The provider gave up on an engine that may still write
+		 * the folio: it must not be filled on the CPU, mapped, or
+		 * reused. Report it uncopied so the caller drops it (the
+		 * provider holds it alive) and starts over elsewhere.
+		 */
+		if (rc == -ETIMEDOUT)
+			return ret_val;
 	}
 
 	for (i = 0; i < nr_pages; i++) {

@@ -34,7 +34,10 @@
 #include <linux/sysfs.h>
 #include <linux/uaccess.h>
 
-#define UFFD_DMA_TIMEOUT_MS	10000
+#define UFFD_DMA_TIMEOUT_MS	10000	/* between overdue warnings */
+#define UFFD_DMA_ABANDON_MS_DEFAULT	30000
+/* A refused prep is retried this often while the channel drains. */
+#define UFFD_DMA_PREP_RETRIES	3
 /* One descriptor per this many bytes when spreading over channels */
 #define UFFD_DMA_CHUNK_BYTES	SZ_2M
 
@@ -52,7 +55,8 @@ static atomic_long_t map_us_total;	/* DMA mapping of source + destination */
 static atomic_long_t unmap_us_total;	/* unmap + unpin */
 static atomic_long_t src_contig;
 static atomic_long_t sg_txns;	/* DMA_MEMCPY_SG transactions submitted */
-static atomic_long_t striped_copies;	/* copies striped over >1 device */	/* copies whose source was one contiguous run */
+static atomic_long_t striped_copies;	/* copies striped over >1 device */
+static atomic_long_t copies_abandoned;	/* given up on, see uffd_dma_wait() */
 
 static bool offloading_enabled;
 static unsigned int nr_dma_chan = 4;
@@ -65,26 +69,196 @@ static unsigned int wait_mode = UFFD_DMA_WAIT_IRQ;
 static unsigned int spin_us = 60;
 /* Source segments per DMA_MEMCPY_SG transaction; 0 disables the batch path */
 static unsigned int sg_elems = 32;
+/* Give up on a copy this long overdue; 0 waits forever. */
+static unsigned int abandon_ms = UFFD_DMA_ABANDON_MS_DEFAULT;
+/* An abandoned copy means an engine that is not completing: stop using them. */
+static bool stalled;
 static bool util_gate;
 
 static DEFINE_MUTEX(uffd_dma_mutex);
 
 static struct kobject *uffd_dma_kobj;
 
+struct uffd_dma_map {
+	struct device *dev;
+	dma_addr_t dma;
+	size_t len;
+	enum dma_data_direction dir;
+};
+
+enum uffd_dma_req_state {
+	UFFD_DMA_REQ_WAITING,	/* the submitter will collect the result */
+	UFFD_DMA_REQ_DONE,	/* every descriptor landed; the submitter releases */
+	UFFD_DMA_REQ_ABANDONED,	/* the submitter gave up; the last descriptor releases */
+};
+
+/*
+ * One copy. The request owns everything the engines can touch until the
+ * last descriptor has landed - the pinned source, the DMA mappings, and
+ * after an abandoned wait a reference on every destination folio - so
+ * that giving up on a descriptor never frees anything out from under
+ * it. Normally the submitter releases it all once the copy is done; an
+ * abandoned request is released by the last descriptor to land, if one
+ * ever does.
+ */
 struct uffd_dma_req {
 	struct completion done;
-	atomic_t pending;
+	atomic_t pending;		/* descriptors in flight, plus the submitter */
 	atomic_t error;
+	atomic_t state;			/* enum uffd_dma_req_state */
+	struct page *dst;
+	unsigned long nr_pages;
+	struct page **pages;		/* the source */
+	bool src_pinned;
+	bool pinned;			/* FOLL_PIN rather than FOLL_GET */
+	struct device *sgt_dev;		/* a scattered source is mapped here */
+	struct sg_table sgt;
+	unsigned int nr_maps;
+	struct uffd_dma_map maps[2 * MM_OFFLOAD_DMA_MAX_CHANNELS];
 };
+
+/* One per submitted descriptor: which request, and whose channel slot. */
+struct uffd_dma_desc {
+	struct uffd_dma_req *req;
+	unsigned int chan;
+};
+
+static atomic_long_t admit_failures;
+
+static void uffd_dma_unpin_src(struct page **pages, unsigned long nr,
+			       bool pinned);
+
+static struct uffd_dma_req *uffd_dma_req_alloc(struct page *dst,
+					       unsigned long nr_pages)
+{
+	struct uffd_dma_req *req = kzalloc(sizeof(*req), GFP_KERNEL);
+
+	if (!req)
+		return NULL;
+	init_completion(&req->done);
+	atomic_set(&req->pending, 1);	/* submission reference */
+	atomic_set(&req->error, 0);
+	atomic_set(&req->state, UFFD_DMA_REQ_WAITING);
+	req->dst = dst;
+	req->nr_pages = nr_pages;
+	return req;
+}
+
+/* Map one range for @dev and record it for the release. */
+static int uffd_dma_req_map(struct uffd_dma_req *req, struct device *dev,
+			    struct page *page, size_t len,
+			    enum dma_data_direction dir, dma_addr_t *dma)
+{
+	struct uffd_dma_map *m;
+
+	if (WARN_ON_ONCE(req->nr_maps == ARRAY_SIZE(req->maps)))
+		return -ENOSPC;
+	m = &req->maps[req->nr_maps];
+	m->dma = dma_map_page_attrs(dev, page, 0, len, dir, 0);
+	if (dma_mapping_error(dev, m->dma))
+		return -EIO;
+	m->dev = dev;
+	m->len = len;
+	m->dir = dir;
+	req->nr_maps++;
+	*dma = m->dma;
+	return 0;
+}
+
+/* Undo everything the request holds, in reverse order of taking it. */
+static void uffd_dma_req_release(struct uffd_dma_req *req)
+{
+	bool abandoned = atomic_read(&req->state) == UFFD_DMA_REQ_ABANDONED;
+	unsigned int i = req->nr_maps;
+
+	while (i--)
+		dma_unmap_page_attrs(req->maps[i].dev, req->maps[i].dma,
+				     req->maps[i].len, req->maps[i].dir, 0);
+	if (req->sgt_dev)
+		dma_unmap_sgtable(req->sgt_dev, &req->sgt, DMA_TO_DEVICE, 0);
+	if (req->sgt.sgl)
+		sg_free_table(&req->sgt);
+	if (req->src_pinned)
+		uffd_dma_unpin_src(req->pages, req->nr_pages, req->pinned);
+	kvfree(req->pages);
+	if (abandoned) {
+		unsigned long pg = 0;
+
+		while (pg < req->nr_pages) {
+			struct folio *folio = page_folio(req->dst + pg);
+
+			pg += folio_nr_pages(folio);
+			folio_put(folio);
+		}
+	}
+	kfree(req);
+	if (abandoned)
+		module_put(THIS_MODULE);
+}
+
+/* The last descriptor has landed, or nothing was ever submitted. */
+static void uffd_dma_req_landed(struct uffd_dma_req *req)
+{
+	if (atomic_cmpxchg(&req->state, UFFD_DMA_REQ_WAITING,
+			   UFFD_DMA_REQ_DONE) == UFFD_DMA_REQ_WAITING)
+		complete(&req->done);
+	else
+		uffd_dma_req_release(req);	/* abandoned: nobody else will */
+}
 
 static void uffd_dma_callback(void *data, const struct dmaengine_result *result)
 {
-	struct uffd_dma_req *req = data;
+	struct uffd_dma_desc *desc = data;
+	struct uffd_dma_req *req = desc->req;
+	unsigned int chan = desc->chan;
 
+	kfree(desc);
+	mm_offload_dma_complete(chan, 1);
 	if (!result || result->result != DMA_TRANS_NOERROR)
 		atomic_set(&req->error, -EIO);
 	if (atomic_dec_and_test(&req->pending))
-		complete(&req->done);
+		uffd_dma_req_landed(req);
+}
+
+/*
+ * Take a channel slot and the context that returns it. NULL when the
+ * channel stayed over budget: the caller gives the rest to the CPU.
+ */
+static struct uffd_dma_desc *uffd_dma_admit(struct uffd_dma_req *req,
+					    unsigned int chan, bool wait)
+{
+	struct uffd_dma_desc *desc = kmalloc(sizeof(*desc), GFP_KERNEL);
+
+	if (!desc)
+		return NULL;
+	if (mm_offload_dma_admit(chan, 1, wait)) {
+		atomic_long_inc(&admit_failures);
+		kfree(desc);
+		return NULL;
+	}
+	desc->req = req;
+	desc->chan = chan;
+	return desc;
+}
+
+/* Hand a prepared descriptor to the engine; @desc holds its slot. */
+static int uffd_dma_submit_tx(struct uffd_dma_req *req,
+			      struct dma_async_tx_descriptor *tx,
+			      struct uffd_dma_desc *desc)
+{
+	dma_cookie_t cookie;
+
+	tx->callback_result = uffd_dma_callback;
+	tx->callback_param = desc;
+	atomic_inc(&req->pending);
+	cookie = dmaengine_submit(tx);
+	if (dma_submit_error(cookie)) {
+		atomic_dec(&req->pending);
+		mm_offload_dma_retire(desc->chan, 1);
+		kfree(desc);
+		return -EIO;
+	}
+	return 0;
 }
 
 
@@ -162,6 +336,7 @@ struct uffd_dma_cursor {
 	unsigned long chan_mask;
 	unsigned int idx;
 	unsigned long flags;
+	bool wait;		/* may sleep for channel budget */
 };
 
 static int uffd_dma_submit_one(struct uffd_dma_req *req,
@@ -169,20 +344,28 @@ static int uffd_dma_submit_one(struct uffd_dma_req *req,
 			       dma_addr_t dst, dma_addr_t src, size_t len)
 {
 	struct dma_async_tx_descriptor *tx;
-	dma_cookie_t cookie;
+	struct uffd_dma_desc *desc;
+	unsigned int retries = 0;
+	int ret;
 
-	tx = dmaengine_prep_dma_memcpy(mm_offload_dma_chan(cur->idx), dst, src, len,
-				       cur->flags);
-	if (!tx)
-		return -EIO;
-	tx->callback_result = uffd_dma_callback;
-	tx->callback_param = req;
-	atomic_inc(&req->pending);
-	cookie = dmaengine_submit(tx);
-	if (dma_submit_error(cookie)) {
-		atomic_dec(&req->pending);
-		return -EIO;
+	for (;;) {
+		desc = uffd_dma_admit(req, cur->idx, cur->wait);
+		if (!desc)
+			return -EBUSY;
+		tx = dmaengine_prep_dma_memcpy(mm_offload_dma_chan(cur->idx),
+					       dst, src, len, cur->flags);
+		if (tx)
+			break;
+		mm_offload_dma_retire(desc->chan, 1);
+		kfree(desc);
+		/* Ring full behind the budget: let it drain, try again. */
+		if (!cur->wait || retries++ >= UFFD_DMA_PREP_RETRIES ||
+		    mm_offload_dma_prep_wait(cur->idx))
+			return -EIO;
 	}
+	ret = uffd_dma_submit_tx(req, tx, desc);
+	if (ret)
+		return ret;
 	cur->idx = find_next_bit(&cur->chan_mask, MM_OFFLOAD_DMA_MAX_CHANNELS,
 				 cur->idx + 1);
 	if (cur->idx >= MM_OFFLOAD_DMA_MAX_CHANNELS)
@@ -240,6 +423,8 @@ static int uffd_dma_submit_sg(struct uffd_dma_req *req,
 {
 	unsigned int elems = clamp(READ_ONCE(sg_elems), 1U, 1024U);
 	struct scatterlist *src_win, dst_sg;
+	struct uffd_dma_desc *desc;
+	unsigned int retries = 0;
 	struct scatterlist *sg = sgt->sgl;
 	unsigned int nents = sgt->nents;
 	size_t sg_off = 0, off = 0;
@@ -253,7 +438,6 @@ static int uffd_dma_submit_sg(struct uffd_dma_req *req,
 		struct dma_async_tx_descriptor *tx;
 		size_t win_len = 0;
 		unsigned int n = 0;
-		dma_cookie_t cookie;
 
 		sg_init_table(src_win, elems);
 		while (n < elems && nents && off + win_len < dma_len) {
@@ -278,22 +462,31 @@ static int uffd_dma_submit_sg(struct uffd_dma_req *req,
 		sg_dma_address(&dst_sg) = dst + off;
 		sg_dma_len(&dst_sg) = win_len;
 
-		tx = dmaengine_prep_dma_memcpy_sg(mm_offload_dma_chan(cur->idx),
-						  &dst_sg, 1, src_win, n,
-						  cur->flags);
-		if (!tx) {
-			ret = -EIO;
-			break;
+		for (;;) {
+			desc = uffd_dma_admit(req, cur->idx, cur->wait);
+			if (!desc) {
+				ret = -EBUSY;
+				break;
+			}
+			tx = dmaengine_prep_dma_memcpy_sg(
+					mm_offload_dma_chan(cur->idx),
+					&dst_sg, 1, src_win, n, cur->flags);
+			if (tx)
+				break;
+			mm_offload_dma_retire(desc->chan, 1);
+			kfree(desc);
+			if (!cur->wait || retries++ >= UFFD_DMA_PREP_RETRIES ||
+			    mm_offload_dma_prep_wait(cur->idx)) {
+				ret = -EIO;
+				break;
+			}
 		}
-		tx->callback_result = uffd_dma_callback;
-		tx->callback_param = req;
-		atomic_inc(&req->pending);
-		cookie = dmaengine_submit(tx);
-		if (dma_submit_error(cookie)) {
-			atomic_dec(&req->pending);
-			ret = -EIO;
+		if (ret)
 			break;
-		}
+		ret = uffd_dma_submit_tx(req, tx, desc);
+		if (ret)
+			break;
+		retries = 0;
 		atomic_long_inc(&sg_txns);
 		off += win_len;
 		cur->idx = find_next_bit(&cur->chan_mask,
@@ -326,8 +519,62 @@ static int uffd_dma_submit_contig(struct uffd_dma_req *req,
 	return 0;
 }
 
+/*
+ * Give up on a request whose descriptors are not landing. The engine
+ * may still write the destination and read the source whenever it gets
+ * round to them, so the request keeps both: a reference on every
+ * destination folio, taken here while the caller still holds its own,
+ * and the source pins and mappings it already has. The last descriptor
+ * to land releases them, and until then the module stays loaded. The
+ * caller is told to drop the destination and start over elsewhere.
+ *
+ * Returns false when the request landed after all.
+ */
+static bool uffd_dma_abandon(struct uffd_dma_req *req)
+{
+	unsigned long pg = 0;
+
+	__module_get(THIS_MODULE);
+	while (pg < req->nr_pages) {
+		struct folio *folio = page_folio(req->dst + pg);
+
+		pg += folio_nr_pages(folio);
+		folio_get(folio);
+	}
+	if (atomic_cmpxchg(&req->state, UFFD_DMA_REQ_WAITING,
+			   UFFD_DMA_REQ_ABANDONED) != UFFD_DMA_REQ_WAITING) {
+		pg = 0;
+		while (pg < req->nr_pages) {
+			struct folio *folio = page_folio(req->dst + pg);
+
+			pg += folio_nr_pages(folio);
+			folio_put(folio);
+		}
+		module_put(THIS_MODULE);
+		return false;
+	}
+	atomic_long_inc(&copies_abandoned);
+	WRITE_ONCE(stalled, true);
+	pr_err("uffd_dma: abandoning a copy %u ms overdue; its pages stay held until the engine completes it. No further copies are offloaded until offloading is re-enabled.\n",
+	       READ_ONCE(abandon_ms));
+	return true;
+}
+
+/*
+ * Wait for every descriptor of a request. Nothing is ever terminated:
+ * the channels are shared, and a terminate flushes every operation's
+ * descriptors on the work queue with their callbacks stripped - the
+ * others would wait forever and their admission slots would never come
+ * back. An overdue completion is waited for, loudly, and after
+ * abandon_ms the request is abandoned to its descriptors (see
+ * uffd_dma_abandon()) and the caller gets -ETIMEDOUT: whatever it holds
+ * - mmap or VMA lock, the hugetlb fault mutex - is held for that long
+ * at most, instead of for as long as a dead engine stays dead.
+ */
 static int uffd_dma_wait(struct uffd_dma_req *req)
 {
+	unsigned int overdue = 0;
+
 	if (READ_ONCE(wait_mode) == UFFD_DMA_WAIT_SPIN_IRQ) {
 		ktime_t deadline = ktime_add_us(ktime_get(), READ_ONCE(spin_us));
 
@@ -337,9 +584,17 @@ static int uffd_dma_wait(struct uffd_dma_req *req)
 			cpu_relax();
 		}
 	}
-	if (!wait_for_completion_timeout(&req->done,
-					 msecs_to_jiffies(UFFD_DMA_TIMEOUT_MS)))
-		return -ETIMEDOUT;
+	while (!wait_for_completion_timeout(&req->done,
+					    msecs_to_jiffies(UFFD_DMA_TIMEOUT_MS))) {
+		unsigned int limit = READ_ONCE(abandon_ms);
+
+		overdue++;
+		if (limit && overdue * UFFD_DMA_TIMEOUT_MS >= limit &&
+		    uffd_dma_abandon(req))
+			return -ETIMEDOUT;
+		pr_warn_ratelimited("uffd_dma: DMA completion overdue (%u s), still waiting\n",
+				    overdue * (UFFD_DMA_TIMEOUT_MS / 1000));
+	}
 	return atomic_read(&req->error);
 }
 
@@ -363,12 +618,12 @@ struct uffd_dma_stripe {
  * channel release stay with the caller, everything between (mapping,
  * submission, wait, unmapping, result counters) happens here.
  */
-static int uffd_dma_copy_striped(struct page *dst, struct page **pages,
-				 size_t size, struct uffd_dma_cursor *cur)
+static int uffd_dma_copy_striped(struct uffd_dma_req *req, struct page *dst,
+				 struct page **pages, size_t size,
+				 struct uffd_dma_cursor *cur)
 {
 	struct uffd_dma_stripe *st;
-	struct uffd_dma_req req;
-	unsigned int i, k, ns = 0, mapped = 0;
+	unsigned int i, k, ns = 0;
 	size_t per, off = 0;
 	ktime_t t0, t1;
 	int ret = 0;
@@ -399,30 +654,21 @@ static int uffd_dma_copy_striped(struct page *dst, struct page **pages,
 	}
 
 	t0 = ktime_get();
-	for (mapped = 0; mapped < ns; mapped++) {
-		struct uffd_dma_stripe *sp = &st[mapped];
+	for (k = 0; k < ns; k++) {
+		struct uffd_dma_stripe *sp = &st[k];
 
-		sp->src = dma_map_page_attrs(sp->dev, pages[sp->off >> PAGE_SHIFT],
-					     0, sp->len, DMA_TO_DEVICE, 0);
-		if (dma_mapping_error(sp->dev, sp->src)) {
-			ret = -EIO;
-			goto out_unmap;
-		}
-		sp->dst = dma_map_page_attrs(sp->dev, dst + (sp->off >> PAGE_SHIFT),
-					     0, sp->len, DMA_FROM_DEVICE, 0);
-		if (dma_mapping_error(sp->dev, sp->dst)) {
-			dma_unmap_page_attrs(sp->dev, sp->src, sp->len,
-					     DMA_TO_DEVICE, 0);
-			ret = -EIO;
-			goto out_unmap;
-		}
+		ret = uffd_dma_req_map(req, sp->dev, pages[sp->off >> PAGE_SHIFT],
+				       sp->len, DMA_TO_DEVICE, &sp->src);
+		if (!ret)
+			ret = uffd_dma_req_map(req, sp->dev,
+					       dst + (sp->off >> PAGE_SHIFT),
+					       sp->len, DMA_FROM_DEVICE,
+					       &sp->dst);
+		if (ret)
+			goto out;
 	}
 	t1 = ktime_get();
 	atomic_long_add(ktime_us_delta(t1, t0), &map_us_total);
-
-	init_completion(&req.done);
-	atomic_set(&req.pending, 1);	/* submission reference */
-	atomic_set(&req.error, 0);
 
 	for (k = 0; k < ns; k++) {
 		struct uffd_dma_cursor scur = {
@@ -430,31 +676,27 @@ static int uffd_dma_copy_striped(struct page *dst, struct page **pages,
 			.idx = find_first_bit(&st[k].chans,
 					      MM_OFFLOAD_DMA_MAX_CHANNELS),
 			.flags = cur->flags,
+			.wait = cur->wait,
 		};
 
-		ret = uffd_dma_submit_contig(&req, &scur, st[k].dst, st[k].src,
+		ret = uffd_dma_submit_contig(req, &scur, st[k].dst, st[k].src,
 					     st[k].len);
 		if (ret)
-			goto out_terminate;
+			break;
 	}
 	for_each_set_bit(i, &cur->chan_mask, MM_OFFLOAD_DMA_MAX_CHANNELS)
 		dma_async_issue_pending(mm_offload_dma_chan(i));
 
-	if (atomic_dec_and_test(&req.pending))
-		complete(&req.done);
-	ret = uffd_dma_wait(&req);
-	if (ret == -ETIMEDOUT)
-		goto out_terminate;
+	/* Whatever was submitted runs out before anything is unmapped. */
+	if (atomic_dec_and_test(&req->pending))
+		uffd_dma_req_landed(req);
+	ret = uffd_dma_wait(req) ? : ret;
 	atomic_long_add(ktime_us_delta(ktime_get(), t1), &wait_ns_total);
 
-out_unmap:
-	for (k = 0; k < mapped; k++) {
-		dma_unmap_page_attrs(st[k].dev, st[k].dst, st[k].len,
-				     DMA_FROM_DEVICE, 0);
-		dma_unmap_page_attrs(st[k].dev, st[k].src, st[k].len,
-				     DMA_TO_DEVICE, 0);
-	}
-	if (ret) {
+out:
+	if (ret == -ETIMEDOUT) {
+		/* Counted by the abandon; the request is the engine's now. */
+	} else if (ret) {
 		atomic_long_inc(&copies_failed);
 		pr_warn_ratelimited("uffd_dma: striped copy failed (%d), falling back to CPU\n",
 				    ret);
@@ -465,13 +707,6 @@ out_unmap:
 	}
 	kfree(st);
 	return ret;
-
-out_terminate:
-	if (atomic_dec_and_test(&req.pending))
-		complete(&req.done);
-	for_each_set_bit(i, &cur->chan_mask, MM_OFFLOAD_DMA_MAX_CHANNELS)
-		dmaengine_terminate_sync(mm_offload_dma_chan(i));
-	goto out_unmap;
 }
 
 static int uffd_dma_copy_pages(struct page *dst, unsigned long nr_pages,
@@ -481,22 +716,24 @@ static int uffd_dma_copy_pages(struct page *dst, unsigned long nr_pages,
 	unsigned long src = (unsigned long)usrc;
 	struct mm_offload_dma_group *grp;
 	struct uffd_dma_cursor cur = {};
-	struct uffd_dma_req req;
+	struct uffd_dma_req *req;
 	unsigned long stripe_min;
 	bool multi_dev = false;
-	struct page **pages;
-	struct sg_table sgt;
 	struct device *dev;
-	dma_addr_t dst_dma, src_dma = 0;
+	dma_addr_t dst_dma = 0, src_dma = 0;
 	size_t dma_len, cpu_off;
 	ktime_t t0, t1;
-	bool pinned, contig = false, cpu_fault = false;
+	bool contig = false, cpu_fault = false;
 	unsigned int i;
 	int ret;
 
 	if (size < READ_ONCE(min_bytes) || (src & ~PAGE_MASK)) {
 		atomic_long_inc(&copies_refused);
 		return -ENODEV;
+	}
+	if (READ_ONCE(stalled)) {
+		atomic_long_inc(&copies_refused);
+		return -EBUSY;
 	}
 	if (IS_ENABLED(CONFIG_PAGE_CLEAR_OFFLOAD) && READ_ONCE(util_gate) &&
 	    mm_offload_cpus_saturated()) {
@@ -523,19 +760,32 @@ static int uffd_dma_copy_pages(struct page *dst, unsigned long nr_pages,
 	cur.flags = DMA_PREP_INTERRUPT | DMA_CTRL_ACK;
 	if (READ_ONCE(cache_ctrl))
 		cur.flags |= DMA_PREP_CACHE_CONTROL;
+	/*
+	 * The first attempt runs with the caller's mmap/VMA locks held
+	 * (!allow_pagefault); do not sleep for channel budget there - the
+	 * caller retries with the locks dropped, and that attempt may.
+	 */
+	cur.wait = allow_pagefault;
 	dev = mm_offload_dma_chan_dev(cur.idx);
 
-	pages = kvmalloc_array(nr_pages, sizeof(*pages), GFP_KERNEL);
-	if (!pages) {
+	req = uffd_dma_req_alloc(dst, nr_pages);
+	if (!req) {
 		ret = -ENOMEM;
 		goto out_release;
 	}
+	req->pages = kvmalloc_array(nr_pages, sizeof(*req->pages), GFP_KERNEL);
+	if (!req->pages) {
+		ret = -ENOMEM;
+		goto out_req;
+	}
 	t0 = ktime_get();
-	ret = uffd_dma_pin_src(src, nr_pages, pages, allow_pagefault, &pinned);
+	ret = uffd_dma_pin_src(src, nr_pages, req->pages, allow_pagefault,
+			       &req->pinned);
 	if (ret) {
 		atomic_long_inc(&copies_efault);
-		goto out_free;
+		goto out_req;
 	}
+	req->src_pinned = true;
 	t1 = ktime_get();
 	atomic_long_add(ktime_us_delta(t1, t0), &pin_us_total);
 
@@ -543,14 +793,14 @@ static int uffd_dma_copy_pages(struct page *dst, unsigned long nr_pages,
 	 * A THP or hugetlb-backed source is one physical run: map it as a
 	 * single range and skip the scatterlist entirely.
 	 */
-	contig = uffd_dma_src_contiguous(pages, nr_pages);
+	contig = uffd_dma_src_contiguous(req->pages, nr_pages);
 
 	for_each_set_bit(i, &cur.chan_mask, MM_OFFLOAD_DMA_MAX_CHANNELS)
 		if (mm_offload_dma_chan_dev(i) != dev)
 			multi_dev = true;
 	if (multi_dev && contig) {
-		ret = uffd_dma_copy_striped(dst, pages, size, &cur);
-		goto out_unpin_done;
+		ret = uffd_dma_copy_striped(req, dst, req->pages, size, &cur);
+		goto out_done;
 	}
 	if (multi_dev) {
 		/*
@@ -567,57 +817,61 @@ static int uffd_dma_copy_pages(struct page *dst, unsigned long nr_pages,
 		cur.chan_mask = keep;
 	}
 
-	if (contig) {
-		src_dma = dma_map_page_attrs(dev, pages[0], 0, size,
-					     DMA_TO_DEVICE, 0);
-		if (dma_mapping_error(dev, src_dma)) {
-			ret = -EIO;
-			goto out_unpin;
-		}
-		atomic_long_inc(&src_contig);
-	} else {
-		ret = sg_alloc_table_from_pages(&sgt, pages, nr_pages, 0, size,
-						GFP_KERNEL);
-		if (ret)
-			goto out_unpin;
-		ret = dma_map_sgtable(dev, &sgt, DMA_TO_DEVICE, 0);
-		if (ret)
-			goto out_sgfree;
-	}
-	dst_dma = dma_map_page_attrs(dev, dst, 0, size, DMA_FROM_DEVICE, 0);
-	if (dma_mapping_error(dev, dst_dma)) {
-		ret = -EIO;
-		goto out_unmap_src;
-	}
-	t0 = ktime_get();
-	atomic_long_add(ktime_us_delta(t0, t1), &map_us_total);
-
 	/* The CPU copies the tail cpu_pct% concurrently with the engine. */
 	cpu_off = size - ALIGN_DOWN(size * min(READ_ONCE(cpu_pct), 100u) / 100,
 				    PAGE_SIZE);
 	dma_len = cpu_off;
 
-	init_completion(&req.done);
-	atomic_set(&req.pending, 1);	/* submission reference */
-	atomic_set(&req.error, 0);
+	if (dma_len) {
+		if (contig) {
+			ret = uffd_dma_req_map(req, dev, req->pages[0], dma_len,
+					       DMA_TO_DEVICE, &src_dma);
+			if (ret)
+				goto out_req;
+			atomic_long_inc(&src_contig);
+		} else {
+			ret = sg_alloc_table_from_pages(&req->sgt, req->pages,
+							nr_pages, 0, size,
+							GFP_KERNEL);
+			if (ret)
+				goto out_req;
+			ret = dma_map_sgtable(dev, &req->sgt, DMA_TO_DEVICE, 0);
+			if (ret)
+				goto out_req;
+			req->sgt_dev = dev;
+		}
+		/*
+		 * Only the engine's share of the destination. The tail the
+		 * CPU writes stays outside the device mapping, whose unmap
+		 * would otherwise overwrite it with the bounce buffer on a
+		 * bouncing platform or invalidate it on a non-coherent one.
+		 */
+		ret = uffd_dma_req_map(req, dev, dst, dma_len, DMA_FROM_DEVICE,
+				       &dst_dma);
+		if (ret)
+			goto out_req;
+	}
+	t0 = ktime_get();
+	atomic_long_add(ktime_us_delta(t0, t1), &map_us_total);
 
 	if (dma_len) {
 		if (contig)
-			ret = uffd_dma_submit_contig(&req, &cur, dst_dma, src_dma,
+			ret = uffd_dma_submit_contig(req, &cur, dst_dma, src_dma,
 						     dma_len);
 		else
 			if (READ_ONCE(sg_elems) &&
 			    dma_has_cap(DMA_MEMCPY_SG,
 					mm_offload_dma_chan(cur.idx)->device->cap_mask))
-				ret = uffd_dma_submit_sg(&req, &cur, &sgt,
+				ret = uffd_dma_submit_sg(req, &cur, &req->sgt,
 							 dst_dma, dma_len);
 			else
-				ret = uffd_dma_submit(&req, &cur, &sgt, dst_dma,
-						      dma_len);
-		if (ret)
-			goto out_terminate;
+				ret = uffd_dma_submit(req, &cur, &req->sgt,
+						      dst_dma, dma_len);
 		for_each_set_bit(i, &cur.chan_mask, MM_OFFLOAD_DMA_MAX_CHANNELS)
 			dma_async_issue_pending(mm_offload_dma_chan(i));
+		/* A failed submission: what went out runs, the CPU redoes it all. */
+		if (ret)
+			goto out_drain;
 	}
 
 	for (i = cpu_off >> PAGE_SHIFT; i < nr_pages; i++) {
@@ -637,23 +891,19 @@ static int uffd_dma_copy_pages(struct page *dst, unsigned long nr_pages,
 		flush_dcache_page(dst + i);
 	}
 
-	if (atomic_dec_and_test(&req.pending))
-		complete(&req.done);
-	ret = uffd_dma_wait(&req);
-	if (ret == -ETIMEDOUT)
-		goto out_terminate;
+out_drain:
+	if (atomic_dec_and_test(&req->pending))
+		uffd_dma_req_landed(req);
+	ret = uffd_dma_wait(req) ? : ret;
 	t1 = ktime_get();
 	atomic_long_add(ktime_us_delta(t1, t0), &wait_ns_total);
 
-	dma_unmap_page_attrs(dev, dst_dma, size, DMA_FROM_DEVICE, 0);
-	if (contig) {
-		dma_unmap_page_attrs(dev, src_dma, size, DMA_TO_DEVICE, 0);
-	} else {
-		dma_unmap_sgtable(dev, &sgt, DMA_TO_DEVICE, 0);
-		sg_free_table(&sgt);
+	if (ret == -ETIMEDOUT) {
+		/* The request is the engine's now; only the claim is ours. */
+		mm_offload_dma_release(cur.chan_mask);
+		return ret;
 	}
-	uffd_dma_unpin_src(pages, nr_pages, pinned);
-	kvfree(pages);
+	uffd_dma_req_release(req);
 	mm_offload_dma_release(cur.chan_mask);
 	atomic_long_add(ktime_us_delta(ktime_get(), t1), &unmap_us_total);
 
@@ -672,28 +922,14 @@ static int uffd_dma_copy_pages(struct page *dst, unsigned long nr_pages,
 	atomic_long_add(size - dma_len, &bytes_cpu);
 	return 0;
 
-out_unpin_done:
-	uffd_dma_unpin_src(pages, nr_pages, pinned);
-	kvfree(pages);
+out_done:
+	if (ret != -ETIMEDOUT)
+		uffd_dma_req_release(req);
 	mm_offload_dma_release(cur.chan_mask);
 	return ret;
 
-out_terminate:
-	for_each_set_bit(i, &cur.chan_mask, MM_OFFLOAD_DMA_MAX_CHANNELS)
-		dmaengine_terminate_sync(mm_offload_dma_chan(i));
-	dma_unmap_page_attrs(dev, dst_dma, size, DMA_FROM_DEVICE, 0);
-out_unmap_src:
-	if (contig) {
-		dma_unmap_page_attrs(dev, src_dma, size, DMA_TO_DEVICE, 0);
-		goto out_unpin;
-	}
-	dma_unmap_sgtable(dev, &sgt, DMA_TO_DEVICE, 0);
-out_sgfree:
-	sg_free_table(&sgt);
-out_unpin:
-	uffd_dma_unpin_src(pages, nr_pages, pinned);
-out_free:
-	kvfree(pages);
+out_req:
+	uffd_dma_req_release(req);
 out_release:
 	mm_offload_dma_release(cur.chan_mask);
 	if (ret != -EFAULT) {
@@ -742,6 +978,8 @@ static ssize_t offloading_store(struct kobject *kobj,
 			mm_offload_dma_pool_put();
 			goto err;
 		}
+		/* A reset engine gets another chance; see uffd_dma_abandon(). */
+		WRITE_ONCE(stalled, false);
 		offloading_enabled = true;
 	} else {
 		mm_offload_unregister(&uffd_dma_copier);
@@ -825,10 +1063,12 @@ UFFD_DMA_UINT_ATTR(cpu_pct, 0, 100, false);
 UFFD_DMA_UINT_ATTR(wait_mode, 0, 1, false);
 UFFD_DMA_UINT_ATTR(spin_us, 0, 100000, false);
 UFFD_DMA_UINT_ATTR(sg_elems, 0, 1024, false);
+UFFD_DMA_UINT_ATTR(abandon_ms, 0, 3600000, false);
 UFFD_DMA_BOOL_ATTR(cache_ctrl);
 UFFD_DMA_BOOL_ATTR(util_gate);
 UFFD_DMA_COUNTER_ATTR(copies_done);
 UFFD_DMA_COUNTER_ATTR(copies_failed);
+UFFD_DMA_COUNTER_ATTR(admit_failures);
 UFFD_DMA_COUNTER_ATTR(copies_refused);
 UFFD_DMA_COUNTER_ATTR(copies_efault);
 UFFD_DMA_COUNTER_ATTR(bytes_dma);
@@ -840,6 +1080,7 @@ UFFD_DMA_COUNTER_ATTR(unmap_us_total);
 UFFD_DMA_COUNTER_ATTR(src_contig);
 UFFD_DMA_COUNTER_ATTR(sg_txns);
 UFFD_DMA_COUNTER_ATTR(striped_copies);
+UFFD_DMA_COUNTER_ATTR(copies_abandoned);
 
 static ssize_t min_bytes_show(struct kobject *kobj,
 			      struct kobj_attribute *attr, char *buf)
@@ -897,6 +1138,7 @@ static struct attribute *uffd_dma_attrs[] = {
 	&util_gate_attr.attr,
 	&copies_done_attr.attr,
 	&copies_failed_attr.attr,
+	&admit_failures_attr.attr,
 	&copies_refused_attr.attr,
 	&copies_efault_attr.attr,
 	&bytes_dma_attr.attr,
@@ -908,6 +1150,8 @@ static struct attribute *uffd_dma_attrs[] = {
 	&src_contig_attr.attr,
 	&sg_txns_attr.attr,
 	&striped_copies_attr.attr,
+	&abandon_ms_attr.attr,
+	&copies_abandoned_attr.attr,
 	NULL
 };
 
