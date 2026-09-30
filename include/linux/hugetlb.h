@@ -585,6 +585,7 @@ enum hugetlb_page_flags {
 	HPG_vmemmap_optimized,
 	HPG_raw_hwp_unreliable,
 	HPG_cma,
+	HPG_prezeroed,
 	__NR_HPAGEFLAGS,
 };
 
@@ -645,6 +646,7 @@ HPAGEFLAG(Freed, freed)
 HPAGEFLAG(VmemmapOptimized, vmemmap_optimized)
 HPAGEFLAG(RawHwpUnreliable, raw_hwp_unreliable)
 HPAGEFLAG(Cma, cma)
+HPAGEFLAG(Prezeroed, prezeroed)
 
 #ifdef CONFIG_HUGETLB_PAGE
 
