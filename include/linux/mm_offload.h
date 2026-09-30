@@ -36,6 +36,14 @@ struct vm_area_struct;
  *	Folios without this marker are copied via per-folio CPU copy in
  *	the move phase.
  *
+ * @copy_folio_pairs: copy @nr folio pairs given as arrays.
+ *
+ *	The same work as @copy_folios, for callers that cannot put the
+ *	folios on lists: a hugetlb destination comes off the allocator
+ *	already linked into its hstate's active list, so folio->lru is
+ *	not the caller's to use. Marking is as for @copy_folios. May
+ *	sleep.
+ *
  * @clear_folio: zero the contents of @folio.
  *
  *	@addr_hint is the user address most likely to be touched first
@@ -56,6 +64,8 @@ struct mm_offload_provider {
 	char name[MM_OFFLOAD_NAME_LEN];
 	int (*copy_folios)(struct list_head *dst_list, struct list_head *src_list,
 			unsigned int folio_cnt);
+	int (*copy_folio_pairs)(struct folio **dst, struct folio **src,
+			unsigned int nr);
 	int (*clear_folio)(struct folio *folio, unsigned long addr_hint);
 	/*
 	 * Copy @nr_pages pages of user memory at @src into the physically
@@ -81,6 +91,8 @@ int mm_offload_reason_mask_format(char *buf, unsigned long mask);
 bool migrate_should_offload(int reason);
 int migrate_offload_batch_copy(struct list_head *dst_batch,
 		struct list_head *src_batch, unsigned int nr_batch);
+int migrate_offload_copy_pairs(struct folio **dst, struct folio **src,
+		unsigned int nr);
 int mm_offload_clear_folio(struct folio *folio, unsigned long addr_hint);
 int mm_offload_copy_user_pages(struct page *dst, unsigned long nr_pages,
 			       const void __user *src, bool allow_pagefault);
@@ -122,6 +134,8 @@ static inline int migrate_offload_batch_copy(struct list_head *dst_batch,
 {
 	return -EOPNOTSUPP;
 }
+static inline int migrate_offload_copy_pairs(struct folio **dst,
+		struct folio **src, unsigned int nr) { return -EOPNOTSUPP; }
 static inline int mm_offload_clear_folio(struct folio *folio,
 		unsigned long addr_hint) { return -EOPNOTSUPP; }
 static inline bool mm_offload_clear_available(void) { return false; }

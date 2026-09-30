@@ -1479,6 +1479,7 @@ out:
 struct hugetlb_migrate_lock {
 	struct address_space *mapping;
 	struct inode *inode;
+	bool contended;		/* the last trylock was what failed */
 };
 
 static void hugetlb_migrate_unlock(struct hugetlb_migrate_lock *hl)
@@ -1495,8 +1496,10 @@ static void hugetlb_migrate_unlock(struct hugetlb_migrate_lock *hl)
 
 /*
  * Take the mapping lock for the file-backed @src, which is locked.
- * Returns 0 with the lock held, and -EAGAIN when it is contended and
- * @wait is not allowed.
+ * Returns 0 with the lock held - or already held, when @hl has this
+ * mapping from an earlier folio of the batch - and -EAGAIN when it is
+ * contended and @wait is not allowed, or @hl holds another mapping,
+ * which the caller must release first rather than nest.
  *
  * A wait unlocks @src for its duration. On return the folio is locked
  * again but may have been removed from its mapping meanwhile, which the
@@ -1508,15 +1511,22 @@ static int hugetlb_migrate_lock(struct folio *src,
 	struct address_space *mapping = folio_mapping(src);
 	struct inode *inode;
 
+	hl->contended = false;
 	if (unlikely(!mapping))
+		return -EAGAIN;
+	if (hl->mapping == mapping)
+		return 0;
+	if (hl->mapping)
 		return -EAGAIN;
 
 	if (i_mmap_trylock_write(mapping)) {
 		hl->mapping = mapping;
 		return 0;
 	}
-	if (!wait)
+	if (!wait) {
+		hl->contended = true;
 		return -EAGAIN;
+	}
 
 	inode = igrab(mapping->host);
 	if (!inode)
@@ -1529,17 +1539,25 @@ static int hugetlb_migrate_lock(struct folio *src,
 	return 0;
 }
 
-static int unmap_and_move_hugetlb_folio(new_folio_t get_new_folio,
+/*
+ * @hl carries the mapping lock out to the move phase; @wait says whether
+ * the lock may be waited for, which needs a context that holds no other
+ * folio locked and a mode that allows sleeping.
+ */
+static int migrate_hugetlb_folio_unmap(new_folio_t get_new_folio,
 		free_folio_t put_new_folio, unsigned long private,
-		struct folio *src, int force, enum migrate_mode mode,
-		int reason, struct list_head *ret)
+		struct folio *src, struct folio **dstp,
+		struct anon_vma **anon_vmap, bool *was_mapped,
+		struct hugetlb_migrate_lock *hl, bool wait,
+		int force, enum migrate_mode mode, struct list_head *ret)
 {
+	struct anon_vma *anon_vma = NULL;
+	bool took_lock = false;
 	struct folio *dst;
 	int rc = -EAGAIN;
-	int was_mapped = 0;
-	struct anon_vma *anon_vma = NULL;
-	struct hugetlb_migrate_lock hl = {};
-	enum ttu_flags ttu = 0;
+
+	*anon_vmap = NULL;
+	*was_mapped = false;
 
 	if (folio_ref_count(src) == 1) {
 		/* folio was freed from under us. So we are done. */
@@ -1550,6 +1568,7 @@ static int unmap_and_move_hugetlb_folio(new_folio_t get_new_folio,
 	dst = get_new_folio(src, private);
 	if (!dst)
 		return -ENOMEM;
+	*dstp = dst;
 
 	if (!folio_trylock(src)) {
 		if (!force)
@@ -1582,40 +1601,96 @@ static int unmap_and_move_hugetlb_folio(new_folio_t get_new_folio,
 		 * semaphore in write mode here and set TTU_RMAP_LOCKED
 		 * to let lower levels know we have taken the lock.
 		 */
-		rc = hugetlb_migrate_lock(src, &hl, mode == MIGRATE_SYNC);
+		took_lock = !hl->mapping;
+		rc = hugetlb_migrate_lock(src, hl, wait);
 		if (rc)
 			goto out_unlock;
+		took_lock = took_lock && hl->mapping;
 		rc = -EAGAIN;
-		if (unlikely(folio_mapping(src) != hl.mapping)) {
+		if (unlikely(folio_mapping(src) != hl->mapping)) {
 			/* Left its mapping during the wait: being freed. */
 			rc = -EBUSY;
 			goto out_unlock;
 		}
-		ttu = TTU_RMAP_LOCKED;
 	}
 
 	if (unlikely(!folio_trylock(dst)))
 		goto put_anon;
 
 	if (folio_mapped(src)) {
+		enum ttu_flags ttu = folio_test_anon(src) ? 0 : TTU_RMAP_LOCKED;
+
 		/* A file folio cannot have become mapped under its lock. */
-		if (WARN_ON_ONCE(!folio_test_anon(src) && !hl.mapping))
-			goto unlock_put_anon;
+		if (WARN_ON_ONCE(ttu && !hl->mapping))
+			goto unlock_dst;
 
 		try_to_migrate(src, ttu);
-		was_mapped = 1;
+		*was_mapped = true;
+
+		if (!folio_mapped(src)) {
+			*anon_vmap = anon_vma;
+			return 0;
+		}
+
+		/* Something still holds it mapped; put the entries back. */
+		remove_migration_ptes(src, src, ttu);
+		*was_mapped = false;
+	} else {
+		*anon_vmap = anon_vma;
+		return 0;
 	}
 
-	if (!folio_mapped(src))
-		rc = move_to_new_folio(dst, src, mode);
-
-	if (was_mapped)
-		remove_migration_ptes(src, !rc ? dst : src, ttu);
-
-unlock_put_anon:
+unlock_dst:
 	folio_unlock(dst);
 
 put_anon:
+	if (anon_vma)
+		put_anon_vma(anon_vma);
+
+out_unlock:
+	/* Only what this call took: a batch may hold it for earlier folios. */
+	if (took_lock)
+		hugetlb_migrate_unlock(hl);
+	folio_unlock(src);
+out:
+	/*
+	 * A folio that has not been unmapped will be restored to the
+	 * right list unless we want to retry.
+	 */
+	if (rc != -EAGAIN)
+		list_move_tail(&src->lru, ret);
+
+	if (put_new_folio)
+		put_new_folio(dst, private);
+	else
+		folio_put(dst);
+
+	return rc;
+}
+
+/*
+ * Counterpart of migrate_folio_move() for hugetlb: move an already
+ * unmapped source onto the destination migrate_hugetlb_folio_unmap()
+ * allocated for it. Both folios are locked on entry and unlocked on
+ * return, whatever the outcome. @anon_vma and @was_mapped are what the
+ * unmap phase handed back, and @rmap_locked says it still holds the
+ * source's mapping lock, which the caller releases afterwards.
+ */
+static int migrate_hugetlb_folio_move(free_folio_t put_new_folio,
+		unsigned long private, struct folio *src, struct folio *dst,
+		struct anon_vma *anon_vma, bool was_mapped, bool rmap_locked,
+		enum migrate_mode mode, int reason, struct list_head *ret)
+{
+	int rc;
+
+	rc = move_to_new_folio(dst, src, mode);
+
+	if (was_mapped)
+		remove_migration_ptes(src, !rc ? dst : src,
+				      rmap_locked ? TTU_RMAP_LOCKED : 0);
+
+	folio_unlock(dst);
+
 	if (anon_vma)
 		put_anon_vma(anon_vma);
 
@@ -1624,10 +1699,12 @@ put_anon:
 		put_new_folio = NULL;
 	}
 
-out_unlock:
-	hugetlb_migrate_unlock(&hl);
 	folio_unlock(src);
-out:
+
+	/*
+	 * A folio that has been migrated has all references removed
+	 * and will be freed.
+	 */
 	if (!rc)
 		folio_putback_hugetlb(src);
 	else if (rc != -EAGAIN)
@@ -1643,6 +1720,50 @@ out:
 	else
 		folio_put(dst);
 
+	return rc;
+}
+
+/*
+ * Counterpart of migrate_folio_unmap() and migrate_folio_move() for hugetlb
+ * folio migration.
+ *
+ * This function doesn't wait the completion of hugepage I/O
+ * because there is no race between I/O and migration for hugepage.
+ * Note that currently hugepage I/O occurs only in direct I/O
+ * where no lock is held and PG_writeback is irrelevant,
+ * and writeback status of all subpages are counted in the reference
+ * count of the head page (i.e. if all subpages of a 2MB hugepage are
+ * under direct I/O, the reference of the head page is 512 and a bit more.)
+ * This means that when we try to migrate hugepage whose subpages are
+ * doing direct I/O, some references remain after try_to_unmap() and
+ * hugepage migration fails without data corruption.
+ *
+ * There is also no race when direct I/O is issued on the page under migration,
+ * because then pte is replaced with migration swap entry and direct I/O code
+ * will wait in the page fault for migration to complete.
+ */
+static int unmap_and_move_hugetlb_folio(new_folio_t get_new_folio,
+		free_folio_t put_new_folio, unsigned long private,
+		struct folio *src, int force, enum migrate_mode mode,
+		int reason, struct list_head *ret)
+{
+	struct hugetlb_migrate_lock hl = {};
+	struct anon_vma *anon_vma;
+	struct folio *dst = NULL;
+	bool was_mapped;
+	int rc;
+
+	rc = migrate_hugetlb_folio_unmap(get_new_folio, put_new_folio, private,
+					 src, &dst, &anon_vma, &was_mapped, &hl,
+					 mode == MIGRATE_SYNC, force, mode, ret);
+	/* Nothing to move: it failed, or the folio was freed under us. */
+	if (rc || !dst)
+		return rc;
+
+	rc = migrate_hugetlb_folio_move(put_new_folio, private, src, dst,
+					anon_vma, was_mapped, !!hl.mapping,
+					mode, reason, ret);
+	hugetlb_migrate_unlock(&hl);
 	return rc;
 }
 
@@ -1670,6 +1791,29 @@ static inline int try_split_folio(struct folio *folio, struct list_head *split_f
 #else
 #define NR_MAX_BATCHED_MIGRATION	512
 #endif
+
+/*
+ * NR_MAX_BATCHED_MIGRATION counts base pages, so a single PMD folio
+ * already fills a batch. That is fine for a CPU copy, which starts on
+ * the next folio the moment it finishes one, but it starves a copy
+ * offload: the migrator submits one folio, sleeps, moves it, and only
+ * then looks at the next. When a provider is offloading this reason,
+ * let a batch grow to NR_MIN_OFFLOAD_BATCH_FOLIOS folios however large
+ * they are - capped by NR_MAX_OFFLOAD_BATCH_PAGES, since the sources
+ * stay unmapped and both sides locked until the batch is moved.
+ */
+#define NR_MIN_OFFLOAD_BATCH_FOLIOS	16
+#define NR_MAX_OFFLOAD_BATCH_PAGES	(SZ_64M / PAGE_SIZE)
+
+static bool migrate_batch_full(int nr_pages, int nr_folios, bool offload)
+{
+	if (nr_pages < NR_MAX_BATCHED_MIGRATION)
+		return false;
+	if (!offload)
+		return true;
+	return nr_folios >= NR_MIN_OFFLOAD_BATCH_FOLIOS ||
+	       nr_pages >= NR_MAX_OFFLOAD_BATCH_PAGES;
+}
 #define NR_MAX_MIGRATE_PAGES_RETRY	10
 #define NR_MAX_MIGRATE_ASYNC_RETRY	3
 #define NR_MAX_MIGRATE_SYNC_RETRY					\
@@ -1687,6 +1831,99 @@ struct migrate_pages_stats {
 };
 
 /*
+ * Folio pairs per batched hugetlb copy, and the bytes at which a batch
+ * is flushed early. Each folio is at least PMD-sized, so a small count
+ * already hands the provider tens of megabytes; the cap keeps a batch
+ * of gigantic folios from growing without bound. The sources stay
+ * unmapped and both sides locked until the batch completes, so it is
+ * not worth making these large.
+ */
+#define NR_MAX_BATCHED_HUGETLB		16
+#define MAX_BATCHED_HUGETLB_BYTES	(64UL << 20)
+
+/*
+ * A batch of unmapped hugetlb folios waiting for their copy.
+ *
+ * The LRU path keeps this state on the destination folio and pairs the
+ * folios through two lists. hugetlb can do neither: dst->migrate_info
+ * aliases folio->private, which hugetlb uses as its flag word, and a
+ * hugetlb destination comes out of the allocator already linked into
+ * its hstate's active list, so folio->lru is not ours to use. Plain
+ * arrays it is.
+ */
+struct hugetlb_migrate_batch {
+	struct folio *src[NR_MAX_BATCHED_HUGETLB];
+	struct folio *dst[NR_MAX_BATCHED_HUGETLB];
+	struct anon_vma *anon_vma[NR_MAX_BATCHED_HUGETLB];
+	unsigned long mapped;		/* bit per entry: source was mapped */
+	unsigned int nr;
+	size_t bytes;
+	/*
+	 * The one mapping lock a batch may hold: every file-backed source
+	 * in it belongs to this mapping, and it is released when the batch
+	 * has moved. Taking a second would nest two mappings' locks.
+	 */
+	struct hugetlb_migrate_lock lock;
+};
+
+/*
+ * Copy a whole batch in one go, then move each folio. Pairs the
+ * provider declined or failed on are simply left unmarked and are
+ * copied by the move below.
+ */
+static void migrate_hugetlb_batch_move(struct hugetlb_migrate_batch *batch,
+		free_folio_t put_new_folio, unsigned long private,
+		enum migrate_mode mode, int reason,
+		struct list_head *ret_folios,
+		struct migrate_pages_stats *stats,
+		int *retry, int *nr_failed, int *nr_retry_pages)
+{
+	unsigned int i;
+
+	if (!batch->nr)
+		return;
+
+	migrate_offload_copy_pairs(batch->dst, batch->src, batch->nr);
+
+	for (i = 0; i < batch->nr; i++) {
+		int nr_pages = folio_nr_pages(batch->src[i]);
+		int rc;
+
+		cond_resched();
+
+		rc = migrate_hugetlb_folio_move(put_new_folio, private,
+				batch->src[i], batch->dst[i],
+				batch->anon_vma[i],
+				test_bit(i, &batch->mapped),
+				!folio_test_anon(batch->src[i]) &&
+				batch->lock.mapping,
+				mode, reason, ret_folios);
+		switch (rc) {
+		case -EAGAIN:
+			/* Stays on the from list for the next pass. */
+			(*retry)++;
+			*nr_retry_pages += nr_pages;
+			break;
+		case 0:
+			stats->nr_succeeded += nr_pages;
+			break;
+		default:
+			/*
+			 * Permanent failure (-EBUSY, etc.): the folio has
+			 * been moved to ret_folios and is not retried.
+			 */
+			(*nr_failed)++;
+			stats->nr_failed_pages += nr_pages;
+			break;
+		}
+	}
+	hugetlb_migrate_unlock(&batch->lock);
+	batch->nr = 0;
+	batch->mapped = 0;
+	batch->bytes = 0;
+}
+
+/*
  * Returns the number of hugetlb folios that were not migrated, or an error code
  * after NR_MAX_MIGRATE_PAGES_RETRY attempts or if no hugetlb folios are movable
  * any more because the list has become empty or no retryable hugetlb folios
@@ -1699,6 +1936,8 @@ static int migrate_hugetlbs(struct list_head *from, new_folio_t get_new_folio,
 			    struct migrate_pages_stats *stats,
 			    struct list_head *ret_folios)
 {
+	struct hugetlb_migrate_batch batch = {};
+	bool offload = migrate_should_offload(reason);
 	int retry = 1;
 	int nr_failed = 0;
 	int nr_retry_pages = 0;
@@ -1732,10 +1971,102 @@ static int migrate_hugetlbs(struct list_head *from, new_folio_t get_new_folio,
 				continue;
 			}
 
-			rc = unmap_and_move_hugetlb_folio(get_new_folio,
+			if (offload) {
+				struct anon_vma *anon_vma;
+				struct folio *dst = NULL;
+				bool force = pass > 2;
+				bool was_mapped;
+
+				/*
+				 * Nothing may sleep with a batch of sources
+				 * held unmapped and locked behind it: neither a
+				 * forced folio_lock() nor a wait for a mapping
+				 * lock. Flush ahead of the first, and of a folio
+				 * from another mapping than the batch holds,
+				 * since its lock cannot be taken on top.
+				 */
+				if (batch.nr &&
+				    (force || (batch.lock.mapping &&
+					       !folio_test_anon(folio) &&
+					       folio_mapping(folio) !=
+					       batch.lock.mapping)))
+					migrate_hugetlb_batch_move(&batch,
+						put_new_folio, private, mode,
+						reason, ret_folios, stats,
+						&retry, &nr_failed,
+						&nr_retry_pages);
+
+				rc = migrate_hugetlb_folio_unmap(get_new_folio,
+						put_new_folio, private, folio,
+						&dst, &anon_vma, &was_mapped,
+						&batch.lock,
+						!batch.nr && mode == MIGRATE_SYNC,
+						force, mode, ret_folios);
+				/*
+				 * The mapping lock was what was missing, and
+				 * only the batch stood in the way of waiting
+				 * for it: flush and wait, rather than burn a
+				 * pass on every folio behind the same lock.
+				 */
+				if (rc == -EAGAIN && batch.lock.contended &&
+				    batch.nr && mode == MIGRATE_SYNC) {
+					migrate_hugetlb_batch_move(&batch,
+						put_new_folio, private, mode,
+						reason, ret_folios, stats,
+						&retry, &nr_failed,
+						&nr_retry_pages);
+					rc = migrate_hugetlb_folio_unmap(
+						get_new_folio, put_new_folio,
+						private, folio, &dst, &anon_vma,
+						&was_mapped, &batch.lock, true,
+						force, mode, ret_folios);
+				}
+				/*
+				 * The move copies only when the marker is
+				 * missing and checks the reference count
+				 * only after that. A source something still
+				 * pins can change under a batched copy and be
+				 * unpinned before the check, so it moves on
+				 * its own, with the copy inside the check
+				 * where it always was.
+				 */
+				if (!rc && dst &&
+				    folio_ref_count(folio) !=
+				    folio_expected_ref_count(folio) + 1) {
+					rc = migrate_hugetlb_folio_move(
+						put_new_folio, private, folio,
+						dst, anon_vma, was_mapped,
+						!folio_test_anon(folio) &&
+						batch.lock.mapping,
+						mode, reason, ret_folios);
+					/* Taken for this folio alone. */
+					if (!batch.nr)
+						hugetlb_migrate_unlock(&batch.lock);
+				} else if (!rc && dst) {
+					unsigned int i = batch.nr++;
+
+					batch.src[i] = folio;
+					batch.dst[i] = dst;
+					batch.anon_vma[i] = anon_vma;
+					if (was_mapped)
+						__set_bit(i, &batch.mapped);
+					batch.bytes += folio_size(folio);
+					if (batch.nr == NR_MAX_BATCHED_HUGETLB ||
+					    batch.bytes >= MAX_BATCHED_HUGETLB_BYTES)
+						migrate_hugetlb_batch_move(&batch,
+							put_new_folio, private,
+							mode, reason, ret_folios,
+							stats, &retry, &nr_failed,
+							&nr_retry_pages);
+					/* Accounted when the batch moves. */
+					continue;
+				}
+			} else {
+				rc = unmap_and_move_hugetlb_folio(get_new_folio,
 							  put_new_folio, private,
 							  folio, pass > 2, mode,
 							  reason, ret_folios);
+			}
 			/*
 			 * The rules are:
 			 *	0: hugetlb folio will be put back
@@ -1747,8 +2078,13 @@ static int migrate_hugetlbs(struct list_head *from, new_folio_t get_new_folio,
 			case -ENOMEM:
 				/*
 				 * When memory is low, don't bother to try to migrate
-				 * other folios, just exit.
+				 * other folios, just move what is already unmapped
+				 * and exit.
 				 */
+				migrate_hugetlb_batch_move(&batch, put_new_folio,
+						private, mode, reason,
+						ret_folios, stats, &retry,
+						&nr_failed, &nr_retry_pages);
 				stats->nr_failed_pages += nr_pages + nr_retry_pages;
 				return -ENOMEM;
 			case -EAGAIN:
@@ -1770,6 +2106,9 @@ static int migrate_hugetlbs(struct list_head *from, new_folio_t get_new_folio,
 				break;
 			}
 		}
+		migrate_hugetlb_batch_move(&batch, put_new_folio, private, mode,
+					   reason, ret_folios, stats, &retry,
+					   &nr_failed, &nr_retry_pages);
 	}
 	/*
 	 * nr_failed is number of hugetlb folios failed to be migrated.  After
@@ -2258,8 +2597,9 @@ int migrate_pages(struct list_head *from, new_folio_t get_new_folio,
 		free_folio_t put_new_folio, unsigned long private,
 		enum migrate_mode mode, int reason, unsigned int *ret_succeeded)
 {
+	bool offload = migrate_should_offload(reason);
 	int rc, rc_gather;
-	int nr_pages;
+	int nr_pages, nr_folios;
 	struct folio *folio, *folio2;
 	LIST_HEAD(folios);
 	LIST_HEAD(ret_folios);
@@ -2277,6 +2617,7 @@ int migrate_pages(struct list_head *from, new_folio_t get_new_folio,
 
 again:
 	nr_pages = 0;
+	nr_folios = 0;
 	list_for_each_entry_safe(folio, folio2, from, lru) {
 		/* Retried hugetlb folios will be kept in list  */
 		if (folio_test_hugetlb(folio)) {
@@ -2285,10 +2626,11 @@ again:
 		}
 
 		nr_pages += folio_nr_pages(folio);
-		if (nr_pages >= NR_MAX_BATCHED_MIGRATION)
+		nr_folios++;
+		if (migrate_batch_full(nr_pages, nr_folios, offload))
 			break;
 	}
-	if (nr_pages >= NR_MAX_BATCHED_MIGRATION)
+	if (migrate_batch_full(nr_pages, nr_folios, offload))
 		list_cut_before(&folios, from, &folio2->lru);
 	else
 		list_splice_init(from, &folios);

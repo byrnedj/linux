@@ -631,6 +631,39 @@ static int folios_copy_dma(struct list_head *dst_list,
 	return ret;
 }
 
+/**
+ * folio_pairs_copy_dma - copy folio pairs given as arrays
+ * @dst: destination folios
+ * @src: source folios
+ * @nr: number of pairs
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+static int folio_pairs_copy_dma(struct folio **dst, struct folio **src,
+				unsigned int nr)
+{
+	struct dcbm_pair *pairs;
+	unsigned int i;
+	int ret;
+
+	pairs = kcalloc(nr, sizeof(*pairs), GFP_KERNEL);
+	if (!pairs)
+		return -ENOMEM;
+
+	for (i = 0; i < nr; i++) {
+		pairs[i].src = src[i];
+		pairs[i].dst = dst[i];
+	}
+
+	ret = copy_pairs_dma(pairs, nr);
+	if (!ret) {
+		for (i = 0; i < nr; i++)
+			folio_set_migrate_copied(dst[i]);
+	}
+	kfree(pairs);
+	return ret;
+}
+
 /*
  * Split [addr, addr + len) into chunks of at most DCBM_CLEAR_CHUNK_BYTES,
  * dealt round-robin over the claimed channels, and submit one memset
@@ -786,6 +819,7 @@ out_release:
 static const struct mm_offload_provider dma_migrator = {
 	.name = "DCBM",
 	.copy_folios = folios_copy_dma,
+	.copy_folio_pairs = folio_pairs_copy_dma,
 	.clear_folio = folio_clear_dma,
 	.owner = THIS_MODULE,
 };

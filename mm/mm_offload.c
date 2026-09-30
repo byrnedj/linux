@@ -22,6 +22,18 @@ DEFINE_SRCU(mm_offload_srcu);
 DEFINE_STATIC_CALL(mm_offload_copy_folios_fn, migrate_folios_mc_copy);
 
 /*
+ * Default target for the array form. Only reachable in the narrow
+ * window where a caller saw the static branch enabled while the
+ * provider was being torn down; the caller falls back to CPU copies.
+ */
+static int mm_offload_copy_pairs_null(struct folio **dst, struct folio **src,
+				      unsigned int nr)
+{
+	return -ENXIO;
+}
+DEFINE_STATIC_CALL(mm_offload_copy_pairs_fn, mm_offload_copy_pairs_null);
+
+/*
  * Default clear target. Only reachable in the narrow window where a
  * caller saw the static branch enabled while the provider was being
  * torn down; the caller falls back to CPU clearing.
@@ -47,6 +59,7 @@ static DEFINE_MUTEX(provider_mutex);
  * can coexist; a provider may not claim an op another one holds.
  */
 static const struct mm_offload_provider *copy_folios_provider;
+static const struct mm_offload_provider *copy_pairs_provider;
 static const struct mm_offload_provider *clear_folio_provider;
 static const struct mm_offload_provider *copy_user_provider;
 
@@ -160,6 +173,33 @@ int migrate_offload_batch_copy(struct list_head *dst_batch,
 	idx = srcu_read_lock(&mm_offload_srcu);
 	rc = static_call(mm_offload_copy_folios_fn)(dst_batch, src_batch, nr_batch);
 	srcu_read_unlock(&mm_offload_srcu, idx);
+	return rc;
+}
+
+/**
+ * migrate_offload_copy_pairs - copy folio pairs through the provider.
+ * @dst: destination folios, each owned by the caller and not visible.
+ * @src: source folios, each unmapped and locked by the caller.
+ * @nr: number of pairs.
+ *
+ * The array form of migrate_offload_batch_copy(), for callers whose
+ * folios cannot be put on lists. May sleep.
+ *
+ * Return: 0 when every pair was copied, negative errno otherwise; the
+ * provider marks the destinations it copied.
+ */
+int migrate_offload_copy_pairs(struct folio **dst, struct folio **src,
+			       unsigned int nr)
+{
+	int idx, rc;
+
+	might_sleep();
+
+	atomic_inc(&ops_in_flight);
+	idx = srcu_read_lock(&mm_offload_srcu);
+	rc = static_call(mm_offload_copy_pairs_fn)(dst, src, nr);
+	srcu_read_unlock(&mm_offload_srcu, idx);
+	atomic_dec(&ops_in_flight);
 	return rc;
 }
 
@@ -308,13 +348,15 @@ int mm_offload_register(const struct mm_offload_provider *p,
 	unsigned long mask;
 	int ret = 0;
 
-	if (!p || (!p->copy_folios && !p->clear_folio && !p->copy_user_pages))
+	if (!p || (!p->copy_folios && !p->copy_folio_pairs && !p->clear_folio &&
+		   !p->copy_user_pages))
 		return -EINVAL;
 
 	mask = migrate_reason_mask & MIGRATE_OFFLOAD_REASONS_ALLOWED;
 
 	mutex_lock(&provider_mutex);
 	if ((p->copy_folios && copy_folios_provider) ||
+	    (p->copy_folio_pairs && copy_pairs_provider) ||
 	    (p->clear_folio && clear_folio_provider) ||
 	    (p->copy_user_pages && copy_user_provider)) {
 		ret = -EBUSY;
@@ -332,6 +374,10 @@ int mm_offload_register(const struct mm_offload_provider *p,
 		WRITE_ONCE(active_reason_mask, mask);
 		static_call_update(mm_offload_copy_folios_fn, p->copy_folios);
 		static_branch_enable(&mm_offload_copy_folios_enabled);
+	}
+	if (p->copy_folio_pairs) {
+		copy_pairs_provider = p;
+		static_call_update(mm_offload_copy_pairs_fn, p->copy_folio_pairs);
 	}
 	if (p->clear_folio) {
 		clear_folio_provider = p;
@@ -375,6 +421,7 @@ int mm_offload_unregister(const struct mm_offload_provider *p)
 
 	mutex_lock(&provider_mutex);
 	if ((p->copy_folios && copy_folios_provider != p) ||
+	    (p->copy_folio_pairs && copy_pairs_provider != p) ||
 	    (p->clear_folio && clear_folio_provider != p) ||
 	    (p->copy_user_pages && copy_user_provider != p)) {
 		mutex_unlock(&provider_mutex);
@@ -391,6 +438,11 @@ int mm_offload_unregister(const struct mm_offload_provider *p)
 		WRITE_ONCE(active_reason_mask, 0);
 		static_call_update(mm_offload_copy_folios_fn,
 				   migrate_folios_mc_copy);
+	}
+	if (p->copy_folio_pairs) {
+		copy_pairs_provider = NULL;
+		static_call_update(mm_offload_copy_pairs_fn,
+				   mm_offload_copy_pairs_null);
 	}
 	if (p->clear_folio) {
 		clear_folio_provider = NULL;
