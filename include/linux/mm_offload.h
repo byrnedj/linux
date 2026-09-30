@@ -4,12 +4,14 @@
 
 #include <linux/bits.h>
 #include <linux/errno.h>
+#include <linux/gfp_types.h>
 #include <linux/jump_label.h>
 #include <linux/migrate_mode.h>
 
 struct folio;
 struct list_head;
 struct module;
+struct vm_area_struct;
 
 #define MM_OFFLOAD_NAME_LEN 32
 
@@ -71,6 +73,8 @@ int migrate_offload_batch_copy(struct list_head *dst_batch,
 		struct list_head *src_batch, unsigned int nr_batch);
 int mm_offload_clear_folio(struct folio *folio, unsigned long addr_hint);
 bool mm_offload_cpus_saturated(void);
+struct folio *prezero_pool_get(struct vm_area_struct *vma, unsigned long addr,
+			       gfp_t gfp);
 
 /*
  * Cheap availability test for hot paths: a static branch, patched only
@@ -106,6 +110,8 @@ static inline int mm_offload_clear_folio(struct folio *folio,
 		unsigned long addr_hint) { return -EOPNOTSUPP; }
 static inline bool mm_offload_clear_available(void) { return false; }
 static inline bool mm_offload_cpus_saturated(void) { return false; }
+static inline struct folio *prezero_pool_get(struct vm_area_struct *vma,
+		unsigned long addr, gfp_t gfp) { return NULL; }
 #endif
 
 #endif /* _LINUX_MM_OFFLOAD_H */
