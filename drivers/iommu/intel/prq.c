@@ -288,6 +288,7 @@ int intel_iommu_enable_prq(struct intel_iommu *iommu)
 {
 	struct iopf_queue *iopfq;
 	int irq, ret;
+	u32 prs;
 
 	iommu->prq =
 		iommu_alloc_pages_node_sz(iommu->node, GFP_KERNEL, PRQ_SIZE);
@@ -327,6 +328,22 @@ int intel_iommu_enable_prq(struct intel_iommu *iommu)
 	}
 	writeq(0ULL, iommu->reg + DMAR_PQH_REG);
 	writeq(0ULL, iommu->reg + DMAR_PQT_REG);
+
+	/*
+	 * Clear any latched page request status before the queue goes live.
+	 * The page request event interrupt is generated only on the 0->1
+	 * transition of PPR, so a stale PPR - left behind by a previous PRQ
+	 * session torn down with requests outstanding, by kexec, or by
+	 * firmware - means the first request after enable never generates an
+	 * interrupt. The queue then fills with the head parked at 0 and no
+	 * interrupt can ever arrive, because the transition already happened.
+	 */
+	prs = readl(iommu->reg + DMAR_PRS_REG);
+	if (prs & (DMA_PRS_PPR | DMA_PRS_PRO))
+		pr_warn("IOMMU: %s: stale page request status at enable (PRS %x), clearing\n",
+			iommu->name, prs);
+	writel(DMA_PRS_PPR | DMA_PRS_PRO, iommu->reg + DMAR_PRS_REG);
+
 	writeq(virt_to_phys(iommu->prq) | PRQ_ORDER, iommu->reg + DMAR_PQA_REG);
 
 	init_completion(&iommu->prq_complete);
@@ -351,6 +368,9 @@ int intel_iommu_finish_prq(struct intel_iommu *iommu)
 	writeq(0ULL, iommu->reg + DMAR_PQH_REG);
 	writeq(0ULL, iommu->reg + DMAR_PQT_REG);
 	writeq(0ULL, iommu->reg + DMAR_PQA_REG);
+
+	/* Leave no latched status behind for the next enable. */
+	writel(DMA_PRS_PPR | DMA_PRS_PRO, iommu->reg + DMAR_PRS_REG);
 
 	if (iommu->pr_irq) {
 		free_irq(iommu->pr_irq, iommu);
