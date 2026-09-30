@@ -9,127 +9,291 @@
  * Copyright (C) 2024-26 Advanced Micro Devices, Inc.
  */
 
+#include <linux/bitops.h>
 #include <linux/module.h>
 #include <linux/dma-mapping.h>
 #include <linux/dmaengine.h>
 #include <linux/migrate.h>
 #include <linux/migrate_copy_offload.h>
+#include <linux/mutex.h>
+#include <linux/scatterlist.h>
+#include <linux/slab.h>
+#include <linux/wait.h>
 
 #define MAX_DMA_CHANNELS	16
+/*
+ * Folios per scatter-gather transaction. A provider that supports
+ * DMA_MEMCPY_SG turns one transaction into one hardware batch, so
+ * this bounds the batch element count it must accept.
+ */
+#define DCBM_SG_ELEMS_DEFAULT	32
+/*
+ * Descriptors in flight per channel. A DSA work queue owns a fixed
+ * descriptor pool (its queue depth, 64 in a typical configuration)
+ * and prep returns NULL once it is exhausted, so a slice submits at
+ * most this many descriptors before waiting for completions.
+ */
+#define DCBM_MAX_INFLIGHT_DEFAULT	32
 
 static atomic_long_t folios_migrated;
 static atomic_long_t folios_failures;
+static atomic_long_t batches_refused;
 
 static bool offloading_enabled;
 static unsigned int nr_dma_channels = 1;
+static unsigned int sg_elems = DCBM_SG_ELEMS_DEFAULT;
+static unsigned int max_inflight = DCBM_MAX_INFLIGHT_DEFAULT;
+static bool cache_ctrl = true;
 static DEFINE_MUTEX(dcbm_mutex);
+
+/*
+ * Channels are acquired once when offloading is enabled and shared by
+ * concurrent batches through per-channel trylocks. When every channel
+ * is busy the batch is refused and the move phase copies on the CPU,
+ * instead of queueing behind other batches.
+ */
+static struct dcbm_chan {
+	struct dma_chan *chan;
+	struct mutex lock;
+} channels[MAX_DMA_CHANNELS];
+static unsigned int nr_channels;
+
+/*
+ * Channels grouped by DMA device. One batch maps its folios against a
+ * single device and uses only that group's channels. Concurrent
+ * batches rotate over the groups so every device contributes.
+ */
+static struct dcbm_group {
+	struct device *dev;
+	int node;
+	unsigned int first;
+	unsigned int nr;
+} groups[MAX_DMA_CHANNELS];
+static unsigned int nr_groups;
+static atomic_t group_cursor;
+
+struct dcbm_copy {
+	dma_addr_t src;
+	dma_addr_t dst;
+	size_t len;
+};
 
 struct dma_work {
 	struct dma_chan *chan;
-	struct completion done;
+	struct device *dev;
+	wait_queue_head_t waitq;
 	atomic_t pending;
-	struct sg_table *src_sgt;
-	struct sg_table *dst_sgt;
-	bool mapped;
+	atomic_t error;
+	struct dcbm_copy *copies;
+	unsigned int nr_copies;
+	bool submitted;
 };
 
-static void dma_completion_callback(void *data)
+/*
+ * Every descriptor carries its own completion. Engines such as Intel
+ * DSA complete the descriptors of one channel out of order when the
+ * work queue is served by several engines, so a callback on the last
+ * submitted descriptor does not mean the earlier ones have landed.
+ * The pending count starts at one for the submitter, so the work
+ * cannot complete before every descriptor has been submitted.
+ *
+ * A descriptor the hardware rejected or aborted completes with an
+ * error result; it must fail the batch, or a folio that was never
+ * written would be reported as copied.
+ */
+static void dma_completion_callback(void *data,
+				    const struct dmaengine_result *result)
 {
 	struct dma_work *work = data;
 
-	if (atomic_dec_and_test(&work->pending))
-		complete(&work->done);
+	if (!result || result->result != DMA_TRANS_NOERROR)
+		atomic_set(&work->error, -EIO);
+
+	atomic_dec(&work->pending);
+	wake_up(&work->waitq);
 }
 
-static int setup_sg_tables(struct dma_work *work, struct list_head **src_pos,
-			   struct list_head **dst_pos, int nr)
+static void dma_work_init(struct dma_work *work)
 {
-	struct scatterlist *sg_src, *sg_dst;
-	struct device *dev;
-	int i, ret;
+	init_waitqueue_head(&work->waitq);
+	/* Submission reference, dropped by dma_work_done_submitting(). */
+	atomic_set(&work->pending, 1);
+	atomic_set(&work->error, 0);
+}
 
-	work->src_sgt = kmalloc_obj(*work->src_sgt, GFP_KERNEL);
-	if (!work->src_sgt)
-		return -ENOMEM;
-	work->dst_sgt = kmalloc_obj(*work->dst_sgt, GFP_KERNEL);
-	if (!work->dst_sgt) {
-		ret = -ENOMEM;
-		goto err_free_src;
+static void dma_work_done_submitting(struct dma_work *work)
+{
+	atomic_dec(&work->pending);
+	wake_up(&work->waitq);
+}
+
+/*
+ * Throttle submission to max_inflight descriptors per channel, so a
+ * slice never outruns the channel's descriptor pool.
+ */
+static void dma_work_throttle(struct dma_work *work)
+{
+	unsigned int limit = READ_ONCE(max_inflight) + 1;
+
+	wait_event(work->waitq, atomic_read(&work->pending) < limit);
+}
+
+static unsigned long dcbm_claim_group(struct dcbm_group *grp,
+				      unsigned int want)
+{
+	unsigned long mask = 0;
+	unsigned int i, got = 0;
+
+	for (i = 0; i < grp->nr && got < want; i++) {
+		unsigned int idx = grp->first + i;
+
+		if (mutex_trylock(&channels[idx].lock)) {
+			mask |= BIT(idx);
+			got++;
+		}
 	}
+	return mask;
+}
 
-	ret = sg_alloc_table(work->src_sgt, nr, GFP_KERNEL);
-	if (ret)
-		goto err_free_dst;
-	ret = sg_alloc_table(work->dst_sgt, nr, GFP_KERNEL);
-	if (ret)
-		goto err_free_src_table;
+/*
+ * One selection pass: collect the groups whose node does (or does
+ * not) match @nid and try them starting from a rotating offset within
+ * that selection, so rotation is fair however the eligible groups are
+ * laid out in the global array.
+ */
+static unsigned long dcbm_claim_pass(int nid, bool match_node,
+				     unsigned int want,
+				     struct dcbm_group **grpp)
+{
+	unsigned int sel[MAX_DMA_CHANNELS];
+	unsigned int n = 0, g, i;
 
-	sg_src = work->src_sgt->sgl;
-	sg_dst = work->dst_sgt->sgl;
+	for (g = 0; g < nr_groups; g++)
+		if ((groups[g].node == nid) == match_node)
+			sel[n++] = g;
+	if (!n)
+		return 0;
+
+	g = (unsigned int)atomic_inc_return(&group_cursor) % n;
+	for (i = 0; i < n; i++) {
+		struct dcbm_group *grp = &groups[sel[(g + i) % n]];
+		unsigned long mask = dcbm_claim_group(grp, want);
+
+		if (mask) {
+			*grpp = grp;
+			return mask;
+		}
+	}
+	return 0;
+}
+
+/*
+ * Claim up to @want channels from one device group. Groups on the
+ * destination node are tried first: a cross-socket copy pays
+ * remote-link bandwidth on every written line plus a remote
+ * completion interrupt, so locality beats spreading. The first group
+ * with any free channel wins. If every channel of every group is busy
+ * the batch is refused.
+ */
+static unsigned long dcbm_claim_channels(unsigned int want, int nid,
+					 struct dcbm_group **grpp)
+{
+	unsigned long mask = dcbm_claim_pass(nid, true, want, grpp);
+
+	if (!mask)
+		mask = dcbm_claim_pass(nid, false, want, grpp);
+	return mask;
+}
+
+static void dcbm_release_channels(unsigned long mask)
+{
+	unsigned int i;
+
+	for_each_set_bit(i, &mask, nr_channels)
+		mutex_unlock(&channels[i].lock);
+}
+
+/*
+ * Map each folio of the slice on its own. A folio is physically
+ * contiguous, so it is one DMA segment, and the source and
+ * destination of a copy pair up by folio rather than by whatever
+ * segments an IOMMU would merge two scatterlists into.
+ */
+static int map_folios(struct dma_work *work, struct list_head **src_pos,
+		      struct list_head **dst_pos, unsigned int nr)
+{
+	struct device *dev = work->dev;
+	unsigned int i;
+
+	work->copies = kcalloc(nr, sizeof(*work->copies), GFP_KERNEL);
+	if (!work->copies)
+		return -ENOMEM;
+
 	for (i = 0; i < nr; i++) {
 		struct folio *src = list_entry(*src_pos, struct folio, lru);
 		struct folio *dst = list_entry(*dst_pos, struct folio, lru);
+		struct dcbm_copy *copy = &work->copies[i];
 
-		sg_set_folio(sg_src, src, folio_size(src), 0);
-		sg_set_folio(sg_dst, dst, folio_size(dst), 0);
+		copy->len = folio_size(src);
+		copy->src = dma_map_page_attrs(dev, folio_page(src, 0), 0,
+					       copy->len, DMA_TO_DEVICE, 0);
+		if (dma_mapping_error(dev, copy->src))
+			goto err;
+		copy->dst = dma_map_page_attrs(dev, folio_page(dst, 0), 0,
+					       copy->len, DMA_FROM_DEVICE, 0);
+		if (dma_mapping_error(dev, copy->dst)) {
+			dma_unmap_page_attrs(dev, copy->src, copy->len,
+					     DMA_TO_DEVICE, 0);
+			goto err;
+		}
+		work->nr_copies++;
 
 		*src_pos = (*src_pos)->next;
 		*dst_pos = (*dst_pos)->next;
-
-		if (i < nr - 1) {
-			sg_src = sg_next(sg_src);
-			sg_dst = sg_next(sg_dst);
-		}
 	}
-
-	dev = dmaengine_get_dma_device(work->chan);
-	if (!dev) {
-		ret = -ENODEV;
-		goto err_free_dst_table;
-	}
-	ret = dma_map_sgtable(dev, work->src_sgt, DMA_TO_DEVICE,
-			      DMA_ATTR_SKIP_CPU_SYNC | DMA_ATTR_NO_KERNEL_MAPPING);
-	if (ret)
-		goto err_free_dst_table;
-	ret = dma_map_sgtable(dev, work->dst_sgt, DMA_FROM_DEVICE,
-			      DMA_ATTR_SKIP_CPU_SYNC | DMA_ATTR_NO_KERNEL_MAPPING);
-	if (ret)
-		goto err_unmap_src;
-
-	/*
-	 * TODO: IOMMU may merge segments unevenly on the two sides, fall back
-	 * bail to CPU copy. In practice, I have not observed merging in tests.
-	 * Handling unequal nents is left for follow-up.
-	 */
-	if (work->src_sgt->nents != work->dst_sgt->nents) {
-		ret = -EINVAL;
-		goto err_unmap_dst;
-	}
-	work->mapped = true;
 	return 0;
+err:
+	/* The mapped prefix is undone by cleanup_dma_work(). */
+	return -EIO;
+}
 
-err_unmap_dst:
-	dma_unmap_sgtable(dev, work->dst_sgt, DMA_FROM_DEVICE,
-			  DMA_ATTR_SKIP_CPU_SYNC | DMA_ATTR_NO_KERNEL_MAPPING);
-err_unmap_src:
-	dma_unmap_sgtable(dev, work->src_sgt, DMA_TO_DEVICE,
-			  DMA_ATTR_SKIP_CPU_SYNC | DMA_ATTR_NO_KERNEL_MAPPING);
-err_free_dst_table:
-	sg_free_table(work->dst_sgt);
-err_free_src_table:
-	sg_free_table(work->src_sgt);
-err_free_dst:
-	kfree(work->dst_sgt);
-	work->dst_sgt = NULL;
-err_free_src:
-	kfree(work->src_sgt);
-	work->src_sgt = NULL;
-	return ret;
+static void unmap_folios(struct dma_work *work)
+{
+	unsigned int i;
+
+	for (i = 0; i < work->nr_copies; i++) {
+		struct dcbm_copy *copy = &work->copies[i];
+
+		dma_unmap_page_attrs(work->dev, copy->dst, copy->len,
+				     DMA_FROM_DEVICE, 0);
+		dma_unmap_page_attrs(work->dev, copy->src, copy->len,
+				     DMA_TO_DEVICE, 0);
+	}
+	work->nr_copies = 0;
+	kfree(work->copies);
+	work->copies = NULL;
+}
+
+/*
+ * Wait for every descriptor of a slice that was handed to the engine.
+ * Nothing is ever terminated: the descriptors reference the folio
+ * mappings and the on-stack work until they complete, dmaengine has
+ * no per-descriptor abort, and a channel-wide terminate on an engine
+ * such as DSA tears down the channel's interrupt handle, after which
+ * no later descriptor on that channel completes. Anything submitted
+ * runs to completion; a failure only decides what the caller does
+ * afterwards.
+ */
+static int dma_work_wait(struct dma_work *work)
+{
+	if (!work->submitted)
+		return 0;
+	wait_event(work->waitq, !atomic_read(&work->pending));
+	return atomic_read(&work->error);
 }
 
 static void cleanup_dma_work(struct dma_work *works, int actual_channels)
 {
-	struct device *dev;
 	int i;
 
 	if (!works)
@@ -138,71 +302,121 @@ static void cleanup_dma_work(struct dma_work *works, int actual_channels)
 	for (i = 0; i < actual_channels; i++) {
 		if (!works[i].chan)
 			continue;
-
-		dev = dmaengine_get_dma_device(works[i].chan);
-
-		if (works[i].mapped)
-			dmaengine_terminate_sync(works[i].chan);
-
-		if (dev && works[i].mapped) {
-			if (works[i].src_sgt) {
-				dma_unmap_sgtable(dev, works[i].src_sgt,
-						  DMA_TO_DEVICE,
-						  DMA_ATTR_SKIP_CPU_SYNC |
-						  DMA_ATTR_NO_KERNEL_MAPPING);
-				sg_free_table(works[i].src_sgt);
-				kfree(works[i].src_sgt);
-			}
-			if (works[i].dst_sgt) {
-				dma_unmap_sgtable(dev, works[i].dst_sgt,
-						  DMA_FROM_DEVICE,
-						  DMA_ATTR_SKIP_CPU_SYNC |
-						  DMA_ATTR_NO_KERNEL_MAPPING);
-				sg_free_table(works[i].dst_sgt);
-				kfree(works[i].dst_sgt);
-			}
-		}
-		dma_release_channel(works[i].chan);
+		unmap_folios(&works[i]);
 	}
 	kfree(works);
 }
 
+static int submit_one(struct dma_work *work, struct dma_async_tx_descriptor *tx)
+{
+	dma_cookie_t cookie;
+
+	tx->callback_result = dma_completion_callback;
+	tx->callback_param = work;
+	atomic_inc(&work->pending);
+
+	cookie = dmaengine_submit(tx);
+	if (dma_submit_error(cookie)) {
+		atomic_dec(&work->pending);
+		return -EIO;
+	}
+	/*
+	 * Start it now. The throttle sleeps for completions before the
+	 * next descriptor is prepared, and on a provider whose submit only
+	 * queues (a virt-dma driver such as ptdma) nothing completes until
+	 * issue_pending: deferring it to the end of the slice would wait
+	 * on descriptors that never ran. The descriptor's own channel,
+	 * because a work may spread its descriptors over several.
+	 */
+	dma_async_issue_pending(tx->chan);
+	return 0;
+}
+
+/*
+ * Hand the copies to the provider as scatter-gather transactions of
+ * up to sg_elems folios each. A batch-capable engine such as DSA
+ * executes one transaction as one hardware batch descriptor, so the
+ * submission cost is paid once per sg_elems folios instead of once
+ * per folio. The scatterlists carry the DMA addresses mapped by
+ * map_folios(); they are not mapped again.
+ */
+static int submit_sg_transfers(struct dma_work *work, unsigned long flags)
+{
+	struct scatterlist *src_sg, *dst_sg;
+	unsigned int elems = READ_ONCE(sg_elems);
+	unsigned int done = 0;
+	int ret = 0;
+
+	src_sg = kmalloc_array(2 * elems, sizeof(*src_sg), GFP_KERNEL);
+	if (!src_sg)
+		return -ENOMEM;
+	dst_sg = src_sg + elems;
+
+	while (done < work->nr_copies) {
+		unsigned int n = min(elems, work->nr_copies - done);
+		struct dma_async_tx_descriptor *tx;
+		unsigned int i;
+
+		sg_init_table(src_sg, n);
+		sg_init_table(dst_sg, n);
+		for (i = 0; i < n; i++) {
+			struct dcbm_copy *copy = &work->copies[done + i];
+
+			sg_dma_address(&src_sg[i]) = copy->src;
+			sg_dma_len(&src_sg[i]) = copy->len;
+			sg_dma_address(&dst_sg[i]) = copy->dst;
+			sg_dma_len(&dst_sg[i]) = copy->len;
+		}
+
+		dma_work_throttle(work);
+		tx = dmaengine_prep_dma_memcpy_sg(work->chan, dst_sg, n,
+						  src_sg, n, flags);
+		if (!tx) {
+			ret = -EIO;
+			break;
+		}
+		ret = submit_one(work, tx);
+		if (ret)
+			break;
+		done += n;
+	}
+
+	kfree(src_sg);
+	return ret;
+}
+
 static int submit_dma_transfers(struct dma_work *work)
 {
-	struct scatterlist *sg_src, *sg_dst;
 	struct dma_async_tx_descriptor *tx;
-	unsigned long flags = DMA_CTRL_ACK;
-	dma_cookie_t cookie;
-	int i;
+	unsigned long flags = DMA_CTRL_ACK | DMA_PREP_INTERRUPT;
+	unsigned int i;
+	int ret;
 
-	atomic_set(&work->pending, 1);
+	/*
+	 * Cache-allocating writes leave the copied data LLC-warm for the
+	 * first access after remapping, at the cost of cache footprint
+	 * for folios that are not touched soon.
+	 */
+	if (READ_ONCE(cache_ctrl))
+		flags |= DMA_PREP_CACHE_CONTROL;
 
-	sg_src = work->src_sgt->sgl;
-	sg_dst = work->dst_sgt->sgl;
-	for_each_sgtable_dma_sg(work->src_sgt, sg_src, i) {
-		if (i == work->src_sgt->nents - 1)
-			flags |= DMA_PREP_INTERRUPT;
+	dma_work_init(work);
 
-		tx = dmaengine_prep_dma_memcpy(work->chan,
-					       sg_dma_address(sg_dst),
-					       sg_dma_address(sg_src),
-					       sg_dma_len(sg_src), flags);
-		if (!tx) {
-			atomic_set(&work->pending, 0);
+	if (dma_has_cap(DMA_MEMCPY_SG, work->chan->device->cap_mask))
+		return submit_sg_transfers(work, flags);
+
+	for (i = 0; i < work->nr_copies; i++) {
+		struct dcbm_copy *copy = &work->copies[i];
+
+		dma_work_throttle(work);
+		tx = dmaengine_prep_dma_memcpy(work->chan, copy->dst, copy->src,
+					       copy->len, flags);
+		if (!tx)
 			return -EIO;
-		}
 
-		if (i == work->src_sgt->nents - 1) {
-			tx->callback = dma_completion_callback;
-			tx->callback_param = work;
-		}
-
-		cookie = dmaengine_submit(tx);
-		if (dma_submit_error(cookie)) {
-			atomic_set(&work->pending, 0);
-			return -EIO;
-		}
-		sg_dst = sg_next(sg_dst);
+		ret = submit_one(work, tx);
+		if (ret)
+			return ret;
 	}
 	return 0;
 }
@@ -220,34 +434,35 @@ static int folios_copy_dma(struct list_head *dst_list,
 {
 	struct folio *dst;
 	struct dma_work *works;
+	struct dcbm_group *grp;
 	struct list_head *src_pos = src_list->next;
 	struct list_head *dst_pos = dst_list->next;
+	unsigned long chan_mask;
 	int i, folios_per_chan, ret;
-	dma_cap_mask_t mask;
 	int actual_channels = 0;
-	unsigned int max_channels;
+	unsigned int max_channels, idx;
 
 	max_channels = min3(READ_ONCE(nr_dma_channels), nr_folios,
 			    (unsigned int)MAX_DMA_CHANNELS);
 
-	works = kcalloc(max_channels, sizeof(*works), GFP_KERNEL);
-	if (!works)
-		return -ENOMEM;
-
-	dma_cap_zero(mask);
-	dma_cap_set(DMA_MEMCPY, mask);
-
-	for (i = 0; i < max_channels; i++) {
-		works[actual_channels].chan = dma_request_chan_by_mask(&mask);
-		if (IS_ERR(works[actual_channels].chan))
-			break;
-		init_completion(&works[actual_channels].done);
-		actual_channels++;
+	/* Prefer the device closest to where the copies are written. */
+	dst = list_first_entry(dst_list, struct folio, lru);
+	chan_mask = dcbm_claim_channels(max_channels, folio_nid(dst), &grp);
+	if (!chan_mask) {
+		atomic_long_inc(&batches_refused);
+		return -EBUSY;
 	}
 
-	if (actual_channels == 0) {
-		kfree(works);
-		return -ENODEV;
+	works = kcalloc(hweight_long(chan_mask), sizeof(*works), GFP_KERNEL);
+	if (!works) {
+		dcbm_release_channels(chan_mask);
+		return -ENOMEM;
+	}
+
+	for_each_set_bit(idx, &chan_mask, nr_channels) {
+		works[actual_channels].chan = channels[idx].chan;
+		works[actual_channels].dev = grp->dev;
+		actual_channels++;
 	}
 
 	for (i = 0; i < actual_channels; i++) {
@@ -256,34 +471,27 @@ static int folios_copy_dma(struct list_head *dst_list,
 		if (folios_per_chan == 0)
 			continue;
 
-		ret = setup_sg_tables(&works[i], &src_pos, &dst_pos,
-				      folios_per_chan);
+		ret = map_folios(&works[i], &src_pos, &dst_pos,
+				 folios_per_chan);
 		if (ret)
 			goto err_cleanup;
 	}
 
 	for (i = 0; i < actual_channels; i++) {
-		if (!works[i].mapped)
+		if (!works[i].copies)
 			continue;
 		ret = submit_dma_transfers(&works[i]);
+		dma_work_done_submitting(&works[i]);
+		works[i].submitted = true;
 		if (ret)
-			goto err_cleanup;
+			goto err_wait;
 	}
 
-	for (i = 0; i < actual_channels; i++) {
-		if (atomic_read(&works[i].pending) > 0)
-			dma_async_issue_pending(works[i].chan);
-	}
-
-	for (i = 0; i < actual_channels; i++) {
-		if (atomic_read(&works[i].pending) == 0)
-			continue;
-		if (!wait_for_completion_timeout(&works[i].done,
-						 msecs_to_jiffies(10000))) {
-			ret = -ETIMEDOUT;
-			goto err_cleanup;
-		}
-	}
+	ret = 0;
+	for (i = 0; i < actual_channels; i++)
+		ret |= dma_work_wait(&works[i]);
+	if (ret)
+		goto err_cleanup;
 
 	/*
 	 * All folios copied; mark each dst with FOLIO_CONTENT_COPIED so
@@ -293,17 +501,74 @@ static int folios_copy_dma(struct list_head *dst_list,
 		dst->migrate_info |= FOLIO_CONTENT_COPIED;
 
 	cleanup_dma_work(works, actual_channels);
+	dcbm_release_channels(chan_mask);
 
 	atomic_long_add(nr_folios, &folios_migrated);
 	return 0;
 
+err_wait:
+	/* Whatever was queued before the failure runs out. */
+	for (i = 0; i < actual_channels; i++)
+		dma_work_wait(&works[i]);
 err_cleanup:
 	pr_warn_ratelimited("dcbm: DMA copy failed (%d), falling back to CPU\n",
 			    ret);
 	cleanup_dma_work(works, actual_channels);
+	dcbm_release_channels(chan_mask);
 
 	atomic_long_add(nr_folios, &folios_failures);
 	return ret;
+}
+
+static void dcbm_put_channels(void)
+{
+	while (nr_channels) {
+		nr_channels--;
+		dma_release_channel(channels[nr_channels].chan);
+		channels[nr_channels].chan = NULL;
+	}
+	nr_groups = 0;
+}
+
+static int dcbm_get_channels(void)
+{
+	dma_cap_mask_t mask;
+
+	dma_cap_zero(mask);
+	dma_cap_set(DMA_MEMCPY, mask);
+
+	while (nr_channels < nr_dma_channels) {
+		struct dma_chan *chan = dma_request_chan_by_mask(&mask);
+		struct device *dev;
+
+		if (IS_ERR(chan))
+			break;
+
+		/*
+		 * The descriptors of one batch may spread over several
+		 * channels but its folios are mapped only once, so a
+		 * batch must stay within one DMA device: group the
+		 * channels by device as they enumerate.
+		 */
+		dev = dmaengine_get_dma_device(chan);
+		if (!dev) {
+			dma_release_channel(chan);
+			break;
+		}
+		if (!nr_groups || groups[nr_groups - 1].dev != dev) {
+			groups[nr_groups].dev = dev;
+			groups[nr_groups].node = dev_to_node(dev);
+			groups[nr_groups].first = nr_channels;
+			groups[nr_groups].nr = 0;
+			nr_groups++;
+		}
+		groups[nr_groups - 1].nr++;
+
+		channels[nr_channels].chan = chan;
+		mutex_init(&channels[nr_channels].lock);
+		nr_channels++;
+	}
+	return nr_channels ? 0 : -ENODEV;
 }
 
 static const struct migrator dma_migrator = {
@@ -330,15 +595,23 @@ static int offloading_param_set(const char *val, const struct kernel_param *kp)
 		return 0;
 	}
 	if (enable) {
+		ret = dcbm_get_channels();
+		if (ret) {
+			mutex_unlock(&dcbm_mutex);
+			return ret;
+		}
 		ret = migrate_offload_register(&dma_migrator,
 					       READ_ONCE(dcbm_reason_mask));
 		if (ret) {
+			dcbm_put_channels();
 			mutex_unlock(&dcbm_mutex);
 			return ret;
 		}
 		WRITE_ONCE(offloading_enabled, true);
 	} else {
 		migrate_offload_unregister(&dma_migrator);
+		/* No batch is in flight past unregister; channels are idle. */
+		dcbm_put_channels();
 		WRITE_ONCE(offloading_enabled, false);
 	}
 	mutex_unlock(&dcbm_mutex);
@@ -370,6 +643,10 @@ static int nr_dma_chan_param_set(const char *val, const struct kernel_param *kp)
 		return -EINVAL;
 
 	mutex_lock(&dcbm_mutex);
+	if (offloading_enabled) {
+		mutex_unlock(&dcbm_mutex);
+		return -EBUSY;
+	}
 	WRITE_ONCE(nr_dma_channels, new_val);
 	mutex_unlock(&dcbm_mutex);
 	return 0;
@@ -385,7 +662,7 @@ static const struct kernel_param_ops nr_dma_chan_param_ops = {
 	.get = nr_dma_chan_param_get,
 };
 module_param_cb(nr_dma_chan, &nr_dma_chan_param_ops, NULL, 0644);
-MODULE_PARM_DESC(nr_dma_chan, "Max DMA channels to use (1..16)");
+MODULE_PARM_DESC(nr_dma_chan, "DMA channels to acquire when enabling (1..16)");
 
 /* reason_mask: set of MR_* reasons this migrator handles */
 static int reason_mask_param_set(const char *val, const struct kernel_param *kp)
@@ -455,6 +732,33 @@ static const struct kernel_param_ops folios_failures_param_ops = {
 module_param_cb(folios_failures, &folios_failures_param_ops, NULL, 0644);
 MODULE_PARM_DESC(folios_failures, "DMA-copy failure count (write to reset)");
 
+static int batches_refused_param_set(const char *val, const struct kernel_param *kp)
+{
+	atomic_long_set(&batches_refused, 0);
+	return 0;
+}
+
+static int batches_refused_param_get(char *buffer, const struct kernel_param *kp)
+{
+	return sysfs_emit(buffer, "%ld\n", atomic_long_read(&batches_refused));
+}
+
+static const struct kernel_param_ops batches_refused_param_ops = {
+	.set = batches_refused_param_set,
+	.get = batches_refused_param_get,
+};
+module_param_cb(batches_refused, &batches_refused_param_ops, NULL, 0644);
+MODULE_PARM_DESC(batches_refused, "Batches refused because all channels were busy (write to reset)");
+
+module_param(cache_ctrl, bool, 0644);
+MODULE_PARM_DESC(cache_ctrl, "Request cache-allocating writes (DMA_PREP_CACHE_CONTROL)");
+
+module_param(max_inflight, uint, 0644);
+MODULE_PARM_DESC(max_inflight, "Descriptors in flight per channel before waiting for completions");
+
+module_param(sg_elems, uint, 0644);
+MODULE_PARM_DESC(sg_elems, "Folios per scatter-gather transaction on DMA_MEMCPY_SG providers");
+
 static int __init dcbm_init(void)
 {
 	pr_info("dcbm: DMA Core Batch Migrator initialized\n");
@@ -466,6 +770,7 @@ static void __exit dcbm_exit(void)
 	mutex_lock(&dcbm_mutex);
 	if (offloading_enabled) {
 		migrate_offload_unregister(&dma_migrator);
+		dcbm_put_channels();
 		offloading_enabled = false;
 	}
 	mutex_unlock(&dcbm_mutex);
