@@ -7,3 +7,14 @@ config DCBM_DMA
 	  DMAEngine memcpy channels to offload folio data copies
 	  during migration. Primarily intended for testing the copy
 	  offload infrastructure.
+
+config UFFD_DMA
+	tristate "DMA user page copy offload for UFFDIO_COPY (UFFD_DMA)"
+	depends on DMA_ENGINE && USERFAULTFD && 64BIT
+	select MM_OFFLOAD
+	help
+	  mm_offload provider for the copy_user_pages op: offloads the
+	  user-to-kernel copies that populate freshly allocated pages
+	  during UFFDIO_COPY (lazy VM snapshot restore) to a DMA engine
+	  memcpy channel such as Intel DSA. Handles hugetlb 2M folios,
+	  mTHP destinations and batches of contiguous 4K pages.
