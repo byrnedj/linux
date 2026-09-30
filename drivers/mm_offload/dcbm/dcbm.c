@@ -16,13 +16,13 @@
 #include <linux/highmem.h>
 #include <linux/migrate.h>
 #include <linux/mm_offload.h>
+#include <linux/mm_offload_dma.h>
 #include <linux/mutex.h>
 #include <linux/scatterlist.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/wait.h>
 
-#define MAX_DMA_CHANNELS	16
 /*
  * Folios per scatter-gather transaction. A provider that supports
  * DMA_MEMCPY_SG turns one transaction into one hardware batch, so
@@ -52,7 +52,13 @@ static atomic_long_t clear_failures;
 static atomic_long_t folios_gated;
 
 static bool offloading_enabled;
-static unsigned int nr_dma_channels = 1;
+/*
+ * Channels one operation may claim. The claim is confined to the devices
+ * of the operation's node, so this only bounds how far a copy is spread
+ * there: 16 is every channel of a four-device socket at four kernel work
+ * queues per device.
+ */
+static unsigned int nr_dma_channels = 16;
 static unsigned int sg_elems = DCBM_SG_ELEMS_DEFAULT;
 static unsigned int max_inflight = DCBM_MAX_INFLIGHT_DEFAULT;
 static bool cache_ctrl = true;
@@ -61,31 +67,6 @@ static bool cpu_warm = true;
 static bool util_gate = true;
 static DEFINE_MUTEX(dcbm_mutex);
 
-/*
- * Channels are acquired once when offloading is enabled and shared by
- * concurrent batches through per-channel trylocks. When every channel
- * is busy the batch is refused and the move phase copies on the CPU,
- * instead of queueing behind other batches.
- */
-static struct dcbm_chan {
-	struct dma_chan *chan;
-	struct mutex lock;
-} channels[MAX_DMA_CHANNELS];
-static unsigned int nr_channels;
-
-/*
- * Channels grouped by DMA device. One batch maps its folios against a
- * single device and uses only that group's channels. Concurrent
- * batches rotate over the groups so every device contributes.
- */
-static struct dcbm_group {
-	struct device *dev;
-	int node;
-	unsigned int first;
-	unsigned int nr;
-} groups[MAX_DMA_CHANNELS];
-static unsigned int nr_groups;
-static atomic_t group_cursor;
 
 struct dcbm_copy {
 	dma_addr_t src;
@@ -153,80 +134,6 @@ static void dma_work_throttle(struct dma_work *work)
 	wait_event(work->waitq, atomic_read(&work->pending) < limit);
 }
 
-static unsigned long dcbm_claim_group(struct dcbm_group *grp,
-				      unsigned int want)
-{
-	unsigned long mask = 0;
-	unsigned int i, got = 0;
-
-	for (i = 0; i < grp->nr && got < want; i++) {
-		unsigned int idx = grp->first + i;
-
-		if (mutex_trylock(&channels[idx].lock)) {
-			mask |= BIT(idx);
-			got++;
-		}
-	}
-	return mask;
-}
-
-/*
- * One selection pass: collect the groups whose node does (or does
- * not) match @nid and try them starting from a rotating offset within
- * that selection, so rotation is fair however the eligible groups are
- * laid out in the global array.
- */
-static unsigned long dcbm_claim_pass(int nid, bool match_node,
-				     unsigned int want,
-				     struct dcbm_group **grpp)
-{
-	unsigned int sel[MAX_DMA_CHANNELS];
-	unsigned int n = 0, g, i;
-
-	for (g = 0; g < nr_groups; g++)
-		if ((groups[g].node == nid) == match_node)
-			sel[n++] = g;
-	if (!n)
-		return 0;
-
-	g = (unsigned int)atomic_inc_return(&group_cursor) % n;
-	for (i = 0; i < n; i++) {
-		struct dcbm_group *grp = &groups[sel[(g + i) % n]];
-		unsigned long mask = dcbm_claim_group(grp, want);
-
-		if (mask) {
-			*grpp = grp;
-			return mask;
-		}
-	}
-	return 0;
-}
-
-/*
- * Claim up to @want channels from one device group. Groups on the
- * destination node are tried first: a cross-socket copy pays
- * remote-link bandwidth on every written line plus a remote
- * completion interrupt, so locality beats spreading. The first group
- * with any free channel wins. If every channel of every group is busy
- * the batch is refused.
- */
-static unsigned long dcbm_claim_channels(unsigned int want, int nid,
-					 struct dcbm_group **grpp)
-{
-	unsigned long mask = dcbm_claim_pass(nid, true, want, grpp);
-
-	if (!mask)
-		mask = dcbm_claim_pass(nid, false, want, grpp);
-	return mask;
-}
-
-static void dcbm_release_channels(unsigned long mask)
-{
-	unsigned int i;
-
-	for_each_set_bit(i, &mask, nr_channels)
-		mutex_unlock(&channels[i].lock);
-}
 
 /*
  * Map each folio of the slice on its own. A folio is physically
@@ -449,7 +356,7 @@ static int folios_copy_dma(struct list_head *dst_list,
 {
 	struct folio *dst;
 	struct dma_work *works;
-	struct dcbm_group *grp;
+	struct mm_offload_dma_group *grp;
 	struct list_head *src_pos = src_list->next;
 	struct list_head *dst_pos = dst_list->next;
 	unsigned long chan_mask;
@@ -458,11 +365,11 @@ static int folios_copy_dma(struct list_head *dst_list,
 	unsigned int max_channels, idx;
 
 	max_channels = min3(READ_ONCE(nr_dma_channels), nr_folios,
-			    (unsigned int)MAX_DMA_CHANNELS);
+			    (unsigned int)MM_OFFLOAD_DMA_MAX_CHANNELS);
 
 	/* Prefer the device closest to where the copies are written. */
 	dst = list_first_entry(dst_list, struct folio, lru);
-	chan_mask = dcbm_claim_channels(max_channels, folio_nid(dst), &grp);
+	chan_mask = mm_offload_dma_claim(max_channels, folio_nid(dst), &grp);
 	if (!chan_mask) {
 		atomic_long_inc(&batches_refused);
 		return -EBUSY;
@@ -470,12 +377,12 @@ static int folios_copy_dma(struct list_head *dst_list,
 
 	works = kcalloc(hweight_long(chan_mask), sizeof(*works), GFP_KERNEL);
 	if (!works) {
-		dcbm_release_channels(chan_mask);
+		mm_offload_dma_release(chan_mask);
 		return -ENOMEM;
 	}
 
-	for_each_set_bit(idx, &chan_mask, nr_channels) {
-		works[actual_channels].chan = channels[idx].chan;
+	for_each_set_bit(idx, &chan_mask, MM_OFFLOAD_DMA_MAX_CHANNELS) {
+		works[actual_channels].chan = mm_offload_dma_chan(idx);
 		works[actual_channels].dev = grp->dev;
 		actual_channels++;
 	}
@@ -516,7 +423,7 @@ static int folios_copy_dma(struct list_head *dst_list,
 		dst->migrate_info |= FOLIO_CONTENT_COPIED;
 
 	cleanup_dma_work(works, actual_channels);
-	dcbm_release_channels(chan_mask);
+	mm_offload_dma_release(chan_mask);
 
 	atomic_long_add(nr_folios, &folios_migrated);
 	return 0;
@@ -529,62 +436,12 @@ err_cleanup:
 	pr_warn_ratelimited("dcbm: DMA copy failed (%d), falling back to CPU\n",
 			    ret);
 	cleanup_dma_work(works, actual_channels);
-	dcbm_release_channels(chan_mask);
+	mm_offload_dma_release(chan_mask);
 
 	atomic_long_add(nr_folios, &folios_failures);
 	return ret;
 }
 
-static void dcbm_put_channels(void)
-{
-	while (nr_channels) {
-		nr_channels--;
-		dma_release_channel(channels[nr_channels].chan);
-		channels[nr_channels].chan = NULL;
-	}
-	nr_groups = 0;
-}
-
-static int dcbm_get_channels(void)
-{
-	dma_cap_mask_t mask;
-
-	dma_cap_zero(mask);
-	dma_cap_set(DMA_MEMCPY, mask);
-
-	while (nr_channels < nr_dma_channels) {
-		struct dma_chan *chan = dma_request_chan_by_mask(&mask);
-		struct device *dev;
-
-		if (IS_ERR(chan))
-			break;
-
-		/*
-		 * The descriptors of one batch may spread over several
-		 * channels but its folios are mapped only once, so a
-		 * batch must stay within one DMA device: group the
-		 * channels by device as they enumerate.
-		 */
-		dev = dmaengine_get_dma_device(chan);
-		if (!dev) {
-			dma_release_channel(chan);
-			break;
-		}
-		if (!nr_groups || groups[nr_groups - 1].dev != dev) {
-			groups[nr_groups].dev = dev;
-			groups[nr_groups].node = dev_to_node(dev);
-			groups[nr_groups].first = nr_channels;
-			groups[nr_groups].nr = 0;
-			nr_groups++;
-		}
-		groups[nr_groups - 1].nr++;
-
-		channels[nr_channels].chan = chan;
-		mutex_init(&channels[nr_channels].lock);
-		nr_channels++;
-	}
-	return nr_channels ? 0 : -ENODEV;
-}
 
 /*
  * Split [addr, addr + len) into chunks of at most DCBM_CLEAR_CHUNK_BYTES,
@@ -598,7 +455,7 @@ static int submit_clear_range(struct dma_work *work, unsigned long chan_mask,
 {
 	unsigned int nchunks = DIV_ROUND_UP(len, DCBM_CLEAR_CHUNK_BYTES);
 	size_t chunk = DIV_ROUND_UP(len, nchunks);
-	unsigned int idx = find_first_bit(&chan_mask, MAX_DMA_CHANNELS);
+	unsigned int idx = find_first_bit(&chan_mask, MM_OFFLOAD_DMA_MAX_CHANNELS);
 
 	while (len) {
 		size_t this_len = min(chunk, len);
@@ -606,7 +463,7 @@ static int submit_clear_range(struct dma_work *work, unsigned long chan_mask,
 		int ret;
 
 		dma_work_throttle(work);
-		tx = dmaengine_prep_dma_memset(channels[idx].chan, addr, 0,
+		tx = dmaengine_prep_dma_memset(mm_offload_dma_chan(idx), addr, 0,
 					       this_len, flags);
 		if (!tx)
 			return -EIO;
@@ -618,9 +475,9 @@ static int submit_clear_range(struct dma_work *work, unsigned long chan_mask,
 		addr += this_len;
 		len -= this_len;
 
-		idx = find_next_bit(&chan_mask, MAX_DMA_CHANNELS, idx + 1);
-		if (idx >= MAX_DMA_CHANNELS)
-			idx = find_first_bit(&chan_mask, MAX_DMA_CHANNELS);
+		idx = find_next_bit(&chan_mask, MM_OFFLOAD_DMA_MAX_CHANNELS, idx + 1);
+		if (idx >= MM_OFFLOAD_DMA_MAX_CHANNELS)
+			idx = find_first_bit(&chan_mask, MM_OFFLOAD_DMA_MAX_CHANNELS);
 	}
 	return 0;
 }
@@ -645,7 +502,7 @@ static int folio_clear_dma(struct folio *folio, unsigned long addr_hint)
 	const unsigned long base_addr = ALIGN_DOWN(addr_hint, size);
 	unsigned long flags = DMA_CTRL_ACK | DMA_PREP_INTERRUPT;
 	struct dma_work work = {};
-	struct dcbm_group *grp;
+	struct mm_offload_dma_group *grp;
 	unsigned long chan_mask;
 	dma_addr_t dma_base;
 	long ws = 0, we = -1, pg;
@@ -665,14 +522,14 @@ static int folio_clear_dma(struct folio *folio, unsigned long addr_hint)
 		return -EBUSY;
 	}
 
-	chan_mask = dcbm_claim_channels(
+	chan_mask = mm_offload_dma_claim(
 			clamp_t(size_t, size / DCBM_CLEAR_CHUNK_BYTES, 1,
-				nr_channels), folio_nid(folio), &grp);
+				READ_ONCE(nr_dma_channels)), folio_nid(folio), &grp);
 	if (!chan_mask)
 		return -EBUSY;
 
-	i = find_first_bit(&chan_mask, MAX_DMA_CHANNELS);
-	if (!dma_has_cap(DMA_MEMSET, channels[i].chan->device->cap_mask)) {
+	i = find_first_bit(&chan_mask, MM_OFFLOAD_DMA_MAX_CHANNELS);
+	if (!dma_has_cap(DMA_MEMSET, mm_offload_dma_chan(i)->device->cap_mask)) {
 		ret = -EOPNOTSUPP;
 		goto out_release;
 	}
@@ -726,12 +583,12 @@ static int folio_clear_dma(struct folio *folio, unsigned long addr_hint)
 	if (ret)
 		goto out_release;
 
-	dcbm_release_channels(chan_mask);
+	mm_offload_dma_release(chan_mask);
 	atomic_long_inc(&folios_cleared);
 	return 0;
 
 out_release:
-	dcbm_release_channels(chan_mask);
+	mm_offload_dma_release(chan_mask);
 	atomic_long_inc(&clear_failures);
 	pr_warn_ratelimited("dcbm: DMA clear failed (%d), falling back to CPU\n",
 			    ret);
@@ -763,7 +620,7 @@ static int offloading_param_set(const char *val, const struct kernel_param *kp)
 		return 0;
 	}
 	if (enable) {
-		ret = dcbm_get_channels();
+		ret = mm_offload_dma_pool_get();
 		if (ret) {
 			mutex_unlock(&dcbm_mutex);
 			return ret;
@@ -771,7 +628,7 @@ static int offloading_param_set(const char *val, const struct kernel_param *kp)
 		ret = mm_offload_register(&dma_migrator,
 					       READ_ONCE(dcbm_reason_mask));
 		if (ret) {
-			dcbm_put_channels();
+			mm_offload_dma_pool_put();
 			mutex_unlock(&dcbm_mutex);
 			return ret;
 		}
@@ -779,7 +636,7 @@ static int offloading_param_set(const char *val, const struct kernel_param *kp)
 	} else {
 		mm_offload_unregister(&dma_migrator);
 		/* No batch is in flight past unregister; channels are idle. */
-		dcbm_put_channels();
+		mm_offload_dma_pool_put();
 		WRITE_ONCE(offloading_enabled, false);
 	}
 	mutex_unlock(&dcbm_mutex);
@@ -807,16 +664,11 @@ static int nr_dma_chan_param_set(const char *val, const struct kernel_param *kp)
 	ret = kstrtouint(val, 0, &new_val);
 	if (ret)
 		return ret;
-	if (new_val < 1 || new_val > MAX_DMA_CHANNELS)
+	if (new_val < 1 || new_val > MM_OFFLOAD_DMA_MAX_CHANNELS)
 		return -EINVAL;
 
-	mutex_lock(&dcbm_mutex);
-	if (offloading_enabled) {
-		mutex_unlock(&dcbm_mutex);
-		return -EBUSY;
-	}
+	/* Bounds the next claim only; the pool's size does not depend on it. */
 	WRITE_ONCE(nr_dma_channels, new_val);
-	mutex_unlock(&dcbm_mutex);
 	return 0;
 }
 
@@ -1001,7 +853,7 @@ static void __exit dcbm_exit(void)
 	mutex_lock(&dcbm_mutex);
 	if (offloading_enabled) {
 		mm_offload_unregister(&dma_migrator);
-		dcbm_put_channels();
+		mm_offload_dma_pool_put();
 		offloading_enabled = false;
 	}
 	mutex_unlock(&dcbm_mutex);

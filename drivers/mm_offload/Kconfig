@@ -1,7 +1,15 @@
+config MM_OFFLOAD_DMA_POOL
+	tristate
+	depends on DMA_ENGINE
+	help
+	  Shared DMAEngine channel pool used by the mm_offload providers
+	  so several of them can be enabled at once.
+
 config DCBM_DMA
 	tristate "DMA Core Batch Migrator"
 	depends on MIGRATION && DMA_ENGINE && 64BIT
 	select MM_OFFLOAD
+	select MM_OFFLOAD_DMA_POOL
 	help
 	  DMA-based batch copy engine for page migration. Uses
 	  DMAEngine memcpy channels to offload folio data copies
@@ -12,6 +20,7 @@ config UFFD_DMA
 	tristate "DMA user page copy offload for UFFDIO_COPY (UFFD_DMA)"
 	depends on DMA_ENGINE && USERFAULTFD && 64BIT
 	select MM_OFFLOAD
+	select MM_OFFLOAD_DMA_POOL
 	help
 	  mm_offload provider for the copy_user_pages op: offloads the
 	  user-to-kernel copies that populate freshly allocated pages
