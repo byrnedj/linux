@@ -41,6 +41,7 @@
 
 #include <linux/kernel_stat.h>
 #include <linux/mm.h>
+#include <linux/mm_offload.h>
 #include <linux/mm_inline.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/numa_balancing.h>
@@ -7402,6 +7403,16 @@ void folio_zero_user(struct folio *folio, unsigned long addr_hint)
 	const long radius = FOLIO_ZERO_LOCALITY_RADIUS;
 	struct range r[3];
 	int i;
+
+	/*
+	 * A registered clearing provider takes precedence. It sees the
+	 * same @addr_hint and can keep the faulting neighbourhood
+	 * cache-hot by other means (or clear it on the CPU itself). On
+	 * any failure the CPU clears the folio as before.
+	 */
+	if (mm_offload_clear_available() &&
+	    mm_offload_clear_folio(folio, addr_hint) == 0)
+		return;
 
 	/*
 	 * Faulting page and its immediate neighbourhood. Will be cleared at the

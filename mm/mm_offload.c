@@ -6,6 +6,7 @@
 #include <linux/mm_offload.h>
 #include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/srcu.h>
 #include <linux/static_call.h>
@@ -13,11 +14,28 @@
 #include <linux/sysfs.h>
 
 DEFINE_STATIC_KEY_FALSE(mm_offload_copy_folios_enabled);
+DEFINE_STATIC_KEY_FALSE(mm_offload_clear_folio_enabled);
+EXPORT_SYMBOL_GPL(mm_offload_clear_folio_enabled);
 DEFINE_SRCU(mm_offload_srcu);
 DEFINE_STATIC_CALL(mm_offload_copy_folios_fn, migrate_folios_mc_copy);
 
+/*
+ * Default clear target. Only reachable in the narrow window where a
+ * caller saw the static branch enabled while the provider was being
+ * torn down; the caller falls back to CPU clearing.
+ */
+static int mm_offload_clear_folio_null(struct folio *folio,
+				       unsigned long addr_hint)
+{
+	return -ENXIO;
+}
+DEFINE_STATIC_CALL(mm_offload_clear_folio_fn, mm_offload_clear_folio_null);
+
 static DEFINE_MUTEX(provider_mutex);
 static const struct mm_offload_provider *active_provider;
+
+/* Operations currently inside the provider, i.e. potentially asleep. */
+static atomic_t ops_in_flight;
 
 /*
  * The active provider's migration reason mask. This is the single source of truth
@@ -130,6 +148,80 @@ int migrate_offload_batch_copy(struct list_head *dst_batch,
 }
 
 /**
+ * mm_offload_clear_folio - zero a folio through the registered provider.
+ * @folio: folio to zero.
+ * @addr_hint: user address expected to be touched first, or 0.
+ *
+ * May sleep. The caller must hold a reference on @folio and the folio
+ * must not be visible to any other user (no page table entries, not on
+ * the LRU). On failure the folio contents are unspecified and the
+ * caller must zero it by other means before exposing it.
+ *
+ * Return: 0 when the folio is fully zeroed, negative errno otherwise.
+ */
+int mm_offload_clear_folio(struct folio *folio, unsigned long addr_hint)
+{
+	int idx, rc;
+
+	might_sleep();
+
+	atomic_inc(&ops_in_flight);
+	idx = srcu_read_lock(&mm_offload_srcu);
+	rc = static_call(mm_offload_clear_folio_fn)(folio, addr_hint);
+	srcu_read_unlock(&mm_offload_srcu, idx);
+	atomic_dec(&ops_in_flight);
+	return rc;
+}
+
+/**
+ * mm_offload_cpus_saturated - is every online CPU busy right now?
+ *
+ * Offloading only pays when the cycles it frees can run other work.
+ * On a machine with no idle CPU (e.g. a spin-waiting parallel runtime
+ * occupying every core) the sleeping task frees a core nothing can
+ * use, while the completion interrupts and context switches still
+ * cost; doing the work synchronously on the CPU is then the better
+ * choice. Providers can use this as an admission signal.
+ *
+ * A core idled by an already-sleeping offload is not spare capacity:
+ * on a saturated machine each offloaded fault vacates its own CPU, and
+ * counting those as idle would reopen the gate that just closed. Only
+ * report unsaturated when the idle CPUs outnumber the in-flight
+ * operations (excluding the caller, which is still running).
+ *
+ * The scan early-exits as soon as enough idle CPUs are found and the
+ * verdict is cached for a jiffy, so the common (unsaturated) case is
+ * cheap and the saturated case pays one full scan per jiffy.
+ */
+bool mm_offload_cpus_saturated(void)
+{
+	static unsigned long last_check;
+	static bool saturated;
+	unsigned long now = jiffies;
+
+	if (READ_ONCE(last_check) != now) {
+		unsigned int self = atomic_read(&ops_in_flight);
+		unsigned int idle = 0;
+		bool sat = true;
+		int cpu;
+
+		if (self)
+			self--;	/* the caller occupies its CPU */
+
+		WRITE_ONCE(last_check, now);
+		for_each_online_cpu(cpu) {
+			if (idle_cpu(cpu) && ++idle > self) {
+				sat = false;
+				break;
+			}
+		}
+		WRITE_ONCE(saturated, sat);
+	}
+	return READ_ONCE(saturated);
+}
+EXPORT_SYMBOL_GPL(mm_offload_cpus_saturated);
+
+/**
  * mm_offload_set_migrate_reason_mask - update the active provider's migration reason mask.
  * @p: provider (must be the currently active one).
  * @mask: new reason mask.
@@ -171,7 +263,7 @@ int mm_offload_register(const struct mm_offload_provider *p,
 	unsigned long mask;
 	int ret = 0;
 
-	if (!p || !p->copy_folios)
+	if (!p || (!p->copy_folios && !p->clear_folio))
 		return -EINVAL;
 
 	mask = migrate_reason_mask & MIGRATE_OFFLOAD_REASONS_ALLOWED;
@@ -188,10 +280,16 @@ int mm_offload_register(const struct mm_offload_provider *p,
 		goto unlock;
 	}
 
-	WRITE_ONCE(active_reason_mask, mask);
-	static_call_update(mm_offload_copy_folios_fn, p->copy_folios);
 	active_provider = p;
-	static_branch_enable(&mm_offload_copy_folios_enabled);
+	if (p->copy_folios) {
+		WRITE_ONCE(active_reason_mask, mask);
+		static_call_update(mm_offload_copy_folios_fn, p->copy_folios);
+		static_branch_enable(&mm_offload_copy_folios_enabled);
+	}
+	if (p->clear_folio) {
+		static_call_update(mm_offload_clear_folio_fn, p->clear_folio);
+		static_branch_enable(&mm_offload_clear_folio_enabled);
+	}
 
 unlock:
 	mutex_unlock(&provider_mutex);
@@ -229,12 +327,20 @@ int mm_offload_unregister(const struct mm_offload_provider *p)
 	}
 
 	/*
-	 * Disable the static branch first so new migrate_pages_batch() calls
-	 * cannot enter the batch path.
+	 * Disable the static branches first so new callers take the CPU
+	 * paths.
 	 */
-	static_branch_disable(&mm_offload_copy_folios_enabled);
-	WRITE_ONCE(active_reason_mask, 0);
-	static_call_update(mm_offload_copy_folios_fn, migrate_folios_mc_copy);
+	if (p->copy_folios) {
+		static_branch_disable(&mm_offload_copy_folios_enabled);
+		WRITE_ONCE(active_reason_mask, 0);
+		static_call_update(mm_offload_copy_folios_fn,
+				   migrate_folios_mc_copy);
+	}
+	if (p->clear_folio) {
+		static_branch_disable(&mm_offload_clear_folio_enabled);
+		static_call_update(mm_offload_clear_folio_fn,
+				   mm_offload_clear_folio_null);
+	}
 	owner = active_provider->owner;
 	active_provider = NULL;
 	mutex_unlock(&provider_mutex);
