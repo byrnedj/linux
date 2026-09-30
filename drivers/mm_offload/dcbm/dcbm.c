@@ -416,11 +416,11 @@ static int folios_copy_dma(struct list_head *dst_list,
 		goto err_cleanup;
 
 	/*
-	 * All folios copied; mark each dst with FOLIO_CONTENT_COPIED so
-	 * __migrate_folio() skips the per-folio copy in the move phase.
+	 * All folios copied; mark each destination so the move phase
+	 * skips the per-folio copy.
 	 */
 	list_for_each_entry(dst, dst_list, lru)
-		dst->migrate_info |= FOLIO_CONTENT_COPIED;
+		folio_set_migrate_copied(dst);
 
 	cleanup_dma_work(works, actual_channels);
 	mm_offload_dma_release(chan_mask);

@@ -730,13 +730,16 @@ int migrate_huge_page_move_mapping(struct address_space *mapping,
 {
 	XA_STATE(xas, &mapping->i_pages, src->index);
 	int rc, expected_count = folio_expected_ref_count(src) + 1;
+	const bool already_copied = folio_test_clear_migrate_copied(dst);
 
 	if (folio_ref_count(src) != expected_count)
 		return -EAGAIN;
 
-	rc = folio_mc_copy(dst, src);
-	if (unlikely(rc))
-		return rc;
+	if (!already_copied) {
+		rc = folio_mc_copy(dst, src);
+		if (unlikely(rc))
+			return rc;
+	}
 
 	xas_lock_irq(&xas);
 	if (!folio_ref_freeze(src, expected_count)) {
@@ -861,11 +864,7 @@ static int __migrate_folio(struct address_space *mapping, struct folio *dst,
 			   enum migrate_mode mode)
 {
 	int rc, expected_count = folio_expected_ref_count(src) + 1;
-	const bool already_copied = dst->migrate_info & FOLIO_CONTENT_COPIED;
-
-	/* Consume the content copied marker */
-	if (already_copied)
-		dst->migrate_info &= ~FOLIO_CONTENT_COPIED;
+	const bool already_copied = folio_test_clear_migrate_copied(dst);
 
 	/* Check whether src does not have extra refs before we do more work */
 	if (folio_ref_count(src) != expected_count)
@@ -1780,7 +1779,7 @@ int migrate_folios_mc_copy(struct list_head *dst_list,
 		ret = folio_mc_copy(dst, src);
 		if (ret)
 			return ret;
-		dst->migrate_info |= FOLIO_CONTENT_COPIED;
+		folio_set_migrate_copied(dst);
 		dst = list_next_entry(dst, lru);
 		cond_resched();
 	}

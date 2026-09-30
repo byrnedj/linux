@@ -3,6 +3,7 @@
 #define _LINUX_MIGRATE_H
 
 #include <linux/mm.h>
+#include <linux/bitops.h>
 #include <linux/mempolicy.h>
 #include <linux/migrate_mode.h>
 #include <linux/hugetlb.h>
@@ -87,6 +88,18 @@ int migrate_folios_mc_copy(struct list_head *dst_list,
  * FOLIO_CONTENT_COPIED tells __migrate_folio() that the folio contents
  * have already been copied, so the per-folio copy can be skipped. A
  * driver must set this bit on each dst folio it copied.
+ *
+ * migrate_info aliases folio->private, which hugetlb uses as its own
+ * flag word, so FOLIO_WAS_* and the anon_vma pointer may never be
+ * stored on a hugetlb folio - it is migrated one folio at a time and
+ * never reaches the batched path that records them.
+ *
+ * The content-copied marker is needed on hugetlb too, so it lives in
+ * HPG_CONTENT_COPIED for those folios: a bit of the same word that
+ * hugetlb itself does not use, set and cleared with the atomic
+ * operations hugetlb uses for its flags. Use
+ * folio_set_migrate_copied() and folio_test_clear_migrate_copied()
+ * rather than touching either encoding directly.
  */
 enum {
 	FOLIO_WAS_MAPPED	= BIT(0),
@@ -99,6 +112,49 @@ enum {
 	FOLIO_CONTENT_COPIED	= 0,
 #endif
 };
+
+/*
+ * Where the marker lives on a hugetlb folio: the top bit of the flag
+ * word, far above the flags hugetlb defines (see the BUILD_BUG_ON in
+ * folio_set_migrate_copied()).
+ */
+#define HPG_CONTENT_COPIED	(BITS_PER_LONG - 1)
+
+/**
+ * folio_set_migrate_copied - mark a destination folio as already copied.
+ * @dst: destination folio, owned by the caller and not yet visible.
+ *
+ * Providers call this for every destination whose contents they copied,
+ * so that the move phase skips the per-folio copy.
+ */
+static inline void folio_set_migrate_copied(struct folio *dst)
+{
+	BUILD_BUG_ON(__NR_HPAGEFLAGS > HPG_CONTENT_COPIED);
+
+	if (folio_test_hugetlb(dst))
+		set_bit(HPG_CONTENT_COPIED, (unsigned long *)&dst->private);
+	else
+		dst->migrate_info |= FOLIO_CONTENT_COPIED;
+}
+
+/**
+ * folio_test_clear_migrate_copied - consume the already-copied marker.
+ * @dst: destination folio being moved.
+ *
+ * Return: true when the contents were copied before the move phase, in
+ * which case the marker is cleared.
+ */
+static inline bool folio_test_clear_migrate_copied(struct folio *dst)
+{
+	if (folio_test_hugetlb(dst))
+		return test_and_clear_bit(HPG_CONTENT_COPIED,
+					  (unsigned long *)&dst->private);
+
+	if (!(dst->migrate_info & FOLIO_CONTENT_COPIED))
+		return false;
+	dst->migrate_info &= ~FOLIO_CONTENT_COPIED;
+	return true;
+}
 
 #else
 
