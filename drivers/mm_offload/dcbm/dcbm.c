@@ -24,7 +24,7 @@
 #include <linux/wait.h>
 
 /*
- * Folios per scatter-gather transaction. A provider that supports
+ * Copies per scatter-gather transaction. A provider that supports
  * DMA_MEMCPY_SG turns one transaction into one hardware batch, so
  * this bounds the batch element count it must accept.
  */
@@ -38,6 +38,16 @@
 #define DCBM_MAX_INFLIGHT_DEFAULT	32
 /* Matches FOLIO_ZERO_LOCALITY_RADIUS in mm/memory.c */
 #define DCBM_WARM_RADIUS	2
+/*
+ * Smallest share of a copy to give a channel. A PMD folio spread over
+ * eight channels lands on 256K each, the split DSA-2LM found best for
+ * migrating a 2M page (Liu et al., ATC'25).
+ */
+#define DCBM_MIN_CHUNK_DEFAULT	SZ_256K
+/* Largest single descriptor; longer slices are cut into several. */
+#define DCBM_MAX_CHUNK_DEFAULT	SZ_2M
+/* Below this an operation is not worth a descriptor at all. */
+#define DCBM_MIN_BYTES_DEFAULT	SZ_32K
 /*
  * Largest fill descriptor. A DSA work queue transfers at most 2M per
  * descriptor at its default configuration, and the prep refuses more.
@@ -65,6 +75,9 @@ static bool cache_ctrl = true;
 static unsigned long min_clear_bytes = SZ_2M;
 static bool cpu_warm = true;
 static bool util_gate = true;
+static unsigned long min_chunk_bytes = DCBM_MIN_CHUNK_DEFAULT;
+static unsigned long max_chunk_bytes = DCBM_MAX_CHUNK_DEFAULT;
+static unsigned long min_bytes = DCBM_MIN_BYTES_DEFAULT;
 static DEFINE_MUTEX(dcbm_mutex);
 
 
@@ -80,9 +93,55 @@ struct dma_work {
 	wait_queue_head_t waitq;
 	atomic_t pending;
 	atomic_t error;
+	/* Slice of the plan's descriptor array belonging to this channel. */
 	struct dcbm_copy *copies;
 	unsigned int nr_copies;
 	bool submitted;
+};
+
+/* One folio pair to copy. */
+struct dcbm_pair {
+	struct folio *src;
+	struct folio *dst;
+};
+
+/*
+ * One range of one folio pair mapped against one device. A folio is
+ * physically contiguous, so a range of it is one DMA segment; the
+ * descriptors that cover it are offsets into this mapping, which keeps
+ * the number of IOMMU mappings at one per folio per device however
+ * finely the copy is sliced.
+ */
+struct dcbm_map {
+	struct device *dev;
+	dma_addr_t src;
+	dma_addr_t dst;
+	size_t off;			/* start within the whole copy */
+	size_t len;
+};
+
+/* The channels claimed on one device, and the bytes they carry. */
+struct dcbm_dev {
+	struct device *dev;
+	unsigned long chans;
+	unsigned int nr_chan;
+	size_t start;
+	size_t end;
+};
+
+/*
+ * A planned copy: every folio pair cut into per-device mappings and
+ * per-channel descriptors.
+ */
+struct dcbm_plan {
+	struct dma_work *works;
+	unsigned int nr_works;
+	struct dcbm_map *maps;
+	unsigned int nr_maps;
+	struct dcbm_copy *copies;
+	unsigned int nr_copies;
+	struct dcbm_dev *devs;		/* planning scratch, one per channel */
+	unsigned long chan_mask;
 };
 
 /*
@@ -136,64 +195,47 @@ static void dma_work_throttle(struct dma_work *work)
 
 
 /*
- * Map each folio of the slice on its own. A folio is physically
- * contiguous, so it is one DMA segment, and the source and
- * destination of a copy pair up by folio rather than by whatever
- * segments an IOMMU would merge two scatterlists into.
+ * Map [off, off + len) of one folio pair against @dev. A folio is
+ * physically contiguous, so any range of it is a single DMA segment,
+ * and every descriptor covering that range is an offset into this one
+ * mapping - the copy can be sliced as finely as the engines want
+ * without paying an extra IOMMU mapping per slice.
  */
-static int map_folios(struct dma_work *work, struct list_head **src_pos,
-		      struct list_head **dst_pos, unsigned int nr)
+static int plan_map(struct dcbm_plan *plan, struct device *dev,
+		    struct folio *src, struct folio *dst,
+		    size_t in_folio, size_t off, size_t len)
 {
-	struct device *dev = work->dev;
-	unsigned int i;
+	struct dcbm_map *m = &plan->maps[plan->nr_maps];
+	unsigned long pgoff = in_folio >> PAGE_SHIFT;
 
-	work->copies = kcalloc(nr, sizeof(*work->copies), GFP_KERNEL);
-	if (!work->copies)
-		return -ENOMEM;
-
-	for (i = 0; i < nr; i++) {
-		struct folio *src = list_entry(*src_pos, struct folio, lru);
-		struct folio *dst = list_entry(*dst_pos, struct folio, lru);
-		struct dcbm_copy *copy = &work->copies[i];
-
-		copy->len = folio_size(src);
-		copy->src = dma_map_page_attrs(dev, folio_page(src, 0), 0,
-					       copy->len, DMA_TO_DEVICE, 0);
-		if (dma_mapping_error(dev, copy->src))
-			goto err;
-		copy->dst = dma_map_page_attrs(dev, folio_page(dst, 0), 0,
-					       copy->len, DMA_FROM_DEVICE, 0);
-		if (dma_mapping_error(dev, copy->dst)) {
-			dma_unmap_page_attrs(dev, copy->src, copy->len,
-					     DMA_TO_DEVICE, 0);
-			goto err;
-		}
-		work->nr_copies++;
-
-		*src_pos = (*src_pos)->next;
-		*dst_pos = (*dst_pos)->next;
+	m->dev = dev;
+	m->off = off;
+	m->len = len;
+	m->src = dma_map_page_attrs(dev, folio_page(src, pgoff), 0, len,
+				    DMA_TO_DEVICE, 0);
+	if (dma_mapping_error(dev, m->src))
+		return -EIO;
+	m->dst = dma_map_page_attrs(dev, folio_page(dst, pgoff), 0, len,
+				    DMA_FROM_DEVICE, 0);
+	if (dma_mapping_error(dev, m->dst)) {
+		dma_unmap_page_attrs(dev, m->src, len, DMA_TO_DEVICE, 0);
+		return -EIO;
 	}
+	plan->nr_maps++;
 	return 0;
-err:
-	/* The mapped prefix is undone by cleanup_dma_work(). */
-	return -EIO;
 }
 
-static void unmap_folios(struct dma_work *work)
+static void plan_unmap(struct dcbm_plan *plan)
 {
 	unsigned int i;
 
-	for (i = 0; i < work->nr_copies; i++) {
-		struct dcbm_copy *copy = &work->copies[i];
+	for (i = 0; i < plan->nr_maps; i++) {
+		struct dcbm_map *m = &plan->maps[i];
 
-		dma_unmap_page_attrs(work->dev, copy->dst, copy->len,
-				     DMA_FROM_DEVICE, 0);
-		dma_unmap_page_attrs(work->dev, copy->src, copy->len,
-				     DMA_TO_DEVICE, 0);
+		dma_unmap_page_attrs(m->dev, m->dst, m->len, DMA_FROM_DEVICE, 0);
+		dma_unmap_page_attrs(m->dev, m->src, m->len, DMA_TO_DEVICE, 0);
 	}
-	work->nr_copies = 0;
-	kfree(work->copies);
-	work->copies = NULL;
+	plan->nr_maps = 0;
 }
 
 /*
@@ -214,19 +256,17 @@ static int dma_work_wait(struct dma_work *work)
 	return atomic_read(&work->error);
 }
 
-static void cleanup_dma_work(struct dma_work *works, int actual_channels)
+static void plan_free(struct dcbm_plan *plan)
 {
-	int i;
-
-	if (!works)
-		return;
-
-	for (i = 0; i < actual_channels; i++) {
-		if (!works[i].chan)
-			continue;
-		unmap_folios(&works[i]);
-	}
-	kfree(works);
+	plan_unmap(plan);
+	kfree(plan->works);
+	kfree(plan->maps);
+	kfree(plan->copies);
+	kfree(plan->devs);
+	plan->works = NULL;
+	plan->maps = NULL;
+	plan->copies = NULL;
+	plan->devs = NULL;
 }
 
 static int submit_one(struct dma_work *work, struct dma_async_tx_descriptor *tx)
@@ -343,6 +383,217 @@ static int submit_dma_transfers(struct dma_work *work)
 	return 0;
 }
 
+/*
+ * Cut the copy into per-device mappings and per-channel descriptors.
+ *
+ * Each device gets one contiguous, byte-balanced share of the whole
+ * copy, so a folio needs mapping at most once per device; that share
+ * is then split evenly over the device's channels, cutting inside a
+ * folio where a channel boundary falls there. A lone PMD folio handed
+ * to eight channels therefore becomes eight 256K descriptors rather
+ * than one 2M descriptor on one channel, which is the split DSA-2LM
+ * measured as best for migrating a 2M page.
+ */
+static int plan_build(struct dcbm_plan *plan, struct dcbm_pair *pairs,
+		      unsigned int nr, size_t total)
+{
+	struct dcbm_dev *devs = plan->devs;
+	size_t max_chunk = max_t(size_t, READ_ONCE(max_chunk_bytes), PAGE_SIZE);
+	unsigned int ndev = 0, nwork = 0, idx, d, c, m;
+	unsigned int cur = 0;
+	size_t folio_start = 0, off = 0;
+	int ret;
+
+	/* Group the claimed channels by the device they sit on. */
+	for_each_set_bit(idx, &plan->chan_mask, MM_OFFLOAD_DMA_MAX_CHANNELS) {
+		struct device *dev = mm_offload_dma_chan_dev(idx);
+
+		for (d = 0; d < ndev; d++)
+			if (devs[d].dev == dev)
+				break;
+		if (d == ndev) {
+			devs[ndev].dev = dev;
+			devs[ndev].chans = 0;
+			devs[ndev].nr_chan = 0;
+			ndev++;
+		}
+		devs[d].chans |= BIT(idx);
+		devs[d].nr_chan++;
+	}
+
+	for (d = 0; d < ndev; d++) {
+		devs[d].start = off;
+		off = (d == ndev - 1) ? total :
+			min(total, ALIGN(total * (d + 1) / ndev, PAGE_SIZE));
+		devs[d].end = off;
+	}
+
+	for (d = 0; d < ndev; d++) {
+		size_t dstart = devs[d].start, dend = devs[d].end;
+		unsigned int first_map = plan->nr_maps;
+		unsigned int p;
+		size_t o, fs;
+
+		/* Walk the cursor to the folio holding the first byte. */
+		while (cur < nr &&
+		       folio_start + folio_size(pairs[cur].src) <= dstart) {
+			folio_start += folio_size(pairs[cur].src);
+			cur++;
+		}
+
+		/* One mapping per folio range this device touches. */
+		for (o = dstart, p = cur, fs = folio_start; o < dend && p < nr; ) {
+			size_t fsize = folio_size(pairs[p].src);
+			size_t in_folio = o - fs;
+			size_t len = min(fsize - in_folio, dend - o);
+
+			ret = plan_map(plan, devs[d].dev, pairs[p].src,
+				       pairs[p].dst, in_folio, o, len);
+			if (ret)
+				return ret;
+			o += len;
+			if (o >= fs + fsize) {
+				fs += fsize;
+				p++;
+			}
+		}
+
+		/* Split the device's share evenly over its channels. */
+		c = 0;
+		for_each_set_bit(idx, &devs[d].chans, MM_OFFLOAD_DMA_MAX_CHANNELS) {
+			struct dma_work *work = &plan->works[nwork];
+			size_t span = dend - dstart;
+			size_t cstart, cend;
+
+			cstart = dstart + ALIGN_DOWN(span * c / devs[d].nr_chan,
+						     PAGE_SIZE);
+			cend = (c == devs[d].nr_chan - 1) ? dend :
+				dstart + ALIGN_DOWN(span * (c + 1) /
+						    devs[d].nr_chan, PAGE_SIZE);
+			c++;
+
+			work->chan = mm_offload_dma_chan(idx);
+			work->dev = devs[d].dev;
+			work->copies = &plan->copies[plan->nr_copies];
+			work->nr_copies = 0;
+			nwork++;
+
+			for (m = first_map; m < plan->nr_maps && cstart < cend; m++) {
+				struct dcbm_map *mp = &plan->maps[m];
+				size_t s, e;
+
+				if (mp->off + mp->len <= cstart)
+					continue;
+				if (mp->off >= cend)
+					break;
+				s = max(cstart, mp->off);
+				e = min(cend, mp->off + mp->len);
+				while (s < e) {
+					struct dcbm_copy *cp;
+					size_t len = min(e - s, max_chunk);
+
+					cp = &plan->copies[plan->nr_copies++];
+					cp->src = mp->src + (s - mp->off);
+					cp->dst = mp->dst + (s - mp->off);
+					cp->len = len;
+					work->nr_copies++;
+					s += len;
+				}
+			}
+		}
+	}
+	plan->nr_works = nwork;
+	return 0;
+}
+
+/*
+ * Copy @nr folio pairs. Returns 0 only when every byte was copied; the
+ * caller then marks the destinations so the move phase skips them.
+ */
+static int copy_pairs_dma(struct dcbm_pair *pairs, unsigned int nr)
+{
+	struct dcbm_plan plan = {};
+	struct mm_offload_dma_group *grp;
+	unsigned int want, nchan, i;
+	size_t total = 0, max_copies;
+	int nid, ret = 0;
+
+	for (i = 0; i < nr; i++) {
+		if (folio_size(pairs[i].dst) != folio_size(pairs[i].src))
+			return -EINVAL;
+		total += folio_size(pairs[i].src);
+	}
+	if (total < READ_ONCE(min_bytes))
+		return -EINVAL;
+
+	/*
+	 * Ask for as many channels as the copy can keep usefully busy:
+	 * one per min_chunk_bytes of work, so a small batch is not spread
+	 * so thin that each channel gets a descriptor too short to be
+	 * worth its completion.
+	 */
+	want = clamp_t(size_t, total / max_t(size_t, READ_ONCE(min_chunk_bytes),
+					     PAGE_SIZE),
+		       1, READ_ONCE(nr_dma_channels));
+
+	/* Prefer the device closest to where the copies are written. */
+	nid = folio_nid(pairs[0].dst);
+	plan.chan_mask = mm_offload_dma_claim_spread(want, nid);
+	if (!plan.chan_mask)
+		plan.chan_mask = mm_offload_dma_claim(want, nid, &grp);
+	if (!plan.chan_mask) {
+		atomic_long_inc(&batches_refused);
+		return -EBUSY;
+	}
+	nchan = hweight_long(plan.chan_mask);
+
+	/*
+	 * A folio is cut at most once per device boundary, and a channel
+	 * slice at most once per mapping it crosses and once per
+	 * max_chunk_bytes it spans.
+	 */
+	max_copies = total / max_t(size_t, READ_ONCE(max_chunk_bytes), PAGE_SIZE) +
+		     nr + 2 * nchan + 2;
+	plan.works = kcalloc(nchan, sizeof(*plan.works), GFP_KERNEL);
+	plan.maps = kcalloc(nr + nchan + 1, sizeof(*plan.maps), GFP_KERNEL);
+	plan.copies = kcalloc(max_copies, sizeof(*plan.copies), GFP_KERNEL);
+	plan.devs = kcalloc(nchan, sizeof(*plan.devs), GFP_KERNEL);
+	if (!plan.works || !plan.maps || !plan.copies ||
+	    !plan.devs) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	ret = plan_build(&plan, pairs, nr, total);
+	if (ret)
+		goto out;
+
+	for (i = 0; i < plan.nr_works; i++) {
+		if (!plan.works[i].nr_copies)
+			continue;
+		ret = submit_dma_transfers(&plan.works[i]);
+		dma_work_done_submitting(&plan.works[i]);
+		plan.works[i].submitted = true;
+		if (ret)
+			break;
+	}
+	for (i = 0; i < plan.nr_works; i++)
+		ret = dma_work_wait(&plan.works[i]) ? : ret;
+
+out:
+	plan_free(&plan);
+	mm_offload_dma_release(plan.chan_mask);
+
+	if (ret) {
+		atomic_long_add(nr, &folios_failures);
+		pr_warn_ratelimited("dcbm: DMA copy failed (%d), falling back to CPU\n",
+				    ret);
+	} else {
+		atomic_long_add(nr, &folios_migrated);
+	}
+	return ret;
+}
+
 /**
  * folios_copy_dma - copy a batch of folios via DMA memcpy
  * @dst_list: destination folio list
@@ -354,94 +605,31 @@ static int submit_dma_transfers(struct dma_work *work)
 static int folios_copy_dma(struct list_head *dst_list,
 			   struct list_head *src_list, unsigned int nr_folios)
 {
-	struct folio *dst;
-	struct dma_work *works;
-	struct mm_offload_dma_group *grp;
 	struct list_head *src_pos = src_list->next;
 	struct list_head *dst_pos = dst_list->next;
-	unsigned long chan_mask;
-	int i, folios_per_chan, ret;
-	int actual_channels = 0;
-	unsigned int max_channels, idx;
+	struct dcbm_pair *pairs;
+	unsigned int i;
+	int ret;
 
-	max_channels = min3(READ_ONCE(nr_dma_channels), nr_folios,
-			    (unsigned int)MM_OFFLOAD_DMA_MAX_CHANNELS);
-
-	/* Prefer the device closest to where the copies are written. */
-	dst = list_first_entry(dst_list, struct folio, lru);
-	chan_mask = mm_offload_dma_claim(max_channels, folio_nid(dst), &grp);
-	if (!chan_mask) {
-		atomic_long_inc(&batches_refused);
-		return -EBUSY;
-	}
-
-	works = kcalloc(hweight_long(chan_mask), sizeof(*works), GFP_KERNEL);
-	if (!works) {
-		mm_offload_dma_release(chan_mask);
+	pairs = kcalloc(nr_folios, sizeof(*pairs), GFP_KERNEL);
+	if (!pairs)
 		return -ENOMEM;
+
+	for (i = 0; i < nr_folios; i++) {
+		pairs[i].src = list_entry(src_pos, struct folio, lru);
+		pairs[i].dst = list_entry(dst_pos, struct folio, lru);
+		src_pos = src_pos->next;
+		dst_pos = dst_pos->next;
 	}
 
-	for_each_set_bit(idx, &chan_mask, MM_OFFLOAD_DMA_MAX_CHANNELS) {
-		works[actual_channels].chan = mm_offload_dma_chan(idx);
-		works[actual_channels].dev = grp->dev;
-		actual_channels++;
+	ret = copy_pairs_dma(pairs, nr_folios);
+	if (!ret) {
+		for (i = 0; i < nr_folios; i++)
+			folio_set_migrate_copied(pairs[i].dst);
 	}
-
-	for (i = 0; i < actual_channels; i++) {
-		folios_per_chan = nr_folios * (i + 1) / actual_channels -
-				(nr_folios * i) / actual_channels;
-		if (folios_per_chan == 0)
-			continue;
-
-		ret = map_folios(&works[i], &src_pos, &dst_pos,
-				 folios_per_chan);
-		if (ret)
-			goto err_cleanup;
-	}
-
-	for (i = 0; i < actual_channels; i++) {
-		if (!works[i].copies)
-			continue;
-		ret = submit_dma_transfers(&works[i]);
-		dma_work_done_submitting(&works[i]);
-		works[i].submitted = true;
-		if (ret)
-			goto err_wait;
-	}
-
-	ret = 0;
-	for (i = 0; i < actual_channels; i++)
-		ret |= dma_work_wait(&works[i]);
-	if (ret)
-		goto err_cleanup;
-
-	/*
-	 * All folios copied; mark each destination so the move phase
-	 * skips the per-folio copy.
-	 */
-	list_for_each_entry(dst, dst_list, lru)
-		folio_set_migrate_copied(dst);
-
-	cleanup_dma_work(works, actual_channels);
-	mm_offload_dma_release(chan_mask);
-
-	atomic_long_add(nr_folios, &folios_migrated);
-	return 0;
-
-err_wait:
-	/* Whatever was queued before the failure runs out. */
-	for (i = 0; i < actual_channels; i++)
-		dma_work_wait(&works[i]);
-err_cleanup:
-	pr_warn_ratelimited("dcbm: DMA copy failed (%d), falling back to CPU\n",
-			    ret);
-	cleanup_dma_work(works, actual_channels);
-	mm_offload_dma_release(chan_mask);
-
-	atomic_long_add(nr_folios, &folios_failures);
+	kfree(pairs);
 	return ret;
 }
-
 
 /*
  * Split [addr, addr + len) into chunks of at most DCBM_CLEAR_CHUNK_BYTES,
@@ -841,6 +1029,15 @@ MODULE_PARM_DESC(max_inflight, "Descriptors in flight per channel before waiting
 
 module_param(sg_elems, uint, 0644);
 MODULE_PARM_DESC(sg_elems, "Folios per scatter-gather transaction on DMA_MEMCPY_SG providers");
+module_param(min_chunk_bytes, ulong, 0644);
+MODULE_PARM_DESC(min_chunk_bytes,
+		 "Smallest share of a copy to give one channel (bytes)");
+
+module_param(max_chunk_bytes, ulong, 0644);
+MODULE_PARM_DESC(max_chunk_bytes, "Largest single copy descriptor (bytes)");
+
+module_param(min_bytes, ulong, 0644);
+MODULE_PARM_DESC(min_bytes, "Smallest copy worth a descriptor at all (bytes)");
 
 static int __init dcbm_init(void)
 {
