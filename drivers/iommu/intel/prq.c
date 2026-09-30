@@ -7,6 +7,7 @@
 
 #include <linux/pci.h>
 #include <linux/pci-ats.h>
+#include <linux/kernel_stat.h>
 
 #include "iommu.h"
 #include "pasid.h"
@@ -284,11 +285,116 @@ prq_advance:
 	return IRQ_RETVAL(handled);
 }
 
+#define PRQ_WATCHDOG_INTERVAL	HZ
+
+/*
+ * Count every watchdog-detected stall. The log message is ratelimited, so
+ * counting log lines badly undercounts; this is the number to trust for a
+ * soak test. /sys/module/kernel/parameters/prq_wd_stalls (writable to reset).
+ */
+static unsigned long prq_wd_stalls;
+core_param(prq_wd_stalls, prq_wd_stalls, ulong, 0644);
+
+/*
+ * A stall means the handler did not run. Two very different causes:
+ *
+ *   _lost    - no interrupt was delivered in the interval either, so the
+ *              message the IOMMU believes it sent never reached a CPU.
+ *   _blocked - interrupts WERE delivered but the threaded handler made no
+ *              progress, i.e. it is stuck (iopf_lock, iopf workqueue, ...).
+ *
+ * For a threaded irq the primary handler increments the delivery count before
+ * waking the thread, so the count advancing while prq_seq_number does not is
+ * exactly the "delivered but stuck" case.
+ */
+static unsigned long prq_wd_stalls_lost;
+core_param(prq_wd_stalls_lost, prq_wd_stalls_lost, ulong, 0644);
+static unsigned long prq_wd_stalls_blocked;
+core_param(prq_wd_stalls_blocked, prq_wd_stalls_blocked, ulong, 0644);
+
+static unsigned long prq_irq_count(unsigned int irq)
+{
+	unsigned long sum = 0;
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		sum += kstat_irqs_cpu(irq, cpu);
+	return sum;
+}
+
+static void prq_watchdog_fn(struct work_struct *work)
+{
+	struct intel_iommu *iommu = container_of(work, struct intel_iommu,
+						 prq_watchdog.work);
+	u64 head = readq(iommu->reg + DMAR_PQH_REG) & PRQ_RING_MASK;
+	u64 tail = readq(iommu->reg + DMAR_PQT_REG) & PRQ_RING_MASK;
+	unsigned long irqs = prq_irq_count(iommu->pr_irq);
+	unsigned long irq_delta = irqs - iommu->prq_wd_last_irqs;
+
+	/*
+	 * Detect lack of progress with prq_seq_number, not the head pointer:
+	 * the head wraps the ring many times a second under load, so it can
+	 * legitimately hold the same value across an interval. The sequence
+	 * number increments once per request actually handled, so it advances
+	 * if and only if the handler ran.
+	 */
+	if (head != tail && iommu->prq_seq_number == iommu->prq_wd_last_seq) {
+		prq_wd_stalls++;
+		if (irq_delta)
+			prq_wd_stalls_blocked++;
+		else
+			prq_wd_stalls_lost++;
+		/*
+		 * The queue has been non-empty with no handler progress for a
+		 * full interval. Either the page request event interrupt was
+		 * lost or cannot be delivered (e.g. a stale or unreachable MSI
+		 * destination), or it was delivered and the handler thread is
+		 * stuck. Only the first case is helped by draining inline:
+		 * prq_event_thread() clears PPR first, which re-arms the event
+		 * edge for future requests, and disable_irq() excludes a
+		 * concurrently running irq thread. In the second case that
+		 * same disable_irq() would park this work behind the stuck
+		 * thread for as long as it stays stuck, so only report it.
+		 */
+		pr_warn_ratelimited("IOMMU: %s: page request queue stalled [%s: irqs_delta=%lu] (head %llx tail %llx PRS %x PECTL %x PEDATA %x PEADDR %x PEUADDR %x)%s\n",
+				    iommu->name,
+				    irq_delta ? "handler blocked" : "NO INTERRUPT DELIVERED",
+				    irq_delta, head, tail,
+				    readl(iommu->reg + DMAR_PRS_REG),
+				    readl(iommu->reg + DMAR_PECTL_REG),
+				    readl(iommu->reg + DMAR_PEDATA_REG),
+				    readl(iommu->reg + DMAR_PEADDR_REG),
+				    readl(iommu->reg + DMAR_PEUADDR_REG),
+				    irq_delta ? "" : ", draining inline");
+		if (!irq_delta) {
+			disable_irq(iommu->pr_irq);
+			prq_event_thread(iommu->pr_irq, iommu);
+			enable_irq(iommu->pr_irq);
+			head = readq(iommu->reg + DMAR_PQH_REG) & PRQ_RING_MASK;
+		}
+	}
+	iommu->prq_wd_last_head = head;
+	iommu->prq_wd_last_seq = iommu->prq_seq_number;
+	iommu->prq_wd_last_irqs = irqs;
+	schedule_delayed_work(&iommu->prq_watchdog, PRQ_WATCHDOG_INTERVAL);
+}
+
 int intel_iommu_enable_prq(struct intel_iommu *iommu)
 {
 	struct iopf_queue *iopfq;
 	int irq, ret;
 	u32 prs;
+
+	/*
+	 * Observe the page request status register before touching anything:
+	 * a PPR latched here (carried across a crash/kexec, or left by
+	 * firmware) is what silently kills the first interrupt.
+	 */
+	prs = readl(iommu->reg + DMAR_PRS_REG);
+	pr_info("IOMMU: %s: prq: entry PRS %08x PECTL %08x PQH %llx PQT %llx\n",
+		iommu->name, prs, readl(iommu->reg + DMAR_PECTL_REG),
+		readq(iommu->reg + DMAR_PQH_REG),
+		readq(iommu->reg + DMAR_PQT_REG));
 
 	iommu->prq =
 		iommu_alloc_pages_node_sz(iommu->node, GFP_KERNEL, PRQ_SIZE);
@@ -342,11 +448,20 @@ int intel_iommu_enable_prq(struct intel_iommu *iommu)
 	if (prs & (DMA_PRS_PPR | DMA_PRS_PRO))
 		pr_warn("IOMMU: %s: stale page request status at enable (PRS %x), clearing\n",
 			iommu->name, prs);
+	else
+		pr_info("IOMMU: %s: prq: PRS clean at enable (%08x)\n",
+			iommu->name, prs);
 	writel(DMA_PRS_PPR | DMA_PRS_PRO, iommu->reg + DMAR_PRS_REG);
 
 	writeq(virt_to_phys(iommu->prq) | PRQ_ORDER, iommu->reg + DMAR_PQA_REG);
 
 	init_completion(&iommu->prq_complete);
+
+	iommu->prq_wd_last_head = 0;
+	iommu->prq_wd_last_seq = 0;
+	iommu->prq_wd_last_irqs = 0;
+	INIT_DELAYED_WORK(&iommu->prq_watchdog, prq_watchdog_fn);
+	schedule_delayed_work(&iommu->prq_watchdog, PRQ_WATCHDOG_INTERVAL);
 
 	return 0;
 
@@ -365,6 +480,9 @@ free_prq:
 
 int intel_iommu_finish_prq(struct intel_iommu *iommu)
 {
+	/* The watchdog exists only once the queue was enabled. */
+	if (iommu->prq)
+		cancel_delayed_work_sync(&iommu->prq_watchdog);
 	writeq(0ULL, iommu->reg + DMAR_PQH_REG);
 	writeq(0ULL, iommu->reg + DMAR_PQT_REG);
 	writeq(0ULL, iommu->reg + DMAR_PQA_REG);
