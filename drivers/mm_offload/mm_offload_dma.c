@@ -22,8 +22,26 @@
 static DEFINE_MUTEX(pool_mutex);
 static unsigned int pool_users;
 
+/*
+ * Which devices an operation may use, relative to the node it writes to.
+ * Local devices allocate their cache-controlled writes in the LLC the
+ * consumer will read from; a remote device can still win on raw
+ * bandwidth where the interconnect is asymmetric, so the choice is a
+ * knob. A node without devices of its own always falls back to the
+ * others, whatever the setting.
+ */
+enum {
+	MM_OFFLOAD_DMA_LOCAL,		/* the node's own devices only */
+	MM_OFFLOAD_DMA_LOCAL_FIRST,	/* local, then the rest for what remains */
+	MM_OFFLOAD_DMA_REMOTE,		/* other nodes' devices only (diagnostic) */
+};
+static unsigned int cross_node = MM_OFFLOAD_DMA_LOCAL;
+module_param(cross_node, uint, 0644);
+MODULE_PARM_DESC(cross_node, "Devices for an operation: 0 its node's only, 1 its node's first then others, 2 other nodes' only");
+
 static struct {
 	struct dma_chan *chan;
+	struct device *dev;
 	struct mutex lock;
 } channels[MM_OFFLOAD_DMA_MAX_CHANNELS];
 static unsigned int nr_channels;
@@ -43,6 +61,12 @@ struct dma_chan *mm_offload_dma_chan(unsigned int idx)
 	return channels[idx].chan;
 }
 EXPORT_SYMBOL_GPL(mm_offload_dma_chan);
+
+struct device *mm_offload_dma_chan_dev(unsigned int idx)
+{
+	return channels[idx].dev;
+}
+EXPORT_SYMBOL_GPL(mm_offload_dma_chan_dev);
 
 /* Called with pool_mutex held. */
 static void pool_grow(void)
@@ -64,6 +88,7 @@ static void pool_grow(void)
 			break;
 		}
 		channels[nr_channels].chan = chan;
+		channels[nr_channels].dev = dev;
 		mutex_init(&channels[nr_channels].lock);
 		if (!nr_groups || groups[nr_groups - 1].dev != dev) {
 			groups[nr_groups].dev = dev;
@@ -196,13 +221,81 @@ static unsigned long claim_pass(int nid, bool match_node, unsigned int want,
 unsigned long mm_offload_dma_claim(unsigned int want, int nid,
 				   struct mm_offload_dma_group **grpp)
 {
-	unsigned long mask = claim_pass(nid, true, want, grpp);
+	bool local_first = READ_ONCE(cross_node) != MM_OFFLOAD_DMA_REMOTE;
+	unsigned long mask = claim_pass(nid, local_first, want, grpp);
 
 	if (!mask)
-		mask = claim_pass(nid, false, want, grpp);
+		mask = claim_pass(nid, !local_first, want, grpp);
 	return mask;
 }
 EXPORT_SYMBOL_GPL(mm_offload_dma_claim);
+
+/* One breadth-first pass over the groups that do (not) match @nid. */
+static unsigned long spread_pass(unsigned int want, int nid, bool match_node,
+				 unsigned long mask, unsigned int *gotp)
+{
+	unsigned int ngroups = smp_load_acquire(&nr_groups);
+	unsigned int limit = smp_load_acquire(&nr_channels);
+	unsigned int maxnr = 0, r, g;
+
+	for (g = 0; g < ngroups; g++)
+		if ((groups[g].node == nid) == match_node && groups[g].nr > maxnr)
+			maxnr = groups[g].nr;
+
+	for (r = 0; r < maxnr && *gotp < want; r++) {
+		for (g = 0; g < ngroups && *gotp < want; g++) {
+			struct mm_offload_dma_group *grp = &groups[g];
+			unsigned int idx = grp->first + r;
+
+			if ((grp->node == nid) != match_node ||
+			    r >= grp->nr || idx >= limit)
+				continue;
+			if (mutex_trylock(&channels[idx].lock)) {
+				mask |= BIT(idx);
+				(*gotp)++;
+			}
+		}
+	}
+	return mask;
+}
+
+/**
+ * mm_offload_dma_claim_spread - claim channels across distinct devices.
+ * @want: channels wanted.
+ * @nid: NUMA node the copy is written to; groups on it are taken first,
+ *       since a stripe on a remote device makes that share of the copy
+ *       wait on remote-link bandwidth.
+ *
+ * Breadth-first: one channel from every eligible group, then a second
+ * from each, ... so @want channels land on as many distinct devices as
+ * possible. Used to stripe one large copy over several devices.
+ *
+ * The devices of @nid are the only ones used while any of them can be
+ * had, even when they hold fewer channels than @want: a share of the
+ * copy on a remote device not only waits on the remote link, its
+ * cache-allocating writes land in the remote socket's LLC, where the
+ * consumer of the data is not. Only a node without a device of its own
+ * - a CPU-less memory node such as a CXL tier, where a migration
+ * destination often lives - falls back to the groups on other nodes
+ * rather than refusing: every device is remote to that node, and
+ * spreading over all of them still beats using one.
+ *
+ * Return: bitmask of claimed channel indices, 0 if every channel is
+ * busy.
+ */
+unsigned long mm_offload_dma_claim_spread(unsigned int want, int nid)
+{
+	unsigned int policy = READ_ONCE(cross_node);
+	bool local_first = policy != MM_OFFLOAD_DMA_REMOTE;
+	unsigned long mask;
+	unsigned int got = 0;
+
+	mask = spread_pass(want, nid, local_first, 0, &got);
+	if (!got || (policy == MM_OFFLOAD_DMA_LOCAL_FIRST && got < want))
+		mask = spread_pass(want, nid, !local_first, mask, &got);
+	return mask;
+}
+EXPORT_SYMBOL_GPL(mm_offload_dma_claim_spread);
 
 void mm_offload_dma_release(unsigned long mask)
 {
