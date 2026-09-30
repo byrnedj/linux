@@ -1824,6 +1824,7 @@ bool dma_iova_try_alloc(struct device *dev, struct dma_iova_state *state,
 
 	state->addr = addr + iova_off;
 	state->__size = size;
+	debug_dma_alloc_iova(dev, state->addr, size);
 	return true;
 }
 EXPORT_SYMBOL_GPL(dma_iova_try_alloc);
@@ -1848,6 +1849,7 @@ void dma_iova_free(struct device *dev, struct dma_iova_state *state)
 	size_t iova_start_pad = iova_offset(iovad, state->addr);
 	size_t size = dma_iova_size(state);
 
+	debug_dma_free_iova(dev, state->addr, size);
 	iommu_dma_free_iova(domain, state->addr - iova_start_pad,
 			iova_align(iovad, size + iova_start_pad), NULL);
 }
@@ -2096,8 +2098,10 @@ static void __iommu_dma_iova_unlink(struct device *dev,
 
 	if (!iotlb_gather.queued)
 		iommu_iotlb_sync(domain, &iotlb_gather);
-	if (free_iova)
+	if (free_iova) {
+		debug_dma_free_iova(dev, state->addr, dma_iova_size(state));
 		iommu_dma_free_iova(domain, addr, size, &iotlb_gather);
+	}
 }
 
 /**

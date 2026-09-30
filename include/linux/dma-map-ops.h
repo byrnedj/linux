@@ -418,11 +418,22 @@ static inline void arch_teardown_dma_ops(struct device *dev)
 #ifdef CONFIG_DMA_API_DEBUG
 void dma_debug_add_bus(const struct bus_type *bus);
 void debug_dma_dump_mappings(struct device *dev);
+void debug_dma_alloc_iova(struct device *dev, dma_addr_t dma_addr,
+			  size_t size);
+void debug_dma_free_iova(struct device *dev, dma_addr_t dma_addr, size_t size);
 #else
 static inline void dma_debug_add_bus(const struct bus_type *bus)
 {
 }
 static inline void debug_dma_dump_mappings(struct device *dev)
+{
+}
+static inline void debug_dma_alloc_iova(struct device *dev,
+					dma_addr_t dma_addr, size_t size)
+{
+}
+static inline void debug_dma_free_iova(struct device *dev, dma_addr_t dma_addr,
+				       size_t size)
 {
 }
 #endif /* CONFIG_DMA_API_DEBUG */

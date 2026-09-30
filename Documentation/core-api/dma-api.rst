@@ -738,6 +738,10 @@ option has a performance impact. Do not enable it in production kernels.
 If you boot the resulting kernel will contain code which does some bookkeeping
 about what DMA memory was allocated for which device. If this code detects an
 error it prints a warning message with some details into your kernel log. An
+IOVA range from the IOVA-based API of Part Ie is tracked as one allocation
+from dma_iova_try_alloc() to dma_iova_free() or dma_iova_destroy(): a sync
+against an address inside it is accepted while it stands, and the individual
+dma_iova_link() ranges and their directions are not checked. An
 example warning message may look like this::
 
 	WARNING: at /data2/repos/linux-2.6-iommu/lib/dma-debug.c:448
