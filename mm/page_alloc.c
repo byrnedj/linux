@@ -44,6 +44,7 @@
 #include <linux/mmu_notifier.h>
 #include <linux/migrate.h>
 #include <linux/sched/mm.h>
+#include <linux/mm_offload.h>
 #include <linux/page_owner.h>
 #include <linux/page_table_check.h>
 #include <linux/memcontrol.h>
@@ -1325,6 +1326,26 @@ static __always_inline bool __free_pages_prepare(struct page *page,
 
 	trace_mm_page_free(page, order);
 	kmsan_free_page(page, order);
+
+	/*
+	 * With init_on_free, bulk-zero large freed folios through the
+	 * clearing offload provider while the compound metadata is
+	 * still intact. Freed memory has no consumer adjacent, so
+	 * offloading loses nothing to cache-cold zeros and the freed
+	 * CPU cycles are pure profit. Only from sleepable context: the
+	 * provider waits for the engine, so besides preemptible() the
+	 * caller must not be inside a preemptible-RCU reader (which a
+	 * final folio_put() under rcu_read_lock() can be, as can an RT
+	 * spinlock), nor on the trylock free path. On any failure fall
+	 * back to the synchronous clearing below.
+	 */
+	if (init && compound && preemptible() && !rcu_preempt_depth() &&
+	    !(fpi_flags & FPI_TRYLOCK) &&
+	    !IS_ENABLED(CONFIG_KASAN_HW_TAGS) &&
+	    (PAGE_SIZE << order) >= SZ_2M &&
+	    mm_offload_clear_available() &&
+	    !mm_offload_clear_folio(folio, 0))
+		init = false;
 
 	if (memcg_kmem_online() && PageMemcgKmem(page))
 		__memcg_kmem_uncharge_page(page, order);
