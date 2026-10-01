@@ -1462,6 +1462,73 @@ out:
  * because then pte is replaced with migration swap entry and direct I/O code
  * will wait in the page fault for migration to complete.
  */
+/*
+ * The i_mmap_rwsem of a file-backed hugetlb source, held for write from
+ * before its unmap walk until after its remap walk. try_to_migrate()
+ * needs it for write because it may call huge_pmd_unshare(), the remap
+ * walk needs it for read, and the folio stays locked between the two.
+ * There is no point at which it could be taken afresh: the hugetlb side
+ * of the ordering documented in mm/rmap.c takes i_mmap_rwsem before the
+ * folio lock - hugetlbfs_punch_hole() holds it for write while it waits
+ * for a folio lock - so with a folio locked it can only ever be tried.
+ *
+ * Waiting for it is possible only with the folio unlocked, and then
+ * nothing keeps the inode from being evicted under the wait: @inode is
+ * the reference that does, taken while the folio lock still pins it.
+ */
+struct hugetlb_migrate_lock {
+	struct address_space *mapping;
+	struct inode *inode;
+};
+
+static void hugetlb_migrate_unlock(struct hugetlb_migrate_lock *hl)
+{
+	if (!hl->mapping)
+		return;
+	i_mmap_unlock_write(hl->mapping);
+	hl->mapping = NULL;
+	if (hl->inode) {
+		iput(hl->inode);
+		hl->inode = NULL;
+	}
+}
+
+/*
+ * Take the mapping lock for the file-backed @src, which is locked.
+ * Returns 0 with the lock held, and -EAGAIN when it is contended and
+ * @wait is not allowed.
+ *
+ * A wait unlocks @src for its duration. On return the folio is locked
+ * again but may have been removed from its mapping meanwhile, which the
+ * caller checks for.
+ */
+static int hugetlb_migrate_lock(struct folio *src,
+				struct hugetlb_migrate_lock *hl, bool wait)
+{
+	struct address_space *mapping = folio_mapping(src);
+	struct inode *inode;
+
+	if (unlikely(!mapping))
+		return -EAGAIN;
+
+	if (i_mmap_trylock_write(mapping)) {
+		hl->mapping = mapping;
+		return 0;
+	}
+	if (!wait)
+		return -EAGAIN;
+
+	inode = igrab(mapping->host);
+	if (!inode)
+		return -EAGAIN;	/* being evicted; the folio is going too */
+	folio_unlock(src);
+	i_mmap_lock_write(mapping);
+	folio_lock(src);
+	hl->mapping = mapping;
+	hl->inode = inode;
+	return 0;
+}
+
 static int unmap_and_move_hugetlb_folio(new_folio_t get_new_folio,
 		free_folio_t put_new_folio, unsigned long private,
 		struct folio *src, int force, enum migrate_mode mode,
@@ -1471,7 +1538,7 @@ static int unmap_and_move_hugetlb_folio(new_folio_t get_new_folio,
 	int rc = -EAGAIN;
 	int was_mapped = 0;
 	struct anon_vma *anon_vma = NULL;
-	struct address_space *mapping = NULL;
+	struct hugetlb_migrate_lock hl = {};
 	enum ttu_flags ttu = 0;
 
 	if (folio_ref_count(src) == 1) {
@@ -1506,26 +1573,34 @@ static int unmap_and_move_hugetlb_folio(new_folio_t get_new_folio,
 		goto out_unlock;
 	}
 
-	if (folio_test_anon(src))
+	if (folio_test_anon(src)) {
 		anon_vma = folio_get_anon_vma(src);
+	} else if (folio_mapped(src)) {
+		/*
+		 * In shared mappings, try_to_unmap could potentially
+		 * call huge_pmd_unshare.  Because of this, take
+		 * semaphore in write mode here and set TTU_RMAP_LOCKED
+		 * to let lower levels know we have taken the lock.
+		 */
+		rc = hugetlb_migrate_lock(src, &hl, mode == MIGRATE_SYNC);
+		if (rc)
+			goto out_unlock;
+		rc = -EAGAIN;
+		if (unlikely(folio_mapping(src) != hl.mapping)) {
+			/* Left its mapping during the wait: being freed. */
+			rc = -EBUSY;
+			goto out_unlock;
+		}
+		ttu = TTU_RMAP_LOCKED;
+	}
 
 	if (unlikely(!folio_trylock(dst)))
 		goto put_anon;
 
 	if (folio_mapped(src)) {
-		if (!folio_test_anon(src)) {
-			/*
-			 * In shared mappings, try_to_unmap could potentially
-			 * call huge_pmd_unshare.  Because of this, take
-			 * semaphore in write mode here and set TTU_RMAP_LOCKED
-			 * to let lower levels know we have taken the lock.
-			 */
-			mapping = hugetlb_folio_mapping_lock_write(src);
-			if (unlikely(!mapping))
-				goto unlock_put_anon;
-
-			ttu = TTU_RMAP_LOCKED;
-		}
+		/* A file folio cannot have become mapped under its lock. */
+		if (WARN_ON_ONCE(!folio_test_anon(src) && !hl.mapping))
+			goto unlock_put_anon;
 
 		try_to_migrate(src, ttu);
 		was_mapped = 1;
@@ -1536,9 +1611,6 @@ static int unmap_and_move_hugetlb_folio(new_folio_t get_new_folio,
 
 	if (was_mapped)
 		remove_migration_ptes(src, !rc ? dst : src, ttu);
-
-	if (ttu & TTU_RMAP_LOCKED)
-		i_mmap_unlock_write(mapping);
 
 unlock_put_anon:
 	folio_unlock(dst);
@@ -1553,6 +1625,7 @@ put_anon:
 	}
 
 out_unlock:
+	hugetlb_migrate_unlock(&hl);
 	folio_unlock(src);
 out:
 	if (!rc)
