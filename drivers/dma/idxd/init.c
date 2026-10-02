@@ -1267,6 +1267,12 @@ static void idxd_remove(struct pci_dev *pdev)
 {
 	struct idxd_device *idxd = pci_get_drvdata(pdev);
 
+	/*
+	 * The idxd sub-driver's remove walks idxd->wqs to disable the
+	 * active queues, and each wq is freed with its conf_dev. Unbind
+	 * that driver while the queues still exist.
+	 */
+	device_release_driver(idxd_confdev(idxd));
 	idxd_unregister_devices(idxd);
 	/*
 	 * When ->release() is called for the idxd->conf_dev, it frees all the memory related
