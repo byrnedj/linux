@@ -40,6 +40,8 @@
 #define UFFD_DMA_PREP_RETRIES	3
 /* One descriptor per this many bytes when spreading over channels */
 #define UFFD_DMA_CHUNK_BYTES	SZ_2M
+/* Destination segments a copy may be cut into by the standing mappings. */
+#define UFFD_DMA_MAX_DST_SEGS	(2 * MM_OFFLOAD_DMA_MAX_CHANNELS)
 
 enum uffd_dma_wait { UFFD_DMA_WAIT_IRQ = 0, UFFD_DMA_WAIT_SPIN_IRQ = 1 };
 
@@ -57,6 +59,8 @@ static atomic_long_t src_contig;
 static atomic_long_t sg_txns;	/* DMA_MEMCPY_SG transactions submitted */
 static atomic_long_t striped_copies;	/* copies striped over >1 device */
 static atomic_long_t copies_abandoned;	/* given up on, see uffd_dma_wait() */
+static atomic_long_t dst_cached_segs;	/* destination ranges from the standing mappings */
+static atomic_long_t dst_mapped_segs;	/* destination ranges mapped per request */
 
 static bool offloading_enabled;
 static unsigned int nr_dma_chan = 4;
@@ -74,6 +78,7 @@ static unsigned int abandon_ms = UFFD_DMA_ABANDON_MS_DEFAULT;
 /* An abandoned copy means an engine that is not completing: stop using them. */
 static bool stalled;
 static bool util_gate;
+static bool dst_map_cache = true;	/* destinations through mm_offload_dma_map_get() */
 
 static DEFINE_MUTEX(uffd_dma_mutex);
 
@@ -84,6 +89,21 @@ struct uffd_dma_map {
 	dma_addr_t dma;
 	size_t len;
 	enum dma_data_direction dir;
+};
+
+/* One device range of the destination, in copy order. */
+struct uffd_dma_seg {
+	dma_addr_t dma;
+	size_t off;		/* within the copy */
+	size_t len;
+};
+
+/* A standing mapping borrowed from the pool's cache, handed back on release. */
+struct uffd_dma_ent {
+	struct mm_offload_dma_map *ent;
+	struct device *dev;
+	dma_addr_t dma;
+	size_t len;
 };
 
 enum uffd_dma_req_state {
@@ -115,6 +135,12 @@ struct uffd_dma_req {
 	struct sg_table sgt;
 	unsigned int nr_maps;
 	struct uffd_dma_map maps[2 * MM_OFFLOAD_DMA_MAX_CHANNELS];
+	/* The destination in copy order, and the standing mappings among it. */
+	struct uffd_dma_seg *segs;
+	unsigned int nr_segs;
+	unsigned int max_segs;
+	struct uffd_dma_ent *ents;
+	unsigned int nr_ents;
 };
 
 /* One per submitted descriptor: which request, and whose channel slot. */
@@ -165,12 +191,105 @@ static int uffd_dma_req_map(struct uffd_dma_req *req, struct device *dev,
 	return 0;
 }
 
+/*
+ * Device addresses for the destination bytes [off, off + len) on @dev,
+ * appended to req->segs in copy order.
+ *
+ * The destination is a run the caller has just allocated and nobody
+ * else can see yet, so it may go through the pool's standing mappings
+ * (mm_offload_dma_map_get()): a restore populates the same hugetlb
+ * pool, or the same guest range, over and over, so the folios come back
+ * and the IOVA allocation - which cost more than the 2 MiB copy itself
+ * when it was paid per copy - is paid once. The source is user memory
+ * the request has merely pinned and stays mapped per request. A
+ * destination that is not one folio (a batch of split order-0 pages),
+ * or would cut into too many segments, is mapped for this request alone
+ * as one range, as before.
+ */
+static int uffd_dma_map_dst(struct uffd_dma_req *req, struct device *dev,
+			    size_t off, size_t len)
+{
+	struct folio *first = page_folio(req->dst);
+	size_t pos = off, end = off + len;
+	size_t quantum = 0;
+
+	if (READ_ONCE(dst_map_cache) &&
+	    folio_nr_pages(first) >= req->nr_pages)
+		quantum = mm_offload_dma_map_quantum(dev);
+	if (quantum && DIV_ROUND_UP(req->nr_pages << PAGE_SHIFT, quantum) >
+	    UFFD_DMA_MAX_DST_SEGS)
+		quantum = 0;
+
+	if (!req->segs) {
+		unsigned int cap = MM_OFFLOAD_DMA_MAX_CHANNELS;
+
+		if (quantum)
+			cap += DIV_ROUND_UP(req->nr_pages << PAGE_SHIFT, quantum);
+		req->segs = kcalloc(cap, sizeof(*req->segs), GFP_KERNEL);
+		req->ents = kcalloc(cap, sizeof(*req->ents), GFP_KERNEL);
+		if (!req->segs || !req->ents)
+			return -ENOMEM;
+		req->max_segs = cap;
+	}
+
+	while (pos < end) {
+		struct page *page = req->dst + (pos >> PAGE_SHIFT);
+		struct mm_offload_dma_map *ent = NULL;
+		struct uffd_dma_seg *s;
+		size_t seg = end - pos;
+		dma_addr_t dma;
+		int ret;
+
+		if (unlikely(req->nr_segs == req->max_segs))
+			return -ENOSPC;
+		if (quantum) {
+			size_t in_folio = folio_page_idx(first, page) << PAGE_SHIFT;
+
+			seg = min(seg, quantum - (in_folio & (quantum - 1)));
+			ent = mm_offload_dma_map_get(dev, first, in_folio, seg, &dma);
+		}
+		if (ent) {
+			struct uffd_dma_ent *en = &req->ents[req->nr_ents++];
+
+			en->ent = ent;
+			en->dev = dev;
+			en->dma = dma;
+			en->len = seg;
+			/* The device is about to write it; it owns it until then. */
+			dma_sync_single_for_device(dev, dma, seg, DMA_FROM_DEVICE);
+			atomic_long_inc(&dst_cached_segs);
+		} else {
+			ret = uffd_dma_req_map(req, dev, page, seg, DMA_FROM_DEVICE,
+					       &dma);
+			if (ret)
+				return ret;
+			atomic_long_inc(&dst_mapped_segs);
+		}
+		s = &req->segs[req->nr_segs++];
+		s->dma = dma;
+		s->off = pos;
+		s->len = seg;
+		pos += seg;
+	}
+	return 0;
+}
+
 /* Undo everything the request holds, in reverse order of taking it. */
 static void uffd_dma_req_release(struct uffd_dma_req *req)
 {
 	bool abandoned = atomic_read(&req->state) == UFFD_DMA_REQ_ABANDONED;
-	unsigned int i = req->nr_maps;
+	unsigned int i;
 
+	for (i = 0; i < req->nr_ents; i++) {
+		struct uffd_dma_ent *en = &req->ents[i];
+
+		/* The device wrote it; hand it back to the CPU. */
+		dma_sync_single_for_cpu(en->dev, en->dma, en->len, DMA_FROM_DEVICE);
+		mm_offload_dma_map_put(en->ent);
+	}
+	kfree(req->ents);
+	kfree(req->segs);
+	i = req->nr_maps;
 	while (i--)
 		dma_unmap_page_attrs(req->maps[i].dev, req->maps[i].dma,
 				     req->maps[i].len, req->maps[i].dir, 0);
@@ -602,10 +721,29 @@ struct uffd_dma_stripe {
 	struct device *dev;
 	unsigned long chans;
 	dma_addr_t src;
-	dma_addr_t dst;
 	size_t off;
 	size_t len;
+	unsigned int seg_first;		/* its destination segments in req->segs */
+	unsigned int nr_segs;
 };
+
+/* Submit destination segments [first, first + n) from one contiguous source mapping. */
+static int uffd_dma_submit_segs(struct uffd_dma_req *req,
+				struct uffd_dma_cursor *cur, unsigned int first,
+				unsigned int n, dma_addr_t src, size_t src_off)
+{
+	unsigned int i;
+
+	for (i = first; i < first + n; i++) {
+		struct uffd_dma_seg *s = &req->segs[i];
+		int ret = uffd_dma_submit_contig(req, cur, s->dma,
+						 src + (s->off - src_off), s->len);
+
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
 
 /*
  * Stripe one physically contiguous copy over the distinct devices the
@@ -659,13 +797,13 @@ static int uffd_dma_copy_striped(struct uffd_dma_req *req, struct page *dst,
 
 		ret = uffd_dma_req_map(req, sp->dev, pages[sp->off >> PAGE_SHIFT],
 				       sp->len, DMA_TO_DEVICE, &sp->src);
-		if (!ret)
-			ret = uffd_dma_req_map(req, sp->dev,
-					       dst + (sp->off >> PAGE_SHIFT),
-					       sp->len, DMA_FROM_DEVICE,
-					       &sp->dst);
 		if (ret)
 			goto out;
+		sp->seg_first = req->nr_segs;
+		ret = uffd_dma_map_dst(req, sp->dev, sp->off, sp->len);
+		if (ret)
+			goto out;
+		sp->nr_segs = req->nr_segs - sp->seg_first;
 	}
 	t1 = ktime_get();
 	atomic_long_add(ktime_us_delta(t1, t0), &map_us_total);
@@ -679,8 +817,8 @@ static int uffd_dma_copy_striped(struct uffd_dma_req *req, struct page *dst,
 			.wait = cur->wait,
 		};
 
-		ret = uffd_dma_submit_contig(req, &scur, st[k].dst, st[k].src,
-					     st[k].len);
+		ret = uffd_dma_submit_segs(req, &scur, st[k].seg_first,
+					   st[k].nr_segs, st[k].src, st[k].off);
 		if (ret)
 			break;
 	}
@@ -845,9 +983,14 @@ static int uffd_dma_copy_pages(struct page *dst, unsigned long nr_pages,
 		 * CPU writes stays outside the device mapping, whose unmap
 		 * would otherwise overwrite it with the bounce buffer on a
 		 * bouncing platform or invalidate it on a non-coherent one.
+		 * A contiguous source gets per-segment destinations, so the
+		 * pool's standing mappings can serve them.
 		 */
-		ret = uffd_dma_req_map(req, dev, dst, dma_len, DMA_FROM_DEVICE,
-				       &dst_dma);
+		if (contig)
+			ret = uffd_dma_map_dst(req, dev, 0, dma_len);
+		else
+			ret = uffd_dma_req_map(req, dev, dst, dma_len,
+					       DMA_FROM_DEVICE, &dst_dma);
 		if (ret)
 			goto out_req;
 	}
@@ -856,8 +999,8 @@ static int uffd_dma_copy_pages(struct page *dst, unsigned long nr_pages,
 
 	if (dma_len) {
 		if (contig)
-			ret = uffd_dma_submit_contig(req, &cur, dst_dma, src_dma,
-						     dma_len);
+			ret = uffd_dma_submit_segs(req, &cur, 0, req->nr_segs,
+						   src_dma, 0);
 		else
 			if (READ_ONCE(sg_elems) &&
 			    dma_has_cap(DMA_MEMCPY_SG,
@@ -1066,6 +1209,7 @@ UFFD_DMA_UINT_ATTR(sg_elems, 0, 1024, false);
 UFFD_DMA_UINT_ATTR(abandon_ms, 0, 3600000, false);
 UFFD_DMA_BOOL_ATTR(cache_ctrl);
 UFFD_DMA_BOOL_ATTR(util_gate);
+UFFD_DMA_BOOL_ATTR(dst_map_cache);
 UFFD_DMA_COUNTER_ATTR(copies_done);
 UFFD_DMA_COUNTER_ATTR(copies_failed);
 UFFD_DMA_COUNTER_ATTR(admit_failures);
@@ -1081,6 +1225,8 @@ UFFD_DMA_COUNTER_ATTR(src_contig);
 UFFD_DMA_COUNTER_ATTR(sg_txns);
 UFFD_DMA_COUNTER_ATTR(striped_copies);
 UFFD_DMA_COUNTER_ATTR(copies_abandoned);
+UFFD_DMA_COUNTER_ATTR(dst_cached_segs);
+UFFD_DMA_COUNTER_ATTR(dst_mapped_segs);
 
 static ssize_t min_bytes_show(struct kobject *kobj,
 			      struct kobj_attribute *attr, char *buf)
@@ -1136,6 +1282,7 @@ static struct attribute *uffd_dma_attrs[] = {
 	&spin_us_attr.attr,
 	&sg_elems_attr.attr,
 	&util_gate_attr.attr,
+	&dst_map_cache_attr.attr,
 	&copies_done_attr.attr,
 	&copies_failed_attr.attr,
 	&admit_failures_attr.attr,
@@ -1152,6 +1299,8 @@ static struct attribute *uffd_dma_attrs[] = {
 	&striped_copies_attr.attr,
 	&abandon_ms_attr.attr,
 	&copies_abandoned_attr.attr,
+	&dst_cached_segs_attr.attr,
+	&dst_mapped_segs_attr.attr,
 	NULL
 };
 

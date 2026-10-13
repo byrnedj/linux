@@ -63,4 +63,24 @@ void mm_offload_dma_complete(unsigned int idx, unsigned int nr);
 int mm_offload_dma_prep_wait(unsigned int idx);
 bool mm_offload_dma_shared(void);
 
+struct folio;
+struct mm_offload_dma_map;
+
+/*
+ * Standing DMA mappings of folios a provider holds, kept across copies
+ * and shared by the providers: one cache per device, keyed by PFN. A
+ * range is resolved with mm_offload_dma_map_get() and the entry it hands
+ * back is dropped with mm_offload_dma_map_put() once the descriptors have
+ * landed; the mapping itself stays until eviction or a flush. Only for
+ * pages the provider owns for the life of the entry (a migration's
+ * folios, a destination not yet visible) - never for pinned user memory.
+ */
+size_t mm_offload_dma_map_quantum(struct device *dev);
+struct mm_offload_dma_map *mm_offload_dma_map_get(struct device *dev,
+						  struct folio *folio,
+						  size_t offset, size_t len,
+						  dma_addr_t *dma);
+void mm_offload_dma_map_put(struct mm_offload_dma_map *map);
+void mm_offload_dma_map_flush(void);
+
 #endif /* _LINUX_MM_OFFLOAD_DMA_H */

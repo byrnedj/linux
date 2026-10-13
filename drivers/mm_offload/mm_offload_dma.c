@@ -13,12 +13,22 @@
 
 #include <linux/atomic.h>
 #include <linux/bitops.h>
+#include <linux/device.h>
+#include <linux/dma-mapping.h>
 #include <linux/dmaengine.h>
+#include <linux/mm.h>
 #include <linux/mm_offload_dma.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/rcupdate.h>
+#include <linux/sizes.h>
+#include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <linux/wait.h>
+#include <linux/xarray.h>
 #include <linux/jiffies.h>
+
+static void map_cache_free_all(void);
 
 static DEFINE_MUTEX(pool_mutex);
 static unsigned int pool_users;
@@ -181,6 +191,8 @@ void mm_offload_dma_pool_put(void)
 	if (WARN_ON(!pool_users))
 		goto out;
 	if (--pool_users == 0) {
+		/* Standing mappings go before the devices they were made against. */
+		map_cache_free_all();
 		while (nr_channels) {
 			nr_channels--;
 			dma_release_channel(channels[nr_channels].chan);
@@ -520,6 +532,622 @@ static int stats_get(char *buf, const struct kernel_param *kp)
 static const struct kernel_param_ops stats_ops = { .get = stats_get };
 module_param_cb(stats, &stats_ops, NULL, 0444);
 MODULE_PARM_DESC(stats, "Per-channel admission counters");
+
+/*
+ * PFN-keyed standing mapping cache, shared by the providers.
+ *
+ * Every copy a provider offloads maps its folios, hands them to the
+ * engines and unmaps them again, so each one pays for an IOVA allocation
+ * and its teardown. Under a translated IOMMU domain that is not merely
+ * CPU cost: an allocation larger than the per-CPU IOVA rcache ceiling
+ * (dma_opt_mapping_size(), 128K on a stock kernel) is served from the
+ * domain rbtree, the addresses it hands back drift as that space
+ * fragments, and the IOMMU stops holding the translations the engines
+ * are about to use. Measured on two DSA devices, offloaded migration
+ * starts at ~60 GiB/s and settles at ~30 after an hour of traffic;
+ * iommu.passthrough=1 removes the loss entirely.
+ *
+ * So keep the mappings. A per-device xarray keyed by segment-head PFN
+ * holds standing mappings of the folios the providers have touched. The
+ * folios come from bounded sets - an hstate pool, a guest's memory, the
+ * pages a restore populates - so the same pages come back, and with
+ * them the same device addresses. dma_unmap leaves the copy path
+ * entirely: it runs on CLOCK eviction under a byte cap, or on a flush.
+ *
+ * Entries are mapped DMA_BIDIRECTIONAL because a folio that is a source
+ * this time is a destination the next, and one entry serving both roles
+ * halves both the entry count and the IOVA footprint.
+ *
+ * Correctness: struct page to physical address is immutable, and the
+ * providers only issue descriptors against folios they hold - a
+ * migration source unmapped and locked, a destination allocated and not
+ * yet visible to anyone - so a stale entry cannot misdirect a copy.
+ * What staleness costs is IOVA space and a standing window in which the
+ * device could reach a page since released: the trade page_pool already
+ * makes for its persistent NIC mappings, bounded here by the cap and
+ * revocable by writing map_cache_stats. Pages a provider does not own
+ * for the life of the entry - user memory it has merely pinned - must
+ * not go through the cache.
+ *
+ * A standing mapping is not the device's to keep between copies, so the
+ * ownership transfers the per-copy map and unmap used to perform happen
+ * explicitly in the caller instead: the source is handed to the device
+ * (dma_sync_single_for_device) before its descriptors are submitted and
+ * the destination handed back (dma_sync_single_for_cpu) once they have
+ * landed. On a coherent device both compile away.
+ *
+ * Entry lifetime is a bias refcount: refs = 1 for the cache plus one
+ * per in-flight copy. Lookup takes its reference with
+ * atomic_inc_not_zero() under RCU, and eviction erases the entry and
+ * drops the bias, so a mapping outlives eviction until the last copy
+ * using it completes and the last dropper unmaps.
+ *
+ * The caches live as long as the pool has a user: the devices they map
+ * against are the pool's, and the last mm_offload_dma_pool_put() frees
+ * them before it releases the channels.
+ */
+
+/* Largest segment an entry covers; also the largest descriptor. */
+#define MAP_QUANTUM_MAX		SZ_2M
+/* Entries one eviction sweep may visit, bounding submit-path latency. */
+#define MAP_EVICT_BUDGET	64
+/* Devices that can have a cache; the pool holds at most this many. */
+#define MAP_CACHE_DEVS		(MM_OFFLOAD_DMA_MAX_CHANNELS / 2)
+
+/* One standing mapping: a quantum-sized segment of one folio. */
+struct mm_offload_dma_map {
+	unsigned long		pfn;		/* segment-head PFN: the key */
+	dma_addr_t		dma;
+	unsigned int		size;
+	atomic_t		refs;		/* cache bias + in-flight copies */
+	bool			referenced;	/* CLOCK second chance */
+	struct device		*dev;
+	struct rcu_head		rcu;
+};
+
+struct map_cache {
+	struct xarray		xa;
+	spinlock_t		lock;		/* serialises the CLOCK sweep */
+	unsigned long		hand;		/* where the sweep resumes */
+	struct device		*dev;
+	size_t			quantum;
+	atomic64_t		covered;	/* bytes mapped through the tree */
+	atomic64_t		hits;
+	atomic64_t		misses;
+	atomic64_t		inserts;
+	atomic64_t		insert_fails;
+	atomic64_t		range_fallbacks;
+	atomic64_t		evictions;
+	atomic64_t		ref_skips;	/* sweep passed an in-flight entry */
+};
+
+static bool map_cache = true;
+static unsigned long map_cache_cap_mb = 4096;
+static unsigned long map_quantum_kb;		/* 0: dma_opt_mapping_size() */
+static unsigned long map_cache_min_kb = 64;
+
+static struct map_cache *map_caches[MAP_CACHE_DEVS];
+static struct device *map_cache_devs[MAP_CACHE_DEVS];
+static DEFINE_SPINLOCK(map_cache_reg_lock);
+/* Flush and free against the stats walk. */
+static DEFINE_MUTEX(map_mutex);
+
+/*
+ * Segment size entries are carved into. Keeping it at or below
+ * dma_opt_mapping_size() puts every IOVA allocation the cache does make
+ * in a per-CPU rcache size class; raising it to the folio size trades
+ * that for fewer, larger entries and larger descriptors, which pays
+ * once the working set fits the cap and the allocations stop.
+ */
+static size_t map_quantum_of(struct device *dev)
+{
+	size_t q = (size_t)READ_ONCE(map_quantum_kb) << 10;
+
+	if (!q)
+		q = dma_opt_mapping_size(dev);
+	if (!q || q > MAP_QUANTUM_MAX)
+		q = MAP_QUANTUM_MAX;
+	if (q < PAGE_SIZE)
+		q = PAGE_SIZE;
+
+	return 1UL << (fls_long(q) - 1);	/* power of two, rounded down */
+}
+
+/* The cache of @dev, created on first use. NULL: caching is off. */
+static struct map_cache *map_cache_get(struct device *dev)
+{
+	struct map_cache *c;
+	int i;
+
+	if (!READ_ONCE(map_cache))
+		return NULL;
+
+	for (i = 0; i < MAP_CACHE_DEVS; i++) {
+		/*
+		 * Pairs with the store-release below: a published device
+		 * means its cache is fully initialised.
+		 */
+		if (smp_load_acquire(&map_cache_devs[i]) == dev)
+			return map_caches[i];
+		if (!READ_ONCE(map_cache_devs[i]))
+			break;
+	}
+
+	c = kzalloc(sizeof(*c), GFP_KERNEL);
+	if (!c)
+		return NULL;
+	xa_init(&c->xa);
+	spin_lock_init(&c->lock);
+	/*
+	 * Entries outlive any one copy and unmap against this device, so
+	 * hold it for as long as the cache does.
+	 */
+	c->dev = get_device(dev);
+	c->quantum = map_quantum_of(dev);
+
+	spin_lock(&map_cache_reg_lock);
+	for (i = 0; i < MAP_CACHE_DEVS; i++) {
+		if (map_cache_devs[i] == dev) {		/* lost the race */
+			spin_unlock(&map_cache_reg_lock);
+			put_device(c->dev);
+			kfree(c);
+			return map_caches[i];
+		}
+		if (!map_cache_devs[i]) {
+			map_caches[i] = c;
+			/* Publish the cache before the device it answers to. */
+			smp_store_release(&map_cache_devs[i], dev);
+			spin_unlock(&map_cache_reg_lock);
+			return c;
+		}
+	}
+	spin_unlock(&map_cache_reg_lock);
+	put_device(c->dev);
+	kfree(c);
+	return NULL;
+}
+
+/**
+ * mm_offload_dma_map_quantum - segment size of @dev's standing mappings.
+ *
+ * Return: the size a provider should cut its ranges at so each one is a
+ * whole cache entry, or 0 when the cache is off and ranges are mapped
+ * per copy.
+ */
+size_t mm_offload_dma_map_quantum(struct device *dev)
+{
+	struct map_cache *c = map_cache_get(dev);
+
+	return c ? c->quantum : 0;
+}
+EXPORT_SYMBOL_GPL(mm_offload_dma_map_quantum);
+
+/**
+ * mm_offload_dma_map_put - drop one reference on a standing mapping.
+ *
+ * The last dropper unmaps and frees, which is safe from any context the
+ * copy path completes in.
+ */
+void mm_offload_dma_map_put(struct mm_offload_dma_map *e)
+{
+	if (!atomic_dec_and_test(&e->refs))
+		return;
+	dma_unmap_page_attrs(e->dev, e->dma, e->size, DMA_BIDIRECTIONAL,
+			     DMA_ATTR_SKIP_CPU_SYNC);
+	kfree_rcu(e, rcu);
+}
+EXPORT_SYMBOL_GPL(mm_offload_dma_map_put);
+
+/*
+ * CLOCK sweep: resume the hand where it stopped, give referenced
+ * entries a second chance so a one-pass scan cannot flush the recycling
+ * working set, and skip entries a copy is still using. Runs on the
+ * submit path once an insert pushes the cache past its cap, so the
+ * trylock - another submitter is already sweeping - and the visit
+ * budget both bound the latency it adds.
+ */
+static void map_cache_evict(struct map_cache *c, u64 cap)
+{
+	/*
+	 * Evict down to a low-water mark rather than exactly to the cap.
+	 * Stopping at the cap leaves the next insert over it again, so a
+	 * working set that happens to sit at the cap pays a sweep and an
+	 * unmap per insert and thrashes: measured at 775k evictions and
+	 * barely half the throughput, against none and full speed once the
+	 * cap was raised past the same working set.
+	 */
+	u64 low = cap - (cap >> 3);
+	struct mm_offload_dma_map *e;
+	unsigned long index;
+	int budget = MAP_EVICT_BUDGET;
+	int pass;
+
+	if (!spin_trylock(&c->lock))
+		return;
+
+	/*
+	 * Entries are freed with kfree_rcu(), and the iterator hands them
+	 * back outside any read-side section, so hold one across the sweep:
+	 * under preemptible RCU c->lock does not stand in for it, and a
+	 * grace period elapsing mid-sweep would leave us reading freed
+	 * entries.
+	 */
+	rcu_read_lock();
+	for (pass = 0; pass < 2 && atomic64_read(&c->covered) > (s64)low; pass++) {
+		unsigned long start = pass ? 0 : c->hand;
+
+		xa_for_each_start(&c->xa, index, e, start) {
+			if (--budget <= 0) {
+				c->hand = index + 1;
+				goto out;
+			}
+			if (READ_ONCE(e->referenced)) {
+				WRITE_ONCE(e->referenced, false);
+			} else if (atomic_read(&e->refs) > 1) {
+				atomic64_inc(&c->ref_skips);
+			} else if (xa_cmpxchg(&c->xa, index, e, NULL,
+					      GFP_NOWAIT | __GFP_NOWARN) == e) {
+				/*
+				 * Identity-checked: the displace path in
+				 * mm_offload_dma_map_get() removes entries
+				 * without this lock, so only the remover that
+				 * actually took *this* entry out may drop its
+				 * bias.
+				 */
+				atomic64_sub(e->size, &c->covered);
+				atomic64_inc(&c->evictions);
+				mm_offload_dma_map_put(e);	/* the cache bias */
+				if (atomic64_read(&c->covered) <= (s64)low) {
+					c->hand = index + 1;
+					goto out;
+				}
+			}
+		}
+		c->hand = 0;
+	}
+out:
+	rcu_read_unlock();
+	spin_unlock(&c->lock);
+}
+
+/*
+ * Erase every entry, dropping the cache's bias; in-flight copies keep
+ * their own reference and unmap when they finish.
+ */
+static void map_cache_flush(struct map_cache *c)
+{
+	struct mm_offload_dma_map *e;
+	unsigned long index;
+
+	/* As in the sweep: the entries are only safe to touch under RCU. */
+	rcu_read_lock();
+	xa_for_each(&c->xa, index, e) {
+		if (xa_cmpxchg(&c->xa, index, e, NULL,
+			       GFP_NOWAIT | __GFP_NOWARN) != e)
+			continue;	/* a sweep got there first */
+		atomic64_sub(e->size, &c->covered);
+		mm_offload_dma_map_put(e);
+	}
+	rcu_read_unlock();
+
+	spin_lock(&c->lock);
+	c->hand = 0;
+	spin_unlock(&c->lock);
+}
+
+static void map_cache_flush_all(void)
+{
+	int i;
+
+	for (i = 0; i < MAP_CACHE_DEVS; i++) {
+		/* Pairs with the store-release in map_cache_get(). */
+		if (!smp_load_acquire(&map_cache_devs[i]))
+			break;
+		map_cache_flush(map_caches[i]);
+	}
+}
+
+/**
+ * mm_offload_dma_map_flush - revoke every standing mapping, all devices.
+ *
+ * In-flight copies keep theirs until they complete.
+ */
+void mm_offload_dma_map_flush(void)
+{
+	mutex_lock(&map_mutex);
+	map_cache_flush_all();
+	mutex_unlock(&map_mutex);
+}
+EXPORT_SYMBOL_GPL(mm_offload_dma_map_flush);
+
+/*
+ * The pool's last user is gone: no copy can be in flight, so the caches
+ * go too, before the channels - and with them the pool's handle on the
+ * devices - are released.
+ */
+static void map_cache_free_all(void)
+{
+	int i;
+
+	mutex_lock(&map_mutex);
+	map_cache_flush_all();
+	rcu_barrier();		/* the entries' kfree_rcu() */
+
+	spin_lock(&map_cache_reg_lock);
+	for (i = 0; i < MAP_CACHE_DEVS; i++) {
+		struct map_cache *c = map_caches[i];
+
+		if (!c)
+			continue;
+		/* flush emptied it; anything left would be an unmapped leak */
+		WARN_ON_ONCE(!xa_empty(&c->xa));
+		xa_destroy(&c->xa);
+		put_device(c->dev);
+		kfree(c);
+		map_caches[i] = NULL;
+		map_cache_devs[i] = NULL;
+	}
+	spin_unlock(&map_cache_reg_lock);
+	mutex_unlock(&map_mutex);
+}
+
+/**
+ * mm_offload_dma_map_get - device address of a folio range, cached.
+ * @dev: the DMA device the copy will run on.
+ * @folio: a folio the caller holds for the life of the copy.
+ * @offset: start within the folio.
+ * @len: bytes; must not cross a quantum boundary (see _quantum()).
+ * @dma: set to the device address of @offset.
+ *
+ * Resolve [offset, offset + len) of @folio to a device address, mapping
+ * and caching the segment that covers it if this is the first time.
+ * Return: the entry with an in-flight reference taken (drop it with
+ * mm_offload_dma_map_put() once the descriptors have landed), or NULL
+ * when the caller should map the range itself - never an error, only
+ * slower. The entry is mapped bidirectional without CPU sync: the
+ * caller syncs for the device before submitting and for the CPU after.
+ */
+struct mm_offload_dma_map *mm_offload_dma_map_get(struct device *dev,
+						  struct folio *folio,
+						  size_t offset, size_t len,
+						  dma_addr_t *dma)
+{
+	u64 cap = (u64)READ_ONCE(map_cache_cap_mb) << 20;
+	struct map_cache *c = map_cache_get(dev);
+	size_t seg_base, seg_len, rel, map_len;
+	struct mm_offload_dma_map *e, *old;
+	unsigned long pfn;
+	dma_addr_t base;
+
+	if (!c || !cap)
+		return NULL;
+
+	map_len = folio_size(folio);
+	seg_base = offset & ~(c->quantum - 1);
+	seg_len = min_t(size_t, c->quantum, map_len - seg_base);
+	rel = offset - seg_base;
+	if (unlikely(rel + len > seg_len)) {
+		atomic64_inc(&c->range_fallbacks);
+		return NULL;
+	}
+	/*
+	 * Below the IOVA rcache ceiling a mapping is served from a per-CPU
+	 * magazine and costs little to make and unmake, so small folios are
+	 * left to map themselves rather than filling the cache with entries
+	 * that save nothing.
+	 */
+	if (seg_len < ((size_t)READ_ONCE(map_cache_min_kb) << 10))
+		return NULL;
+
+	pfn = folio_pfn(folio) + (seg_base >> PAGE_SHIFT);
+
+	rcu_read_lock();
+	e = xa_load(&c->xa, pfn);
+	if (e && atomic_inc_not_zero(&e->refs)) {
+		rcu_read_unlock();
+		if (unlikely(rel + len > e->size)) {
+			/*
+			 * The PFN came back under a larger folio than the one
+			 * the entry was mapped for. Displace it and remap
+			 * under the same key; anyone still copying through the
+			 * old mapping is held up by the bias protocol.
+			 */
+			if (xa_cmpxchg(&c->xa, pfn, e, NULL,
+				       GFP_NOWAIT | __GFP_NOWARN) == e) {
+				atomic64_sub(e->size, &c->covered);
+				mm_offload_dma_map_put(e);	/* the cache bias */
+			}
+			mm_offload_dma_map_put(e);		/* the lookup */
+			atomic64_inc(&c->range_fallbacks);
+			goto miss;
+		}
+		WRITE_ONCE(e->referenced, true);
+		atomic64_inc(&c->hits);
+		*dma = e->dma + rel;
+		return e;
+	}
+	rcu_read_unlock();
+
+miss:
+	atomic64_inc(&c->misses);
+	e = kmalloc_obj(*e, GFP_NOWAIT | __GFP_NOWARN);
+	if (!e)
+		goto fail;
+	base = dma_map_page_attrs(c->dev, folio_page(folio, seg_base >> PAGE_SHIFT),
+				  0, seg_len, DMA_BIDIRECTIONAL,
+				  DMA_ATTR_SKIP_CPU_SYNC);
+	if (dma_mapping_error(c->dev, base)) {
+		kfree(e);
+		goto fail;
+	}
+	e->pfn = pfn;
+	e->dma = base;
+	e->size = seg_len;
+	e->dev = c->dev;
+	e->referenced = true;
+	atomic_set(&e->refs, 2);	/* the cache bias + this copy */
+
+	/*
+	 * Charge before publishing: once the entry is visible a sweep may
+	 * remove it, and a remover that subtracted bytes never added would
+	 * drive the counter negative and the cap comparison with it.
+	 */
+	atomic64_add(seg_len, &c->covered);
+	rcu_read_lock();
+	old = xa_cmpxchg(&c->xa, pfn, NULL, e, GFP_NOWAIT | __GFP_NOWARN);
+	if (old) {
+		/* Lost an insert race, or the xarray could not allocate. */
+		atomic64_sub(seg_len, &c->covered);
+		dma_unmap_page_attrs(c->dev, base, seg_len, DMA_BIDIRECTIONAL,
+				     DMA_ATTR_SKIP_CPU_SYNC);
+		kfree(e);
+		if (!xa_is_err(old) && atomic_inc_not_zero(&old->refs)) {
+			rcu_read_unlock();
+			if (unlikely(rel + len > old->size)) {
+				atomic64_inc(&c->range_fallbacks);
+				mm_offload_dma_map_put(old);
+				return NULL;
+			}
+			WRITE_ONCE(old->referenced, true);
+			atomic64_inc(&c->hits);
+			*dma = old->dma + rel;
+			return old;
+		}
+		rcu_read_unlock();
+		goto fail;
+	}
+	rcu_read_unlock();
+	atomic64_inc(&c->inserts);
+
+	/*
+	 * Pairs with the barrier in the setters that revoke the cache:
+	 * either the flush that follows the revoke sees this entry, or this
+	 * sees the revoke and takes the entry back out itself. The copy's
+	 * own reference keeps the mapping until the copy completes.
+	 */
+	smp_mb();
+	if (unlikely(!READ_ONCE(map_cache) || !READ_ONCE(map_cache_cap_mb))) {
+		if (xa_cmpxchg(&c->xa, pfn, e, NULL, GFP_NOWAIT) == e) {
+			atomic64_sub(seg_len, &c->covered);
+			mm_offload_dma_map_put(e);
+		}
+		*dma = e->dma + rel;
+		return e;
+	}
+	if (atomic64_read(&c->covered) > (s64)cap)
+		map_cache_evict(c, cap);
+	*dma = e->dma + rel;
+	return e;
+fail:
+	atomic64_inc(&c->insert_fails);
+	return NULL;
+}
+EXPORT_SYMBOL_GPL(mm_offload_dma_map_get);
+
+/*
+ * Turning the cache off, or capping it at nothing, has to revoke the
+ * mappings it is already holding - otherwise "off" leaves standing
+ * device access to every folio it ever touched. A copy that read the
+ * old setting may still be inserting, so the barrier orders the new
+ * setting before the flush and pairs with the check an inserter makes
+ * after publishing: one of the two sees the other's entry.
+ */
+static int map_cache_off_set(const char *val, const struct kernel_param *kp)
+{
+	int ret = param_set_bool(val, kp);
+
+	if (!ret && !READ_ONCE(map_cache)) {
+		smp_mb();
+		mm_offload_dma_map_flush();
+	}
+	return ret;
+}
+
+static const struct kernel_param_ops map_cache_ops = {
+	.set = map_cache_off_set,
+	.get = param_get_bool,
+};
+module_param_cb(map_cache, &map_cache_ops, &map_cache, 0644);
+MODULE_PARM_DESC(map_cache,
+		 "Keep DMA mappings of the folios providers copy instead of remapping each copy");
+
+static int map_cache_cap_set(const char *val, const struct kernel_param *kp)
+{
+	int ret = param_set_ulong(val, kp);
+
+	if (!ret && !READ_ONCE(map_cache_cap_mb)) {
+		smp_mb();	/* as in map_cache_off_set() */
+		mm_offload_dma_map_flush();
+	}
+	return ret;
+}
+
+static const struct kernel_param_ops map_cache_cap_ops = {
+	.set = map_cache_cap_set,
+	.get = param_get_ulong,
+};
+module_param_cb(map_cache_cap_mb, &map_cache_cap_ops, &map_cache_cap_mb, 0644);
+MODULE_PARM_DESC(map_cache_cap_mb,
+		 "Bytes of standing mappings to keep per device, MiB (0 disables and revokes)");
+
+module_param(map_cache_min_kb, ulong, 0644);
+MODULE_PARM_DESC(map_cache_min_kb,
+		 "Smallest mapping worth caching, KiB (below the IOVA rcache ceiling it saves nothing)");
+
+module_param(map_quantum_kb, ulong, 0644);
+MODULE_PARM_DESC(map_quantum_kb,
+		 "Segment size cached mappings are carved into, KiB (0: dma_opt_mapping_size; fixed per cache, takes effect when the pool is next acquired)");
+
+/* map_cache_stats: per-device cache counters; any write flushes every cache */
+static int map_cache_stats_get(char *buffer, const struct kernel_param *kp)
+{
+	int len = 0, i;
+
+	/* Against map_cache_free_all(), which frees what we walk. */
+	mutex_lock(&map_mutex);
+	for (i = 0; i < MAP_CACHE_DEVS; i++) {
+		struct map_cache *c;
+
+		/* Pairs with the store-release in map_cache_get(). */
+		if (!smp_load_acquire(&map_cache_devs[i]))
+			break;
+		c = map_caches[i];
+		len += sysfs_emit_at(buffer, len,
+				     "%s quantum_kb %zu covered_kb %lld hits %lld misses %lld inserts %lld insert_fails %lld range_fallbacks %lld evictions %lld ref_skips %lld\n",
+				     dev_name(c->dev), c->quantum >> 10,
+				     atomic64_read(&c->covered) >> 10,
+				     atomic64_read(&c->hits),
+				     atomic64_read(&c->misses),
+				     atomic64_read(&c->inserts),
+				     atomic64_read(&c->insert_fails),
+				     atomic64_read(&c->range_fallbacks),
+				     atomic64_read(&c->evictions),
+				     atomic64_read(&c->ref_skips));
+	}
+	if (!len)
+		len = sysfs_emit(buffer, "none\n");
+	mutex_unlock(&map_mutex);
+	return len;
+}
+
+static int map_cache_stats_set(const char *val, const struct kernel_param *kp)
+{
+	mm_offload_dma_map_flush();
+	return 0;
+}
+
+static const struct kernel_param_ops map_cache_stats_ops = {
+	.set = map_cache_stats_set,
+	.get = map_cache_stats_get,
+};
+module_param_cb(map_cache_stats, &map_cache_stats_ops, NULL, 0644);
+MODULE_PARM_DESC(map_cache_stats, "Standing mapping cache counters per device (write to flush)");
+
+static void __exit mm_offload_dma_exit(void)
+{
+	map_cache_free_all();
+}
+module_exit(mm_offload_dma_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Shared DMA channel pool for mm_offload providers");
