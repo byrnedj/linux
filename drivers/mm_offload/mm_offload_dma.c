@@ -297,6 +297,65 @@ unsigned long mm_offload_dma_claim(unsigned int want, int nid,
 }
 EXPORT_SYMBOL_GPL(mm_offload_dma_claim);
 
+/*
+ * As claim_pass(), but the group is chosen by @key instead of by
+ * rotation: the same key always lands on the same device.
+ */
+static unsigned long claim_pass_keyed(int nid, bool match_node,
+				      unsigned int want, unsigned long key,
+				      struct mm_offload_dma_group **grpp)
+{
+	unsigned int sel[MM_OFFLOAD_DMA_MAX_CHANNELS];
+	unsigned int ngroups = smp_load_acquire(&nr_groups);
+	unsigned int limit = smp_load_acquire(&nr_channels);
+	unsigned int n = 0, g, i;
+
+	for (g = 0; g < ngroups; g++)
+		if ((groups[g].node == nid) == match_node)
+			sel[n++] = g;
+	if (!n)
+		return 0;
+
+	g = key % n;
+	for (i = 0; i < n; i++) {
+		struct mm_offload_dma_group *grp = &groups[sel[(g + i) % n]];
+		unsigned long mask = claim_group(grp, want, limit);
+
+		if (mask) {
+			*grpp = grp;
+			return mask;
+		}
+	}
+	return 0;
+}
+
+/**
+ * mm_offload_dma_claim_keyed - claim channels of the device @key selects.
+ * @want: channels wanted.
+ * @nid: NUMA node of the destination; its groups are tried first.
+ * @key: anything stable for the memory being copied, e.g. the PFN of
+ *       the destination at huge-page granularity. The same key always
+ *       maps to the same device among a node's, so a device's standing
+ *       mappings (mm_offload_dma_map_get()) only ever have to cover its
+ *       own share of a recycling pool instead of all of it.
+ * @grpp: the group the channels belong to, on success.
+ *
+ * Return: bitmask of claimed channel indices, 0 if every channel of
+ * every group is busy.
+ */
+unsigned long mm_offload_dma_claim_keyed(unsigned int want, int nid,
+					 unsigned long key,
+					 struct mm_offload_dma_group **grpp)
+{
+	bool local_first = READ_ONCE(cross_node) != MM_OFFLOAD_DMA_REMOTE;
+	unsigned long mask = claim_pass_keyed(nid, local_first, want, key, grpp);
+
+	if (!mask)
+		mask = claim_pass_keyed(nid, !local_first, want, key, grpp);
+	return mask;
+}
+EXPORT_SYMBOL_GPL(mm_offload_dma_claim_keyed);
+
 /* One breadth-first pass over the groups that do (not) match @nid. */
 static unsigned long spread_pass(unsigned int want, int nid, bool match_node,
 				 unsigned long mask, unsigned int *gotp)
@@ -623,7 +682,7 @@ struct map_cache {
 
 static bool map_cache = true;
 static unsigned long map_cache_cap_mb = 4096;
-static unsigned long map_quantum_kb;		/* 0: dma_opt_mapping_size() */
+static unsigned long map_quantum_kb = 128;	/* 0: dma_opt_mapping_size() */
 static unsigned long map_cache_min_kb = 64;
 
 static struct map_cache *map_caches[MAP_CACHE_DEVS];
@@ -1096,7 +1155,7 @@ MODULE_PARM_DESC(map_cache_min_kb,
 
 module_param(map_quantum_kb, ulong, 0644);
 MODULE_PARM_DESC(map_quantum_kb,
-		 "Segment size cached mappings are carved into, KiB (0: dma_opt_mapping_size; fixed per cache, takes effect when the pool is next acquired)");
+		 "Segment size cached mappings are carved into, KiB (default 128, the IOVA rcache ceiling; 0: dma_opt_mapping_size; fixed per cache, takes effect when the pool is next acquired)");
 
 /* map_cache_stats: per-device cache counters; any write flushes every cache */
 static int map_cache_stats_get(char *buffer, const struct kernel_param *kp)

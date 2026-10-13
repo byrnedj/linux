@@ -55,6 +55,9 @@ struct dma_chan *mm_offload_dma_chan(unsigned int idx);
 unsigned long mm_offload_dma_claim(unsigned int want, int nid,
 				   struct mm_offload_dma_group **grpp);
 unsigned long mm_offload_dma_claim_spread(unsigned int want, int nid);
+unsigned long mm_offload_dma_claim_keyed(unsigned int want, int nid,
+					 unsigned long key,
+					 struct mm_offload_dma_group **grpp);
 struct device *mm_offload_dma_chan_dev(unsigned int idx);
 void mm_offload_dma_release(unsigned long mask);
 int mm_offload_dma_admit(unsigned int idx, unsigned int nr, bool wait);

@@ -20,7 +20,11 @@
 #include <linux/completion.h>
 #include <linux/dma-mapping.h>
 #include <linux/dmaengine.h>
+#include <linux/fs.h>
 #include <linux/highmem.h>
+#include <linux/list.h>
+#include <linux/miscdevice.h>
+#include <linux/mmu_notifier.h>
 #include <linux/kobject.h>
 #include <linux/ktime.h>
 #include <linux/mm.h>
@@ -31,8 +35,10 @@
 #include <linux/scatterlist.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
+#include <linux/sched/mm.h>
 #include <linux/sysfs.h>
 #include <linux/uaccess.h>
+#include <linux/wait.h>
 
 #define UFFD_DMA_TIMEOUT_MS	10000	/* between overdue warnings */
 #define UFFD_DMA_ABANDON_MS_DEFAULT	30000
@@ -60,6 +66,15 @@ static atomic_long_t sg_txns;	/* DMA_MEMCPY_SG transactions submitted */
 static atomic_long_t striped_copies;	/* copies striped over >1 device */
 static atomic_long_t copies_abandoned;	/* given up on, see uffd_dma_wait() */
 static atomic_long_t dst_cached_segs;	/* destination ranges from the standing mappings */
+static atomic_long_t src_registered;	/* copies whose source was a registered buffer */
+static atomic_long_t regbufs_invalidated;	/* registrations the mm unmapped under us */
+static atomic_long_t src_map_us_total;	/* of map_us_total: the source */
+static atomic_long_t dst_map_us_total;	/* of map_us_total: the destination */
+static atomic_long_t refused_small;	/* copies_refused by reason: */
+static atomic_long_t refused_unaligned;
+static atomic_long_t refused_stalled;
+static atomic_long_t refused_saturated;
+static atomic_long_t refused_noclaim;
 static atomic_long_t dst_mapped_segs;	/* destination ranges mapped per request */
 
 static bool offloading_enabled;
@@ -79,6 +94,7 @@ static unsigned int abandon_ms = UFFD_DMA_ABANDON_MS_DEFAULT;
 static bool stalled;
 static bool util_gate;
 static bool dst_map_cache = true;	/* destinations through mm_offload_dma_map_get() */
+static bool dev_by_pfn = true;		/* device chosen by destination PFN, not rotation */
 
 static DEFINE_MUTEX(uffd_dma_mutex);
 
@@ -128,8 +144,12 @@ struct uffd_dma_req {
 	atomic_t state;			/* enum uffd_dma_req_state */
 	struct page *dst;
 	unsigned long nr_pages;
-	struct page **pages;		/* the source */
+	struct page **pages;		/* the source, when pinned for this copy */
 	bool src_pinned;
+	/* ... or a registered buffer: pinned and mapped once, see below. */
+	struct uffd_dma_regbuf *regbuf;
+	struct uffd_dma_ext *ext;
+	unsigned long src;
 	bool pinned;			/* FOLL_PIN rather than FOLL_GET */
 	struct device *sgt_dev;		/* a scattered source is mapped here */
 	struct sg_table sgt;
@@ -153,6 +173,454 @@ static atomic_long_t admit_failures;
 
 static void uffd_dma_unpin_src(struct page **pages, unsigned long nr,
 			       bool pinned);
+
+/* ---- registered sources ----
+ *
+ * A UFFDIO_COPY source is user memory: the provider pins it, maps it
+ * for the device and undoes both when the copy lands, and under a
+ * translated IOMMU domain that mapping costs more than a 2 MiB copy.
+ * A restore daemon copies out of the same few decompression buffers
+ * thousands of times, so it may register them once through
+ * /dev/uffd_dma: the pages are pinned for good (FOLL_LONGTERM, charged
+ * to RLIMIT_MEMLOCK like io_uring's fixed buffers) and each physically
+ * contiguous run of them is mapped on a device the first time that
+ * device copies from it. A copy whose source lies within one run of a
+ * buffer registered by the calling mm then pins nothing and maps
+ * nothing. The contract is io_uring's: the buffer stays where it is
+ * for as long as it is registered; the copy reads the pinned pages
+ * whatever the address space says since. Buffers are released on
+ * UNREGISTER or when the file is closed, after any copy still using
+ * them has landed, and their device mappings are dropped whenever the
+ * provider is disabled (the pool's devices go with it) and made again
+ * on the next use.
+ */
+
+struct uffd_dma_reg {
+	__u64 addr;
+	__u64 len;
+};
+
+#define UFFD_DMA_IOC_REGISTER	_IOW(0xDA, 1, struct uffd_dma_reg)
+#define UFFD_DMA_IOC_UNREGISTER	_IOW(0xDA, 2, struct uffd_dma_reg)
+#define UFFD_DMA_REG_DEVS	(MM_OFFLOAD_DMA_MAX_CHANNELS / 2)
+
+/*
+ * One physically contiguous run of a registered buffer. Its device
+ * address on device i of the buffer's mapping table is dma[i].
+ */
+struct uffd_dma_ext {
+	unsigned long uaddr;
+	size_t len;
+	struct page *first;
+	dma_addr_t dma[UFFD_DMA_REG_DEVS];
+};
+
+/*
+ * The whole buffer mapped on one device: one scatterlist of its runs,
+ * one IOVA allocation, however many runs (THPs) the buffer is made of.
+ */
+struct uffd_dma_regmap {
+	struct device *dev;
+	struct sg_table sgt;
+};
+
+struct uffd_dma_regbuf {
+	struct list_head node;		/* on its registry */
+	struct uffd_dma_regs *regs;
+	unsigned long uaddr;
+	size_t len;
+	struct page **pages;
+	unsigned long nr_pages;
+	struct uffd_dma_ext *exts;
+	unsigned int nr_exts;
+	struct uffd_dma_regmap maps[UFFD_DMA_REG_DEVS];
+	unsigned int nmaps;		/* published with release semantics */
+	bool dead;			/* the mm unmapped (part of) it */
+	atomic_t refs;			/* the registry + in-flight copies */
+};
+
+/* One open file: the buffers one mm registered. */
+struct uffd_dma_regs {
+	struct list_head node;		/* on uffd_dma_regs_list */
+	struct mm_struct *mm;
+	struct mmu_notifier mn;
+	struct list_head bufs;
+};
+
+static LIST_HEAD(uffd_dma_regs_list);
+static DEFINE_SPINLOCK(uffd_dma_regs_lock);	/* the lists, for lookup */
+static DEFINE_MUTEX(uffd_dma_regs_mutex);	/* register, unregister, map, unmap */
+static DECLARE_WAIT_QUEUE_HEAD(uffd_dma_regbuf_wq);
+static atomic_long_t registered_bytes;
+
+/*
+ * The registered run covering [src, src + size) of the calling mm, with
+ * a reference taken, or NULL.
+ */
+static struct uffd_dma_regbuf *uffd_dma_regbuf_find(unsigned long src,
+						    size_t size,
+						    struct uffd_dma_ext **extp)
+{
+	struct uffd_dma_regs *regs;
+	struct uffd_dma_regbuf *rb;
+	unsigned int i;
+
+	if (list_empty(&uffd_dma_regs_list))
+		return NULL;
+	spin_lock(&uffd_dma_regs_lock);
+	list_for_each_entry(regs, &uffd_dma_regs_list, node) {
+		if (regs->mm != current->mm)
+			continue;
+		list_for_each_entry(rb, &regs->bufs, node) {
+			if (READ_ONCE(rb->dead) || src < rb->uaddr ||
+			    src + size > rb->uaddr + rb->len)
+				continue;
+			for (i = 0; i < rb->nr_exts; i++) {
+				struct uffd_dma_ext *e = &rb->exts[i];
+
+				if (src >= e->uaddr &&
+				    src + size <= e->uaddr + e->len) {
+					atomic_inc(&rb->refs);
+					*extp = e;
+					spin_unlock(&uffd_dma_regs_lock);
+					return rb;
+				}
+			}
+		}
+	}
+	spin_unlock(&uffd_dma_regs_lock);
+	return NULL;
+}
+
+static void uffd_dma_regbuf_put(struct uffd_dma_regbuf *rb)
+{
+	if (atomic_dec_return(&rb->refs) == 1)
+		wake_up(&uffd_dma_regbuf_wq);
+}
+
+/*
+ * The buffer's standing mapping on @dev, made on first use: the runs go
+ * into one scatterlist and one dma_map_sgtable(), so a buffer of many
+ * THPs costs one IOVA allocation per device, not one per run. The
+ * mapping table only grows while mappings exist (it is emptied with no
+ * copy in flight), so the common case reads it without the mutex: a
+ * published count covers fully written entries.
+ *
+ * Return: the index of the mapping on @dev, or -errno.
+ */
+static int uffd_dma_regbuf_map(struct uffd_dma_regbuf *rb, struct device *dev)
+{
+	unsigned int i, n = smp_load_acquire(&rb->nmaps);
+	struct uffd_dma_regmap *m;
+	struct scatterlist *sg;
+	dma_addr_t cur = 0;
+	size_t left = 0;
+	unsigned int e, seg;
+	int ret;
+
+	for (i = 0; i < n; i++)
+		if (READ_ONCE(rb->maps[i].dev) == dev)
+			return i;
+
+	mutex_lock(&uffd_dma_regs_mutex);
+	for (i = 0; i < rb->nmaps; i++)
+		if (rb->maps[i].dev == dev) {
+			ret = i;
+			goto out;
+		}
+	if (rb->nmaps == UFFD_DMA_REG_DEVS) {
+		ret = -ENOSPC;
+		goto out;
+	}
+	m = &rb->maps[rb->nmaps];
+	ret = sg_alloc_table_from_pages(&m->sgt, rb->pages, rb->nr_pages, 0,
+					rb->len, GFP_KERNEL);
+	if (ret)
+		goto out;
+	ret = dma_map_sgtable(dev, &m->sgt, DMA_TO_DEVICE, DMA_ATTR_SKIP_CPU_SYNC);
+	if (ret) {
+		sg_free_table(&m->sgt);
+		goto out;
+	}
+	/*
+	 * Device segments and runs partition the same bytes in the same
+	 * order, a segment covering one or more whole runs (the IOMMU may
+	 * have coalesced them), so walk both and give every run its address.
+	 */
+	sg = m->sgt.sgl;
+	seg = 0;
+	for (e = 0; e < rb->nr_exts; e++) {
+		if (!left) {
+			if (WARN_ON_ONCE(seg >= m->sgt.nents)) {
+				dma_unmap_sgtable(dev, &m->sgt, DMA_TO_DEVICE,
+						  DMA_ATTR_SKIP_CPU_SYNC);
+				sg_free_table(&m->sgt);
+				ret = -EIO;
+				goto out;
+			}
+			cur = sg_dma_address(sg);
+			left = sg_dma_len(sg);
+			sg = sg_next(sg);
+			seg++;
+		}
+		rb->exts[e].dma[rb->nmaps] = cur;
+		cur += rb->exts[e].len;
+		left -= min(left, rb->exts[e].len);
+	}
+	m->dev = dev;
+	ret = rb->nmaps;
+	/* Entry written before the count that makes it visible. */
+	smp_store_release(&rb->nmaps, rb->nmaps + 1);
+out:
+	mutex_unlock(&uffd_dma_regs_mutex);
+	return ret;
+}
+
+/* uffd_dma_regs_mutex held; no copy in flight through the buffer. */
+static void uffd_dma_regbuf_unmap(struct uffd_dma_regbuf *rb)
+{
+	unsigned int i;
+
+	for (i = 0; i < rb->nmaps; i++) {
+		dma_unmap_sgtable(rb->maps[i].dev, &rb->maps[i].sgt, DMA_TO_DEVICE,
+				  DMA_ATTR_SKIP_CPU_SYNC);
+		sg_free_table(&rb->maps[i].sgt);
+		rb->maps[i].dev = NULL;
+	}
+	rb->nmaps = 0;
+}
+
+/* The provider is being disabled: its devices go, so the mappings go first. */
+static void uffd_dma_regs_unmap_all(void)
+{
+	struct uffd_dma_regs *regs;
+	struct uffd_dma_regbuf *rb;
+
+	mutex_lock(&uffd_dma_regs_mutex);
+	list_for_each_entry(regs, &uffd_dma_regs_list, node)
+		list_for_each_entry(rb, &regs->bufs, node)
+			uffd_dma_regbuf_unmap(rb);
+	mutex_unlock(&uffd_dma_regs_mutex);
+}
+
+/*
+ * The registering mm is changing a range: a buffer it covers may be
+ * unmapped, or about to be, and its address may come back meaning
+ * something else. The registration stays (pins and all) until the
+ * owner releases it, but no copy may be served from it any more: the
+ * contract is io_uring's - the buffer stays where it is - and this is
+ * the safety net for an owner that frees first. Copies that already
+ * found the buffer finish against its pinned pages, which are still
+ * what the address meant when they were issued.
+ */
+static int uffd_dma_mn_invalidate(struct mmu_notifier *mn,
+				  const struct mmu_notifier_range *range)
+{
+	struct uffd_dma_regs *regs = container_of(mn, struct uffd_dma_regs, mn);
+	struct uffd_dma_regbuf *rb;
+
+	spin_lock(&uffd_dma_regs_lock);
+	list_for_each_entry(rb, &regs->bufs, node) {
+		if (rb->dead || range->end <= rb->uaddr ||
+		    range->start >= rb->uaddr + rb->len)
+			continue;
+		WRITE_ONCE(rb->dead, true);
+		atomic_long_inc(&regbufs_invalidated);
+	}
+	spin_unlock(&uffd_dma_regs_lock);
+	return 0;
+}
+
+static const struct mmu_notifier_ops uffd_dma_mn_ops = {
+	.invalidate_range_start = uffd_dma_mn_invalidate,
+};
+
+static int uffd_dma_register(struct uffd_dma_regs *regs, unsigned long addr,
+			     size_t len)
+{
+	struct uffd_dma_regbuf *rb;
+	unsigned long nr, i;
+	unsigned int nexts = 0;
+	long got;
+	int ret;
+
+	if (!len || ((addr | len) & ~PAGE_MASK) || addr + len < addr)
+		return -EINVAL;
+	nr = len >> PAGE_SHIFT;
+	rb = kzalloc(sizeof(*rb), GFP_KERNEL);
+	if (!rb)
+		return -ENOMEM;
+	rb->pages = kvmalloc_array(nr, sizeof(*rb->pages), GFP_KERNEL);
+	if (!rb->pages) {
+		ret = -ENOMEM;
+		goto free_rb;
+	}
+	ret = account_locked_vm(regs->mm, nr, true);
+	if (ret)
+		goto free_pages;
+	got = pin_user_pages_fast(addr, nr, FOLL_WRITE | FOLL_LONGTERM,
+				  rb->pages);
+	if (got != nr) {
+		if (got > 0)
+			unpin_user_pages(rb->pages, got);
+		ret = got < 0 ? got : -EFAULT;
+		goto unaccount;
+	}
+	for (i = 0; i < nr; i++)
+		if (!i || page_to_pfn(rb->pages[i]) != page_to_pfn(rb->pages[i - 1]) + 1)
+			nexts++;
+	rb->exts = kcalloc(nexts, sizeof(*rb->exts), GFP_KERNEL);
+	if (!rb->exts) {
+		ret = -ENOMEM;
+		goto unpin;
+	}
+	for (i = 0; i < nr; i++) {
+		if (!i || page_to_pfn(rb->pages[i]) != page_to_pfn(rb->pages[i - 1]) + 1) {
+			struct uffd_dma_ext *e = &rb->exts[rb->nr_exts++];
+
+			e->uaddr = addr + (i << PAGE_SHIFT);
+			e->first = rb->pages[i];
+		}
+		rb->exts[rb->nr_exts - 1].len += PAGE_SIZE;
+	}
+	rb->regs = regs;
+	rb->uaddr = addr;
+	rb->len = len;
+	rb->nr_pages = nr;
+	atomic_set(&rb->refs, 1);
+	mutex_lock(&uffd_dma_regs_mutex);
+	spin_lock(&uffd_dma_regs_lock);
+	list_add(&rb->node, &regs->bufs);
+	spin_unlock(&uffd_dma_regs_lock);
+	mutex_unlock(&uffd_dma_regs_mutex);
+	atomic_long_add(len, &registered_bytes);
+	return 0;
+
+unpin:
+	unpin_user_pages(rb->pages, nr);
+unaccount:
+	account_locked_vm(regs->mm, nr, false);
+free_pages:
+	kvfree(rb->pages);
+free_rb:
+	kfree(rb);
+	return ret;
+}
+
+/* uffd_dma_regs_mutex held, @rb already off its registry's list. */
+static void uffd_dma_regbuf_free(struct uffd_dma_regbuf *rb)
+{
+	/* Copies that found it before it left the list finish first. */
+	wait_event(uffd_dma_regbuf_wq, atomic_read(&rb->refs) == 1);
+	uffd_dma_regbuf_unmap(rb);
+	unpin_user_pages(rb->pages, rb->nr_pages);
+	account_locked_vm(rb->regs->mm, rb->nr_pages, false);
+	atomic_long_sub(rb->len, &registered_bytes);
+	kfree(rb->exts);
+	kvfree(rb->pages);
+	kfree(rb);
+}
+
+static int uffd_dma_unregister(struct uffd_dma_regs *regs, unsigned long addr,
+			       size_t len)
+{
+	struct uffd_dma_regbuf *rb, *found = NULL;
+
+	mutex_lock(&uffd_dma_regs_mutex);
+	spin_lock(&uffd_dma_regs_lock);
+	list_for_each_entry(rb, &regs->bufs, node)
+		if (rb->uaddr == addr && rb->len == len) {
+			list_del(&rb->node);
+			found = rb;
+			break;
+		}
+	spin_unlock(&uffd_dma_regs_lock);
+	if (found)
+		uffd_dma_regbuf_free(found);
+	mutex_unlock(&uffd_dma_regs_mutex);
+	return found ? 0 : -ENOENT;
+}
+
+static int uffd_dma_dev_open(struct inode *inode, struct file *file)
+{
+	struct uffd_dma_regs *regs = kzalloc(sizeof(*regs), GFP_KERNEL);
+	int ret;
+
+	if (!regs)
+		return -ENOMEM;
+	INIT_LIST_HEAD(&regs->bufs);
+	regs->mm = current->mm;
+	mmgrab(regs->mm);
+	regs->mn.ops = &uffd_dma_mn_ops;
+	ret = mmu_notifier_register(&regs->mn, regs->mm);
+	if (ret) {
+		mmdrop(regs->mm);
+		kfree(regs);
+		return ret;
+	}
+	spin_lock(&uffd_dma_regs_lock);
+	list_add(&regs->node, &uffd_dma_regs_list);
+	spin_unlock(&uffd_dma_regs_lock);
+	file->private_data = regs;
+	return 0;
+}
+
+static int uffd_dma_dev_release(struct inode *inode, struct file *file)
+{
+	struct uffd_dma_regs *regs = file->private_data;
+	struct uffd_dma_regbuf *rb, *next;
+	LIST_HEAD(bufs);
+
+	mutex_lock(&uffd_dma_regs_mutex);
+	spin_lock(&uffd_dma_regs_lock);
+	list_splice_init(&regs->bufs, &bufs);
+	list_del(&regs->node);
+	spin_unlock(&uffd_dma_regs_lock);
+	list_for_each_entry_safe(rb, next, &bufs, node)
+		uffd_dma_regbuf_free(rb);
+	mutex_unlock(&uffd_dma_regs_mutex);
+	/* After the list removal: the callback must not find freed buffers. */
+	mmu_notifier_unregister(&regs->mn, regs->mm);
+	mmdrop(regs->mm);
+	kfree(regs);
+	return 0;
+}
+
+static long uffd_dma_dev_ioctl(struct file *file, unsigned int cmd,
+			       unsigned long arg)
+{
+	struct uffd_dma_regs *regs = file->private_data;
+	struct uffd_dma_reg reg;
+
+	if (regs->mm != current->mm)
+		return -EACCES;
+	if (copy_from_user(&reg, (void __user *)arg, sizeof(reg)))
+		return -EFAULT;
+	if (reg.addr > ULONG_MAX || reg.len > ULONG_MAX)
+		return -EINVAL;
+	switch (cmd) {
+	case UFFD_DMA_IOC_REGISTER:
+		return uffd_dma_register(regs, reg.addr, reg.len);
+	case UFFD_DMA_IOC_UNREGISTER:
+		return uffd_dma_unregister(regs, reg.addr, reg.len);
+	}
+	return -ENOTTY;
+}
+
+static const struct file_operations uffd_dma_dev_fops = {
+	.owner = THIS_MODULE,
+	.open = uffd_dma_dev_open,
+	.release = uffd_dma_dev_release,
+	.unlocked_ioctl = uffd_dma_dev_ioctl,
+};
+
+static struct miscdevice uffd_dma_misc = {
+	.minor = MISC_DYNAMIC_MINOR,
+	.name = "uffd_dma",
+	.fops = &uffd_dma_dev_fops,
+	.mode = 0600,
+};
+
 
 static struct uffd_dma_req *uffd_dma_req_alloc(struct page *dst,
 					       unsigned long nr_pages)
@@ -300,6 +768,8 @@ static void uffd_dma_req_release(struct uffd_dma_req *req)
 	if (req->src_pinned)
 		uffd_dma_unpin_src(req->pages, req->nr_pages, req->pinned);
 	kvfree(req->pages);
+	if (req->regbuf)
+		uffd_dma_regbuf_put(req->regbuf);
 	if (abandoned) {
 		unsigned long pg = 0;
 
@@ -727,6 +1197,32 @@ struct uffd_dma_stripe {
 	unsigned int nr_segs;
 };
 
+/*
+ * Device address on @dev of the contiguous source bytes [off, off + len)
+ * (@first is the page at @off): the registered buffer's standing mapping
+ * when the source is one, a mapping for this request otherwise.
+ */
+static int uffd_dma_src_dma(struct uffd_dma_req *req, struct device *dev,
+			    struct page *first, size_t off, size_t len,
+			    dma_addr_t *dma)
+{
+	int ret;
+
+	if (req->regbuf) {
+		ret = uffd_dma_regbuf_map(req->regbuf, dev);
+		if (ret < 0)
+			return ret;
+		*dma = req->ext->dma[ret] + (req->src - req->ext->uaddr) + off;
+	} else {
+		ret = uffd_dma_req_map(req, dev, first, len, DMA_TO_DEVICE, dma);
+		if (ret)
+			return ret;
+	}
+	/* The CPU (or another device) wrote the buffer since it was mapped. */
+	dma_sync_single_for_device(dev, *dma, len, DMA_TO_DEVICE);
+	return 0;
+}
+
 /* Submit destination segments [first, first + n) from one contiguous source mapping. */
 static int uffd_dma_submit_segs(struct uffd_dma_req *req,
 				struct uffd_dma_cursor *cur, unsigned int first,
@@ -757,7 +1253,7 @@ static int uffd_dma_submit_segs(struct uffd_dma_req *req,
  * submission, wait, unmapping, result counters) happens here.
  */
 static int uffd_dma_copy_striped(struct uffd_dma_req *req, struct page *dst,
-				 struct page **pages, size_t size,
+				 struct page *src_first, size_t size,
 				 struct uffd_dma_cursor *cur)
 {
 	struct uffd_dma_stripe *st;
@@ -795,8 +1291,9 @@ static int uffd_dma_copy_striped(struct uffd_dma_req *req, struct page *dst,
 	for (k = 0; k < ns; k++) {
 		struct uffd_dma_stripe *sp = &st[k];
 
-		ret = uffd_dma_req_map(req, sp->dev, pages[sp->off >> PAGE_SHIFT],
-				       sp->len, DMA_TO_DEVICE, &sp->src);
+		ret = uffd_dma_src_dma(req, sp->dev,
+				       src_first + (sp->off >> PAGE_SHIFT),
+				       sp->off, sp->len, &sp->src);
 		if (ret)
 			goto out;
 		sp->seg_first = req->nr_segs;
@@ -859,28 +1356,49 @@ static int uffd_dma_copy_pages(struct page *dst, unsigned long nr_pages,
 	bool multi_dev = false;
 	struct device *dev;
 	dma_addr_t dst_dma = 0, src_dma = 0;
+	struct page *src_first = NULL;
 	size_t dma_len, cpu_off;
 	ktime_t t0, t1;
 	bool contig = false, cpu_fault = false;
 	unsigned int i;
 	int ret;
 
-	if (size < READ_ONCE(min_bytes) || (src & ~PAGE_MASK)) {
+	if (size < READ_ONCE(min_bytes)) {
+		atomic_long_inc(&refused_small);
+		atomic_long_inc(&copies_refused);
+		return -ENODEV;
+	}
+	if (src & ~PAGE_MASK) {
+		atomic_long_inc(&refused_unaligned);
 		atomic_long_inc(&copies_refused);
 		return -ENODEV;
 	}
 	if (READ_ONCE(stalled)) {
+		atomic_long_inc(&refused_stalled);
 		atomic_long_inc(&copies_refused);
 		return -EBUSY;
 	}
 	if (IS_ENABLED(CONFIG_PAGE_CLEAR_OFFLOAD) && READ_ONCE(util_gate) &&
 	    mm_offload_cpus_saturated()) {
+		atomic_long_inc(&refused_saturated);
 		atomic_long_inc(&copies_refused);
 		return -EBUSY;
 	}
 
+	/*
+	 * The device by the destination's huge-page PFN: a device's standing
+	 * mappings then cover its own share of the pool the destinations
+	 * recycle through, not the whole of it (and the copy is not
+	 * striped). Otherwise stripe large copies, else rotate.
+	 */
 	stripe_min = READ_ONCE(stripe_min_bytes);
-	if (stripe_min && size >= 2 * stripe_min)
+	if (READ_ONCE(dev_by_pfn))
+		cur.chan_mask = mm_offload_dma_claim_keyed(
+				clamp_t(size_t, size / UFFD_DMA_CHUNK_BYTES, 1,
+					READ_ONCE(nr_dma_chan)),
+				page_to_nid(dst),
+				page_to_pfn(dst) >> (PMD_SHIFT - PAGE_SHIFT), &grp);
+	else if (stripe_min && size >= 2 * stripe_min)
 		cur.chan_mask = mm_offload_dma_claim_spread(
 				clamp_t(size_t, size / stripe_min, 2,
 					READ_ONCE(nr_dma_chan)),
@@ -891,6 +1409,7 @@ static int uffd_dma_copy_pages(struct page *dst, unsigned long nr_pages,
 					READ_ONCE(nr_dma_chan)),
 				page_to_nid(dst), &grp);
 	if (!cur.chan_mask) {
+		atomic_long_inc(&refused_noclaim);
 		atomic_long_inc(&copies_refused);
 		return -EBUSY;
 	}
@@ -911,33 +1430,44 @@ static int uffd_dma_copy_pages(struct page *dst, unsigned long nr_pages,
 		ret = -ENOMEM;
 		goto out_release;
 	}
-	req->pages = kvmalloc_array(nr_pages, sizeof(*req->pages), GFP_KERNEL);
-	if (!req->pages) {
-		ret = -ENOMEM;
-		goto out_req;
-	}
+	req->src = src;
 	t0 = ktime_get();
-	ret = uffd_dma_pin_src(src, nr_pages, req->pages, allow_pagefault,
-			       &req->pinned);
-	if (ret) {
-		atomic_long_inc(&copies_efault);
-		goto out_req;
+	req->regbuf = uffd_dma_regbuf_find(src, size, &req->ext);
+	if (req->regbuf) {
+		/* Pinned and mapped at registration: one physical run. */
+		src_first = req->ext->first +
+			    ((src - req->ext->uaddr) >> PAGE_SHIFT);
+		contig = true;
+		atomic_long_inc(&src_registered);
+	} else {
+		req->pages = kvmalloc_array(nr_pages, sizeof(*req->pages),
+					    GFP_KERNEL);
+		if (!req->pages) {
+			ret = -ENOMEM;
+			goto out_req;
+		}
+		ret = uffd_dma_pin_src(src, nr_pages, req->pages, allow_pagefault,
+				       &req->pinned);
+		if (ret) {
+			atomic_long_inc(&copies_efault);
+			goto out_req;
+		}
+		req->src_pinned = true;
+		/*
+		 * A THP or hugetlb-backed source is one physical run: map it
+		 * as a single range and skip the scatterlist entirely.
+		 */
+		contig = uffd_dma_src_contiguous(req->pages, nr_pages);
+		src_first = req->pages[0];
 	}
-	req->src_pinned = true;
 	t1 = ktime_get();
 	atomic_long_add(ktime_us_delta(t1, t0), &pin_us_total);
-
-	/*
-	 * A THP or hugetlb-backed source is one physical run: map it as a
-	 * single range and skip the scatterlist entirely.
-	 */
-	contig = uffd_dma_src_contiguous(req->pages, nr_pages);
 
 	for_each_set_bit(i, &cur.chan_mask, MM_OFFLOAD_DMA_MAX_CHANNELS)
 		if (mm_offload_dma_chan_dev(i) != dev)
 			multi_dev = true;
 	if (multi_dev && contig) {
-		ret = uffd_dma_copy_striped(req, dst, req->pages, size, &cur);
+		ret = uffd_dma_copy_striped(req, dst, src_first, size, &cur);
 		goto out_done;
 	}
 	if (multi_dev) {
@@ -962,8 +1492,12 @@ static int uffd_dma_copy_pages(struct page *dst, unsigned long nr_pages,
 
 	if (dma_len) {
 		if (contig) {
-			ret = uffd_dma_req_map(req, dev, req->pages[0], dma_len,
-					       DMA_TO_DEVICE, &src_dma);
+			ktime_t ts = ktime_get();
+
+			ret = uffd_dma_src_dma(req, dev, src_first, 0, dma_len,
+					       &src_dma);
+			atomic_long_add(ktime_us_delta(ktime_get(), ts),
+					&src_map_us_total);
 			if (ret)
 				goto out_req;
 			atomic_long_inc(&src_contig);
@@ -986,11 +1520,16 @@ static int uffd_dma_copy_pages(struct page *dst, unsigned long nr_pages,
 		 * A contiguous source gets per-segment destinations, so the
 		 * pool's standing mappings can serve them.
 		 */
-		if (contig)
+		if (contig) {
+			ktime_t ts = ktime_get();
+
 			ret = uffd_dma_map_dst(req, dev, 0, dma_len);
-		else
+			atomic_long_add(ktime_us_delta(ktime_get(), ts),
+					&dst_map_us_total);
+		} else {
 			ret = uffd_dma_req_map(req, dev, dst, dma_len,
 					       DMA_FROM_DEVICE, &dst_dma);
+		}
 		if (ret)
 			goto out_req;
 	}
@@ -1126,6 +1665,8 @@ static ssize_t offloading_store(struct kobject *kobj,
 		offloading_enabled = true;
 	} else {
 		mm_offload_unregister(&uffd_dma_copier);
+		/* No copy is in flight past unregister; the devices go next. */
+		uffd_dma_regs_unmap_all();
 		mm_offload_dma_pool_put();
 		offloading_enabled = false;
 	}
@@ -1210,6 +1751,7 @@ UFFD_DMA_UINT_ATTR(abandon_ms, 0, 3600000, false);
 UFFD_DMA_BOOL_ATTR(cache_ctrl);
 UFFD_DMA_BOOL_ATTR(util_gate);
 UFFD_DMA_BOOL_ATTR(dst_map_cache);
+UFFD_DMA_BOOL_ATTR(dev_by_pfn);
 UFFD_DMA_COUNTER_ATTR(copies_done);
 UFFD_DMA_COUNTER_ATTR(copies_failed);
 UFFD_DMA_COUNTER_ATTR(admit_failures);
@@ -1227,6 +1769,16 @@ UFFD_DMA_COUNTER_ATTR(striped_copies);
 UFFD_DMA_COUNTER_ATTR(copies_abandoned);
 UFFD_DMA_COUNTER_ATTR(dst_cached_segs);
 UFFD_DMA_COUNTER_ATTR(dst_mapped_segs);
+UFFD_DMA_COUNTER_ATTR(src_registered);
+UFFD_DMA_COUNTER_ATTR(regbufs_invalidated);
+UFFD_DMA_COUNTER_ATTR(src_map_us_total);
+UFFD_DMA_COUNTER_ATTR(dst_map_us_total);
+UFFD_DMA_COUNTER_ATTR(registered_bytes);
+UFFD_DMA_COUNTER_ATTR(refused_small);
+UFFD_DMA_COUNTER_ATTR(refused_unaligned);
+UFFD_DMA_COUNTER_ATTR(refused_stalled);
+UFFD_DMA_COUNTER_ATTR(refused_saturated);
+UFFD_DMA_COUNTER_ATTR(refused_noclaim);
 
 static ssize_t min_bytes_show(struct kobject *kobj,
 			      struct kobj_attribute *attr, char *buf)
@@ -1283,6 +1835,7 @@ static struct attribute *uffd_dma_attrs[] = {
 	&sg_elems_attr.attr,
 	&util_gate_attr.attr,
 	&dst_map_cache_attr.attr,
+	&dev_by_pfn_attr.attr,
 	&copies_done_attr.attr,
 	&copies_failed_attr.attr,
 	&admit_failures_attr.attr,
@@ -1301,6 +1854,16 @@ static struct attribute *uffd_dma_attrs[] = {
 	&copies_abandoned_attr.attr,
 	&dst_cached_segs_attr.attr,
 	&dst_mapped_segs_attr.attr,
+	&src_registered_attr.attr,
+	&regbufs_invalidated_attr.attr,
+	&src_map_us_total_attr.attr,
+	&dst_map_us_total_attr.attr,
+	&registered_bytes_attr.attr,
+	&refused_small_attr.attr,
+	&refused_unaligned_attr.attr,
+	&refused_stalled_attr.attr,
+	&refused_saturated_attr.attr,
+	&refused_noclaim_attr.attr,
 	NULL
 };
 
@@ -1320,6 +1883,12 @@ static int __init uffd_dma_init(void)
 		kobject_put(uffd_dma_kobj);
 		return ret;
 	}
+	ret = misc_register(&uffd_dma_misc);
+	if (ret) {
+		sysfs_remove_group(uffd_dma_kobj, &uffd_dma_attr_group);
+		kobject_put(uffd_dma_kobj);
+		return ret;
+	}
 	pr_info("uffd_dma: DMA user page copy offload initialized\n");
 	return 0;
 }
@@ -1329,10 +1898,12 @@ static void __exit uffd_dma_exit(void)
 	mutex_lock(&uffd_dma_mutex);
 	if (offloading_enabled) {
 		mm_offload_unregister(&uffd_dma_copier);
+		uffd_dma_regs_unmap_all();
 		mm_offload_dma_pool_put();
 		offloading_enabled = false;
 	}
 	mutex_unlock(&uffd_dma_mutex);
+	misc_deregister(&uffd_dma_misc);
 	sysfs_remove_group(uffd_dma_kobj, &uffd_dma_attr_group);
 	kobject_put(uffd_dma_kobj);
 	pr_info("uffd_dma: DMA user page copy offload unloaded\n");
