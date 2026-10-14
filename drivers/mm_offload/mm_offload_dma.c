@@ -16,7 +16,11 @@
 #include <linux/device.h>
 #include <linux/dma-mapping.h>
 #include <linux/dmaengine.h>
+#include <linux/idxd_dma.h>
+#include <linux/kobject.h>
+#include <linux/ktime.h>
 #include <linux/mm.h>
+#include <linux/perf_event.h>
 #include <linux/mm_offload_dma.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -24,11 +28,14 @@
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/sysfs.h>
 #include <linux/wait.h>
 #include <linux/xarray.h>
 #include <linux/jiffies.h>
 
 static void map_cache_free_all(void);
+static void hw_events_create(void);
+static void hw_events_release(void);
 
 static DEFINE_MUTEX(pool_mutex);
 static unsigned int pool_users;
@@ -167,10 +174,12 @@ int mm_offload_dma_pool_get(void)
 
 	mutex_lock(&pool_mutex);
 	pool_grow();
-	if (nr_channels)
+	if (nr_channels) {
 		pool_users++;
-	else
+		hw_events_create();
+	} else {
 		ret = -ENODEV;
+	}
 	mutex_unlock(&pool_mutex);
 	if (!ret)
 		pr_info("mm_offload_dma: %u channel(s) in %u group(s), %u user(s)\n",
@@ -191,8 +200,9 @@ void mm_offload_dma_pool_put(void)
 	if (WARN_ON(!pool_users))
 		goto out;
 	if (--pool_users == 0) {
-		/* Standing mappings go before the devices they were made against. */
+		/* Standing mappings and counters go before the devices they belong to. */
 		map_cache_free_all();
+		hw_events_release();
 		while (nr_channels) {
 			nr_channels--;
 			dma_release_channel(channels[nr_channels].chan);
@@ -1202,11 +1212,352 @@ static const struct kernel_param_ops map_cache_stats_ops = {
 module_param_cb(map_cache_stats, &map_cache_stats_ops, NULL, 0644);
 MODULE_PARM_DESC(map_cache_stats, "Standing mapping cache counters per device (write to flush)");
 
+
+/*
+ * ---- usage counters ----
+ *
+ * Two views of the same traffic. The software view is per operation
+ * class, the mm_offload function the bytes served (folio clears,
+ * migration copies, UFFDIO_COPY fills), counted by the providers at
+ * submission and completion with the submit-to-completion time summed,
+ * so a mean device latency per class falls out. The hardware view is the
+ * devices' own perfmon counters, read through the idxd PMU as kernel
+ * perf events: data processed and written per device (the engine
+ * category, which has no work-queue filter, so it includes user-space
+ * submitters such as DTO), and descriptor counts per operation type on
+ * the pool's own work queues and on every queue. When nothing else uses
+ * a device the two views agree on bytes; the difference is other
+ * submitters' share. Both are running totals from the pool's first
+ * acquisition; `window` reports the deltas and the rates since it was
+ * last written to.
+ */
+struct op_stat {
+	atomic64_t submitted;
+	atomic64_t completed;
+	atomic64_t failed;
+	atomic64_t bytes_submitted;
+	atomic64_t bytes_completed;
+	atomic64_t busy_ns;		/* submit to completion, summed */
+	atomic_t inflight;
+};
+
+static struct op_stat op_stats[MM_OFFLOAD_DMA_OP_MAX];
+static const char *const op_names[MM_OFFLOAD_DMA_OP_MAX] = {
+	[MM_OFFLOAD_DMA_OP_CLEAR] = "clear",
+	[MM_OFFLOAD_DMA_OP_MIGRATE] = "migrate",
+	[MM_OFFLOAD_DMA_OP_UFFD] = "uffd_copy",
+};
+
+void mm_offload_dma_stat_submit(enum mm_offload_dma_op op, size_t bytes)
+{
+	struct op_stat *s = &op_stats[op];
+
+	atomic64_inc(&s->submitted);
+	atomic64_add(bytes, &s->bytes_submitted);
+	atomic_inc(&s->inflight);
+}
+EXPORT_SYMBOL_GPL(mm_offload_dma_stat_submit);
+
+void mm_offload_dma_stat_complete(enum mm_offload_dma_op op, size_t bytes,
+				  ktime_t submitted, bool ok)
+{
+	struct op_stat *s = &op_stats[op];
+
+	atomic_dec(&s->inflight);
+	if (ok) {
+		atomic64_inc(&s->completed);
+		atomic64_add(bytes, &s->bytes_completed);
+	} else {
+		atomic64_inc(&s->failed);
+	}
+	atomic64_add(ktime_to_ns(ktime_sub(ktime_get(), submitted)), &s->busy_ns);
+}
+EXPORT_SYMBOL_GPL(mm_offload_dma_stat_complete);
+
+/*
+ * Hardware counters, one set per device the pool holds a channel on.
+ * perf attr.config is the idxd PMU's format: event category in bits
+ * 0-3, event mask from bit 4; config1 bits 0-31 are the WQ filter.
+ */
+enum hw_ev {
+	HW_CL_PROCESSED,	/* EV_CL_PROCESSED: input data, 32-byte units */
+	HW_CL_WRITTEN,		/* EV_CL_WRITE: data written, 32-byte units */
+	HW_MOVE_POOL,		/* EV_MEM_MOVE descriptors on the pool's WQs */
+	HW_FILL_POOL,		/* EV_FILL descriptors on the pool's WQs */
+	HW_CPL_POOL,		/* EV_NUM_CPL_SUCC on the pool's WQs */
+	HW_MOVE_ALL,		/* EV_MEM_MOVE, every WQ */
+	HW_FILL_ALL,		/* EV_FILL, every WQ */
+	HW_EV_MAX,
+};
+
+static const struct {
+	const char *name;
+	u8 category;
+	u32 event;
+	bool wq_filter;
+	bool cachelines;	/* counts 32-byte units, reported as bytes */
+} hw_evs[HW_EV_MAX] = {
+	[HW_CL_PROCESSED] = { "processed_bytes", 1, 0x1, false, true },
+	[HW_CL_WRITTEN] = { "written_bytes", 1, 0x2, false, true },
+	[HW_MOVE_POOL] = { "memmove_pool", 3, 0x8, true, false },
+	[HW_FILL_POOL] = { "fill_pool", 3, 0x10, true, false },
+	[HW_CPL_POOL] = { "completions_pool", 4, 0x10, true, false },
+	[HW_MOVE_ALL] = { "memmove_all", 3, 0x8, false, false },
+	[HW_FILL_ALL] = { "fill_all", 3, 0x10, false, false },
+};
+
+#define HW_MAX_DEVS	(MM_OFFLOAD_DMA_MAX_CHANNELS / 2)
+
+struct hw_dev {
+	struct device *dev;
+	int pmu_type;
+	u32 wq_mask;		/* the pool's WQs on this device */
+	struct perf_event *ev[HW_EV_MAX];
+};
+
+/* Under pool_mutex. */
+static struct hw_dev hw_devs[HW_MAX_DEVS];
+static unsigned int nr_hw_devs;
+static bool hw_create_failed_once;
+
+static void hw_events_create(void)
+{
+	unsigned int i, d, e;
+
+	for (i = 0; i < nr_channels; i++) {
+		struct dma_chan *chan = channels[i].chan;
+		int type = idxd_dma_chan_pmu_type(chan);
+		int wq = idxd_dma_chan_wq_id(chan);
+		struct hw_dev *hd = NULL;
+
+		if (type < 0)
+			continue;
+		for (d = 0; d < nr_hw_devs; d++)
+			if (hw_devs[d].dev == channels[i].dev)
+				hd = &hw_devs[d];
+		if (!hd) {
+			if (nr_hw_devs == HW_MAX_DEVS)
+				continue;
+			hd = &hw_devs[nr_hw_devs++];
+			memset(hd, 0, sizeof(*hd));
+			hd->dev = channels[i].dev;
+			hd->pmu_type = type;
+		}
+		if (wq >= 0 && wq < 32)
+			hd->wq_mask |= BIT(wq);
+	}
+
+	for (d = 0; d < nr_hw_devs; d++) {
+		struct hw_dev *hd = &hw_devs[d];
+
+		if (hd->ev[0])
+			continue;	/* created on an earlier acquisition */
+		for (e = 0; e < HW_EV_MAX; e++) {
+			struct perf_event_attr attr = {
+				.type = hd->pmu_type,
+				.size = sizeof(attr),
+				.config = hw_evs[e].category |
+					  ((u64)hw_evs[e].event << 4),
+				.config1 = hw_evs[e].wq_filter ? hd->wq_mask : 0,
+				.pinned = 1,
+			};
+			struct perf_event *ev;
+
+			/* The PMU's cpumask is CPU 0: uncore-style, counted there. */
+			ev = perf_event_create_kernel_counter(&attr, 0, NULL, NULL, NULL);
+			if (IS_ERR(ev)) {
+				if (!hw_create_failed_once)
+					pr_warn("mm_offload_dma: %s: perfmon event %s unavailable (%ld)\n",
+						dev_name(hd->dev), hw_evs[e].name, PTR_ERR(ev));
+				hw_create_failed_once = true;
+				ev = NULL;
+			}
+			hd->ev[e] = ev;
+		}
+	}
+}
+
+static void hw_events_release(void)
+{
+	unsigned int d, e;
+
+	for (d = 0; d < nr_hw_devs; d++)
+		for (e = 0; e < HW_EV_MAX; e++)
+			if (hw_devs[d].ev[e]) {
+				perf_event_release_kernel(hw_devs[d].ev[e]);
+				hw_devs[d].ev[e] = NULL;
+			}
+	nr_hw_devs = 0;
+}
+
+static u64 hw_read(const struct hw_dev *hd, unsigned int e)
+{
+	u64 enabled, running, v;
+
+	if (!hd->ev[e])
+		return 0;
+	v = perf_event_read_value(hd->ev[e], &enabled, &running);
+	return hw_evs[e].cachelines ? v * 32 : v;
+}
+
+/* Everything the window is measured against, taken under pool_mutex. */
+struct usage_snap {
+	ktime_t t;
+	u64 ops[MM_OFFLOAD_DMA_OP_MAX];
+	u64 bytes[MM_OFFLOAD_DMA_OP_MAX];
+	u64 busy_ns[MM_OFFLOAD_DMA_OP_MAX];
+	u64 hw[HW_MAX_DEVS][HW_EV_MAX];
+};
+
+static struct usage_snap window_start;
+
+static void usage_snap(struct usage_snap *snap)
+{
+	unsigned int o, d, e;
+
+	snap->t = ktime_get();
+	for (o = 0; o < MM_OFFLOAD_DMA_OP_MAX; o++) {
+		snap->ops[o] = atomic64_read(&op_stats[o].completed);
+		snap->bytes[o] = atomic64_read(&op_stats[o].bytes_completed);
+		snap->busy_ns[o] = atomic64_read(&op_stats[o].busy_ns);
+	}
+	for (d = 0; d < nr_hw_devs; d++)
+		for (e = 0; e < HW_EV_MAX; e++)
+			snap->hw[d][e] = hw_read(&hw_devs[d], e);
+}
+
+/* MiB/s and ops/s from a byte or count delta over @ns. */
+static u64 per_second(u64 delta, u64 ns)
+{
+	return ns ? div64_u64(delta * NSEC_PER_SEC, ns) : 0;
+}
+
+static ssize_t totals_show(struct kobject *kobj, struct kobj_attribute *attr,
+			   char *buf)
+{
+	unsigned int o, d, e;
+	int len = 0;
+
+	mutex_lock(&pool_mutex);
+	for (o = 0; o < MM_OFFLOAD_DMA_OP_MAX; o++) {
+		struct op_stat *s = &op_stats[o];
+		u64 ops = atomic64_read(&s->completed);
+		u64 busy = atomic64_read(&s->busy_ns);
+
+		len += sysfs_emit_at(buf, len,
+				     "%-10s ops %llu bytes %llu failed %llu inflight %d mean_us %llu\n",
+				     op_names[o], ops, (u64)atomic64_read(&s->bytes_completed),
+				     (u64)atomic64_read(&s->failed), atomic_read(&s->inflight),
+				     ops ? div64_u64(busy, ops * 1000) : 0);
+	}
+	for (d = 0; d < nr_hw_devs; d++) {
+		len += sysfs_emit_at(buf, len, "%s wq_mask 0x%x", dev_name(hw_devs[d].dev),
+				     hw_devs[d].wq_mask);
+		for (e = 0; e < HW_EV_MAX; e++)
+			len += sysfs_emit_at(buf, len, " %s %llu", hw_evs[e].name,
+					     hw_read(&hw_devs[d], e));
+		len += sysfs_emit_at(buf, len, "\n");
+	}
+	if (!nr_hw_devs)
+		len += sysfs_emit_at(buf, len, "hw none (pool not acquired or no idxd PMU)\n");
+	mutex_unlock(&pool_mutex);
+	return len;
+}
+
+static ssize_t window_show(struct kobject *kobj, struct kobj_attribute *attr,
+			   char *buf)
+{
+	struct usage_snap *now;
+	unsigned int o, d;
+	u64 ns;
+	int len = 0;
+
+	now = kzalloc(sizeof(*now), GFP_KERNEL);
+	if (!now)
+		return -ENOMEM;
+	mutex_lock(&pool_mutex);
+	usage_snap(now);
+	ns = ktime_to_ns(ktime_sub(now->t, window_start.t));
+	len += sysfs_emit_at(buf, len, "window_ms %llu\n", div64_u64(ns, NSEC_PER_MSEC));
+	for (o = 0; o < MM_OFFLOAD_DMA_OP_MAX; o++) {
+		u64 ops = now->ops[o] - window_start.ops[o];
+		u64 bytes = now->bytes[o] - window_start.bytes[o];
+		u64 busy = now->busy_ns[o] - window_start.busy_ns[o];
+
+		len += sysfs_emit_at(buf, len,
+				     "%-10s ops %llu bytes %llu MiB/s %llu ops/s %llu mean_us %llu\n",
+				     op_names[o], ops, bytes, per_second(bytes, ns) >> 20,
+				     per_second(ops, ns), ops ? div64_u64(busy, ops * 1000) : 0);
+	}
+	for (d = 0; d < nr_hw_devs; d++) {
+		u64 *a = now->hw[d], *b = window_start.hw[d];
+
+		len += sysfs_emit_at(buf, len,
+				     "%s processed MiB/s %llu written MiB/s %llu memmove_pool %llu fill_pool %llu completions_pool %llu memmove_all %llu fill_all %llu\n",
+				     dev_name(hw_devs[d].dev),
+				     per_second(a[HW_CL_PROCESSED] - b[HW_CL_PROCESSED], ns) >> 20,
+				     per_second(a[HW_CL_WRITTEN] - b[HW_CL_WRITTEN], ns) >> 20,
+				     a[HW_MOVE_POOL] - b[HW_MOVE_POOL],
+				     a[HW_FILL_POOL] - b[HW_FILL_POOL],
+				     a[HW_CPL_POOL] - b[HW_CPL_POOL],
+				     a[HW_MOVE_ALL] - b[HW_MOVE_ALL],
+				     a[HW_FILL_ALL] - b[HW_FILL_ALL]);
+	}
+	mutex_unlock(&pool_mutex);
+	kfree(now);
+	return len;
+}
+
+/* Any write starts a new window. */
+static ssize_t window_store(struct kobject *kobj, struct kobj_attribute *attr,
+			    const char *buf, size_t count)
+{
+	mutex_lock(&pool_mutex);
+	usage_snap(&window_start);
+	mutex_unlock(&pool_mutex);
+	return count;
+}
+
+static struct kobj_attribute totals_attr = __ATTR_RO(totals);
+static struct kobj_attribute window_attr = __ATTR_RW(window);
+
+static struct attribute *usage_attrs[] = {
+	&totals_attr.attr,
+	&window_attr.attr,
+	NULL
+};
+
+static const struct attribute_group usage_attr_group = {
+	.attrs = usage_attrs,
+};
+
+static struct kobject *usage_kobj;
+
+static int __init mm_offload_dma_init(void)
+{
+	int ret;
+
+	usage_kobj = kobject_create_and_add("mm_offload_dma", kernel_kobj);
+	if (!usage_kobj)
+		return -ENOMEM;
+	ret = sysfs_create_group(usage_kobj, &usage_attr_group);
+	if (ret) {
+		kobject_put(usage_kobj);
+		return ret;
+	}
+	window_start.t = ktime_get();
+	return 0;
+}
+module_init(mm_offload_dma_init);
+
 static void __exit mm_offload_dma_exit(void)
 {
 	map_cache_free_all();
+	sysfs_remove_group(usage_kobj, &usage_attr_group);
+	kobject_put(usage_kobj);
 }
 module_exit(mm_offload_dma_exit);
 
+MODULE_IMPORT_NS("IDXD");
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Shared DMA channel pool for mm_offload providers");

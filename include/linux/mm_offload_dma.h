@@ -22,6 +22,7 @@
 #ifndef _LINUX_MM_OFFLOAD_DMA_H
 #define _LINUX_MM_OFFLOAD_DMA_H
 
+#include <linux/ktime.h>
 #include <linux/types.h>
 
 struct dma_chan;
@@ -65,6 +66,23 @@ void mm_offload_dma_retire(unsigned int idx, unsigned int nr);
 void mm_offload_dma_complete(unsigned int idx, unsigned int nr);
 int mm_offload_dma_prep_wait(unsigned int idx);
 bool mm_offload_dma_shared(void);
+
+/*
+ * Usage accounting. Providers report every descriptor they submit under
+ * the mm_offload function it serves; the pool keeps running totals per
+ * class (operations, bytes, submit-to-completion time) next to the
+ * devices' own perfmon counters, and reports both in
+ * /sys/kernel/mm_offload_dma/{totals,window}.
+ */
+enum mm_offload_dma_op {
+	MM_OFFLOAD_DMA_OP_CLEAR,	/* folio clear: memset */
+	MM_OFFLOAD_DMA_OP_MIGRATE,	/* migration copy: memcpy, memcpy_sg */
+	MM_OFFLOAD_DMA_OP_UFFD,		/* UFFDIO_COPY: user to new pages */
+	MM_OFFLOAD_DMA_OP_MAX,
+};
+void mm_offload_dma_stat_submit(enum mm_offload_dma_op op, size_t bytes);
+void mm_offload_dma_stat_complete(enum mm_offload_dma_op op, size_t bytes,
+				  ktime_t submitted, bool ok);
 
 struct folio;
 struct mm_offload_dma_map;

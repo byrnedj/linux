@@ -7,6 +7,7 @@
 #include <linux/device.h>
 #include <linux/io-64-nonatomic-lo-hi.h>
 #include <linux/dmaengine.h>
+#include <linux/idxd_dma.h>
 #include <uapi/linux/idxd.h>
 #include "../dmaengine.h"
 #include "registers.h"
@@ -810,3 +811,29 @@ struct idxd_device_driver idxd_dmaengine_drv = {
 	.type = dev_types,
 };
 EXPORT_SYMBOL_GPL(idxd_dmaengine_drv);
+
+static bool idxd_dma_is_idxd_chan(struct dma_chan *chan)
+{
+	return chan->device->device_release == idxd_dma_release;
+}
+
+int idxd_dma_chan_wq_id(struct dma_chan *chan)
+{
+	if (!idxd_dma_is_idxd_chan(chan))
+		return -ENODEV;
+	return to_idxd_wq(chan)->id;
+}
+EXPORT_SYMBOL_GPL(idxd_dma_chan_wq_id);
+
+int idxd_dma_chan_pmu_type(struct dma_chan *chan)
+{
+	struct idxd_device *idxd;
+
+	if (!idxd_dma_is_idxd_chan(chan))
+		return -ENODEV;
+	idxd = to_idxd_wq(chan)->idxd;
+	if (!idxd->idxd_pmu)
+		return -ENODEV;
+	return idxd->idxd_pmu->pmu.type;
+}
+EXPORT_SYMBOL_GPL(idxd_dma_chan_pmu_type);

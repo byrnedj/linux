@@ -14,6 +14,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/dmaengine.h>
 #include <linux/highmem.h>
+#include <linux/ktime.h>
 #include <linux/migrate.h>
 #include <linux/mm_offload.h>
 #include <linux/mm_offload_dma.h>
@@ -114,6 +115,10 @@ struct dcbm_desc {
 	struct dma_work *work;
 	unsigned int chan;
 	bool free_me;
+	/* usage accounting: what this descriptor does and when it went out */
+	enum mm_offload_dma_op op;
+	size_t bytes;
+	ktime_t submitted;
 };
 
 struct dma_work {
@@ -206,12 +211,14 @@ static void dma_completion_callback(void *data,
 	struct dcbm_desc *desc = data;
 	struct dma_work *work = desc->work;
 	unsigned int chan = desc->chan;
+	bool ok = result && result->result == DMA_TRANS_NOERROR;
 
+	mm_offload_dma_stat_complete(desc->op, desc->bytes, desc->submitted, ok);
 	if (desc->free_me)
 		kfree(desc);
 	mm_offload_dma_complete(chan, 1);
 
-	if (!result || result->result != DMA_TRANS_NOERROR)
+	if (!ok)
 		atomic_set(&work->error, -EIO);
 
 	/*
@@ -409,10 +416,13 @@ static int submit_one(struct dma_work *work, struct dma_async_tx_descriptor *tx,
 	tx->callback_param = desc;
 	atomic_inc(&work->inflight);
 	atomic_inc(&work->pending);
+	desc->submitted = ktime_get();
+	mm_offload_dma_stat_submit(desc->op, desc->bytes);
 
 	cookie = dmaengine_submit(tx);
 	if (dma_submit_error(cookie)) {
 		/* Never queued, so no callback will run for it. */
+		mm_offload_dma_stat_complete(desc->op, desc->bytes, desc->submitted, false);
 		atomic_dec(&work->inflight);
 		atomic_dec(&work->pending);
 		mm_offload_dma_retire(desc->chan, 1);
@@ -467,6 +477,7 @@ static int submit_sg_transfers(struct dma_work *work, unsigned long flags)
 	unsigned int elems = clamp(READ_ONCE(sg_elems), 1u, DCBM_SG_ELEMS_MAX);
 	unsigned int retries = 0;
 	unsigned int done = 0;
+	size_t bytes;
 	int ret = 0;
 
 	/* Up to 64 KB, and the device never reads it: no need for it contiguous. */
@@ -482,6 +493,7 @@ static int submit_sg_transfers(struct dma_work *work, unsigned long flags)
 
 		sg_init_table(src_sg, n);
 		sg_init_table(dst_sg, n);
+		bytes = 0;
 		for (i = 0; i < n; i++) {
 			struct dcbm_copy *copy = &work->copies[done + i];
 
@@ -489,6 +501,7 @@ static int submit_sg_transfers(struct dma_work *work, unsigned long flags)
 			sg_dma_len(&src_sg[i]) = copy->len;
 			sg_dma_address(&dst_sg[i]) = copy->dst;
 			sg_dma_len(&dst_sg[i]) = copy->len;
+			bytes += copy->len;
 		}
 
 		dma_work_throttle(work);
@@ -497,6 +510,8 @@ static int submit_sg_transfers(struct dma_work *work, unsigned long flags)
 			ret = -EBUSY;
 			break;
 		}
+		desc->op = MM_OFFLOAD_DMA_OP_MIGRATE;
+		desc->bytes = bytes;
 		tx = dmaengine_prep_dma_memcpy_sg(work->chan, dst_sg, n,
 						  src_sg, n, flags);
 		if (!tx) {
@@ -550,6 +565,8 @@ static int submit_dma_transfers(struct dma_work *work)
 			desc = work_admit(work);
 			if (!desc)
 				return -EBUSY;
+			desc->op = MM_OFFLOAD_DMA_OP_MIGRATE;
+			desc->bytes = copy->len;
 			tx = dmaengine_prep_dma_memcpy(work->chan, copy->dst,
 						       copy->src, copy->len,
 						       flags);
@@ -1003,6 +1020,8 @@ static int submit_clear_range(struct dma_work *work, unsigned long chan_mask,
 		desc->work = work;
 		desc->chan = idx;
 		desc->free_me = true;
+		desc->op = MM_OFFLOAD_DMA_OP_CLEAR;
+		desc->bytes = this_len;
 		tx = dmaengine_prep_dma_memset(mm_offload_dma_chan(idx), addr, 0,
 					       this_len, flags);
 		if (!tx) {

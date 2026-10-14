@@ -167,6 +167,8 @@ struct uffd_dma_req {
 struct uffd_dma_desc {
 	struct uffd_dma_req *req;
 	unsigned int chan;
+	size_t bytes;
+	ktime_t submitted;
 };
 
 static atomic_long_t admit_failures;
@@ -800,10 +802,13 @@ static void uffd_dma_callback(void *data, const struct dmaengine_result *result)
 	struct uffd_dma_desc *desc = data;
 	struct uffd_dma_req *req = desc->req;
 	unsigned int chan = desc->chan;
+	bool ok = result && result->result == DMA_TRANS_NOERROR;
 
+	mm_offload_dma_stat_complete(MM_OFFLOAD_DMA_OP_UFFD, desc->bytes,
+				     desc->submitted, ok);
 	kfree(desc);
 	mm_offload_dma_complete(chan, 1);
-	if (!result || result->result != DMA_TRANS_NOERROR)
+	if (!ok)
 		atomic_set(&req->error, -EIO);
 	if (atomic_dec_and_test(&req->pending))
 		uffd_dma_req_landed(req);
@@ -840,8 +845,12 @@ static int uffd_dma_submit_tx(struct uffd_dma_req *req,
 	tx->callback_result = uffd_dma_callback;
 	tx->callback_param = desc;
 	atomic_inc(&req->pending);
+	desc->submitted = ktime_get();
+	mm_offload_dma_stat_submit(MM_OFFLOAD_DMA_OP_UFFD, desc->bytes);
 	cookie = dmaengine_submit(tx);
 	if (dma_submit_error(cookie)) {
+		mm_offload_dma_stat_complete(MM_OFFLOAD_DMA_OP_UFFD, desc->bytes,
+					     desc->submitted, false);
 		atomic_dec(&req->pending);
 		mm_offload_dma_retire(desc->chan, 1);
 		kfree(desc);
@@ -941,6 +950,7 @@ static int uffd_dma_submit_one(struct uffd_dma_req *req,
 		desc = uffd_dma_admit(req, cur->idx, cur->wait);
 		if (!desc)
 			return -EBUSY;
+		desc->bytes = len;
 		tx = dmaengine_prep_dma_memcpy(mm_offload_dma_chan(cur->idx),
 					       dst, src, len, cur->flags);
 		if (tx)
